@@ -119,9 +119,13 @@ describe("buildStrategyPrompt", () => {
     expect(prompt).toContain("User requests a code refactor");
   });
 
-  it("includes observation", () => {
-    const prompt = buildStrategyPrompt(createTestInput());
-    expect(prompt).toContain("Refactor the triage module to use DI");
+  it("includes observation truncated to 500 chars", () => {
+    const input = createTestInput();
+    input.observation = "x".repeat(800);
+    const prompt = buildStrategyPrompt(input);
+    // Should contain the first 500 chars, not all 800
+    expect(prompt).not.toContain("x".repeat(800));
+    expect(prompt).toContain("x".repeat(500));
   });
 
   it("includes strategy archetypes", () => {
@@ -140,6 +144,61 @@ describe("buildStrategyPrompt", () => {
     expect(prompt).toContain("alignment (weight=0.4)");
     expect(prompt).toContain("efficiency (weight=0.35)");
     expect(prompt).toContain("risk (weight=0.25)");
+  });
+
+  it("includes scoring calibration scale", () => {
+    const prompt = buildStrategyPrompt(createTestInput());
+    expect(prompt).toContain("0.0-0.2: Poor fit");
+    expect(prompt).toContain("0.9-1.0: Excellent fit");
+  });
+
+  it("includes differentiation constraint", () => {
+    const prompt = buildStrategyPrompt(createTestInput());
+    expect(prompt).toContain("at least one axis per strategy scores below 0.5");
+  });
+
+  it("includes unique archetype constraint", () => {
+    const prompt = buildStrategyPrompt(createTestInput());
+    expect(prompt).toContain("different archetype label");
+  });
+
+  it("includes few-shot example", () => {
+    const prompt = buildStrategyPrompt(createTestInput());
+    expect(prompt).toContain("## Example");
+    expect(prompt).toContain("aggressive_fix");
+    expect(prompt).toContain("minimal_viable_action");
+  });
+
+  it("includes CoT nudge", () => {
+    const prompt = buildStrategyPrompt(createTestInput());
+    expect(prompt).toContain("First consider which archetypes best fit");
+  });
+
+  it("uses improved output format language", () => {
+    const prompt = buildStrategyPrompt(createTestInput());
+    expect(prompt).toContain("Respond with raw JSON only");
+    expect(prompt).toContain("Do not wrap in code fences");
+  });
+
+  it("includes never_do as hard constraints when present", () => {
+    const input = createTestInput();
+    input.neverDo = ["delete production data", "merge without review"];
+    const prompt = buildStrategyPrompt(input);
+    expect(prompt).toContain("Hard Constraints");
+    expect(prompt).toContain("delete production data; merge without review");
+    expect(prompt).toContain("score 0.0 on alignment");
+  });
+
+  it("omits hard constraints section when neverDo is empty", () => {
+    const input = createTestInput();
+    input.neverDo = [];
+    const prompt = buildStrategyPrompt(input);
+    expect(prompt).not.toContain("Hard Constraints");
+  });
+
+  it("omits hard constraints section when neverDo is undefined", () => {
+    const prompt = buildStrategyPrompt(createTestInput());
+    expect(prompt).not.toContain("Hard Constraints");
   });
 
   it("includes JSON schema instructions", () => {

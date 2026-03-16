@@ -125,6 +125,21 @@ describe("buildTriagePrompt", () => {
     expect(prompt).toContain("fix the login bug");
   });
 
+  it("anchors persona to user name", () => {
+    const prompt = buildTriagePrompt(createTestInput());
+    expect(prompt).toContain("acting on behalf of Michael");
+  });
+
+  it("falls back to 'the user' when no name", () => {
+    const input: TriageInput = {
+      observation: "hello",
+      facts: createDefaultKnowledge(),
+      priorities: createTestPriorities(),
+    };
+    const prompt = buildTriagePrompt(input);
+    expect(prompt).toContain("acting on behalf of the user");
+  });
+
   it("includes user identity from facts", () => {
     const prompt = buildTriagePrompt(createTestInput());
     expect(prompt).toContain("Michael");
@@ -147,6 +162,60 @@ describe("buildTriagePrompt", () => {
     expect(prompt).toContain("delete production data");
   });
 
+  it("includes always_ask_before preferences", () => {
+    const facts = createTestFacts({
+      preferences: {
+        ...createDefaultKnowledge().preferences,
+        never_do: [],
+        always_ask_before: ["deploying to production", "deleting branches"],
+      },
+    });
+    const input: TriageInput = {
+      observation: "test",
+      facts,
+      priorities: createTestPriorities(),
+    };
+    const prompt = buildTriagePrompt(input);
+    expect(prompt).toContain("Always ask before: deploying to production; deleting branches");
+  });
+
+  it("includes commitments when present", () => {
+    const facts = createTestFacts({
+      commitments: [
+        {
+          label: "standup",
+          recurrence: "daily",
+          time: "09:00",
+          timezone: "US/Central",
+          blocking: true,
+        },
+        {
+          label: "retro",
+          recurrence: "biweekly",
+          day: "Friday",
+          time: "15:00",
+          timezone: "US/Central",
+          blocking: false,
+        },
+      ],
+    });
+    const input: TriageInput = {
+      observation: "test",
+      facts,
+      priorities: createTestPriorities(),
+    };
+    const prompt = buildTriagePrompt(input);
+    expect(prompt).toContain("Active Commitments");
+    expect(prompt).toContain("standup: daily 09:00 (US/Central) [BLOCKING]");
+    expect(prompt).toContain("retro: biweekly Friday 15:00 (US/Central)");
+    expect(prompt).not.toContain("[BLOCKING]retro"); // non-blocking should not have tag
+  });
+
+  it("omits commitments section when empty", () => {
+    const prompt = buildTriagePrompt(createTestInput());
+    expect(prompt).not.toContain("Active Commitments");
+  });
+
   it("includes domains sorted by weight", () => {
     const prompt = buildTriagePrompt(createTestInput());
     const coreIdx = prompt.indexOf("core_project");
@@ -164,10 +233,39 @@ describe("buildTriagePrompt", () => {
     expect(prompt).toContain('"recommendedDomains"');
   });
 
-  it("includes priority guide", () => {
+  it("includes priority calibration", () => {
     const prompt = buildTriagePrompt(createTestInput());
     expect(prompt).toContain("1-2: Trivial");
     expect(prompt).toContain("9-10: Critical");
+    expect(prompt).toContain("conflicts with active commitments");
+  });
+
+  it("includes few-shot example", () => {
+    const prompt = buildTriagePrompt(createTestInput());
+    expect(prompt).toContain("## Example");
+    expect(prompt).toContain("deploy pipeline is failing");
+  });
+
+  it("includes ambiguity fallback instruction", () => {
+    const prompt = buildTriagePrompt(createTestInput());
+    expect(prompt).toContain("ambiguous");
+    expect(prompt).toContain("default to priority 5");
+  });
+
+  it("includes JSON self-verification instruction", () => {
+    const prompt = buildTriagePrompt(createTestInput());
+    expect(prompt).toContain("Verify your JSON is syntactically valid");
+  });
+
+  it("uses improved output format language", () => {
+    const prompt = buildTriagePrompt(createTestInput());
+    expect(prompt).toContain("Respond with raw JSON only");
+    expect(prompt).toContain("Do not wrap in code fences");
+  });
+
+  it("includes summary length constraint", () => {
+    const prompt = buildTriagePrompt(createTestInput());
+    expect(prompt).toContain("max 120 characters");
   });
 
   it("handles empty facts gracefully", () => {

@@ -27,6 +27,8 @@ export interface StrategyInput {
   priorities: PrioritiesFile;
   /** Original user observation */
   observation: string;
+  /** Hard constraints forwarded from user preferences (never_do) */
+  neverDo?: string[];
 }
 
 export interface StrategyResult {
@@ -72,11 +74,11 @@ export function buildStrategyPrompt(input: StrategyInput): string {
   const archetypes = formatArchetypes(input.priorities);
   const domains = formatDomains(input.priorities);
   const rubric = input.priorities.scoring_rubric;
+  const neverDo = input.neverDo ?? [];
 
-  return `You are a strategy advisor for an AI agent system.
+  return `You are a strategy advisor for an AI agent acting on behalf of the user.
 
-Given a situation report (SITREP) and domain context, generate 2-4 candidate
-strategies and score each on three axes.
+Given a SITREP and domain context, generate 2-4 candidate strategies using different archetypes, then score each on three axes.
 
 ## SITREP
 Priority: ${input.sitrep.priority}/10
@@ -86,34 +88,48 @@ Relevant facts: ${input.sitrep.relevantFacts.length > 0 ? input.sitrep.relevantF
 Recommended domains: ${input.sitrep.recommendedDomains.length > 0 ? input.sitrep.recommendedDomains.join(", ") : "none"}
 
 ## Original Observation
-${input.observation}
+${input.observation.slice(0, 500)}
 
 ## Available Strategy Archetypes
 ${archetypes}
 
 ## Active Domains
 ${domains}
+${neverDo.length > 0 ? `\n## Hard Constraints\nThe user has forbidden: ${neverDo.join("; ")}. Any strategy violating these must score 0.0 on alignment.` : ""}
 
 ## Scoring Axes
 Each strategy must be scored 0.0 to 1.0 on:
 - alignment (weight=${rubric.alignment.weight}): ${rubric.alignment.description}
 - efficiency (weight=${rubric.efficiency.weight}): ${rubric.efficiency.description}
-- risk (weight=${rubric.risk.weight}): ${rubric.risk.description} (higher = safer)
+- risk (weight=${rubric.risk.weight}): ${rubric.risk.description} (1.0 = safest, 0.0 = most dangerous)
 
-## Instructions
-Return ONLY a valid JSON array of 2-4 strategy objects:
+## Scoring Calibration
+- 0.0-0.2: Poor fit on this axis
+- 0.3-0.5: Acceptable but with clear tradeoffs
+- 0.6-0.8: Good fit
+- 0.9-1.0: Excellent fit, reserved for strong matches
+
+Ensure at least one axis per strategy scores below 0.5 to reflect real tradeoffs. Each strategy must use a different archetype label.
+
+## Example
+SITREP: priority=7, summary="User requests a code refactor"
+Output:
+[{"label":"aggressive_fix","reasoning":"High priority refactor aligns with active project goals","alignmentScore":0.9,"efficiencyScore":0.4,"riskScore":0.6},{"label":"minimal_viable_action","reasoning":"Extract interface first to reduce blast radius","alignmentScore":0.6,"efficiencyScore":0.9,"riskScore":0.9}]
+
+## Output Format
+First consider which archetypes best fit this situation, then score each honestly.
+
+Respond with raw JSON only. Do not wrap in code fences or add any text outside the JSON.
+
 [
   {
-    "label": "<archetype name>",
-    "reasoning": "<one-line rationale for this strategy>",
+    "label": "<archetype name from the list above>",
+    "reasoning": "<one sentence: why this archetype fits>",
     "alignmentScore": <0.0-1.0>,
     "efficiencyScore": <0.0-1.0>,
     "riskScore": <0.0-1.0>
   }
-]
-
-Pick from the available archetypes. Score honestly — do not inflate all scores.
-Return ONLY the JSON array. No markdown fences, no commentary.`;
+]`;
 }
 
 // ============================================================================

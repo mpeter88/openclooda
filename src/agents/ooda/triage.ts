@@ -68,6 +68,9 @@ function formatFactsBlock(facts: KnowledgeFile): string {
   if (facts.identity.timezone) {
     sections.push(`Timezone: ${facts.identity.timezone}`);
   }
+  if (facts.identity.communication_style) {
+    sections.push(`Communication style: ${facts.identity.communication_style}`);
+  }
 
   const stackEntries = Object.entries(facts.stack);
   if (stackEntries.length > 0) {
@@ -87,7 +90,24 @@ function formatFactsBlock(facts: KnowledgeFile): string {
     sections.push(`Never do: ${neverDo.join("; ")}`);
   }
 
+  const alwaysAsk = facts.preferences.always_ask_before;
+  if (alwaysAsk.length > 0) {
+    sections.push(`Always ask before: ${alwaysAsk.join("; ")}`);
+  }
+
   return sections.join("\n");
+}
+
+function formatCommitmentsBlock(facts: KnowledgeFile): string {
+  if (facts.commitments.length === 0) {
+    return "";
+  }
+  return facts.commitments
+    .map((c) => {
+      const when = c.day ? `${c.recurrence} ${c.day} ${c.time}` : `${c.recurrence} ${c.time}`;
+      return `  ${c.label}: ${when} (${c.timezone})${c.blocking ? " [BLOCKING]" : ""}`;
+    })
+    .join("\n");
 }
 
 function formatDomainsBlock(priorities: PrioritiesFile): string {
@@ -104,15 +124,17 @@ function formatDomainsBlock(priorities: PrioritiesFile): string {
 
 export function buildTriagePrompt(input: TriageInput): string {
   const factsBlock = formatFactsBlock(input.facts);
+  const commitmentsBlock = formatCommitmentsBlock(input.facts);
   const domainsBlock = formatDomainsBlock(input.priorities);
+  const userName = input.facts.identity.name || "the user";
 
-  return `You are a triage classifier for an AI agent system.
+  return `You are a domain-aware priority dispatcher for an AI agent acting on behalf of ${userName}.
 
-Given an observation and context about the user, produce a SITREP (situation report)
-that classifies the observation's priority and relevance.
+Given an observation, user context, and active domains, produce a SITREP (situation report) classifying this observation's priority and relevance to the user's current goals.
 
 ## User Context
 ${factsBlock || "No user context available."}
+${commitmentsBlock ? `\n## Active Commitments\n${commitmentsBlock}` : ""}
 
 ## Active Domains (priority weights)
 ${domainsBlock}
@@ -120,24 +142,32 @@ ${domainsBlock}
 ## Observation
 ${input.observation}
 
-## Instructions
-Classify this observation and return ONLY valid JSON matching this schema:
+## Example
+Observation: "The deploy pipeline is failing on staging"
+Output:
+{"priority":8,"summary":"Staging deploy pipeline failure — blocks releases","conflictsDetected":[],"relevantFacts":["projects.ooda-agent"],"recommendedDomains":["operations"]}
+
+## Output Format
+Respond with raw JSON only. Do not wrap in code fences or add any text outside the JSON.
+
 {
-  "priority": <number 1-10, where 1=trivial/greeting, 10=urgent/critical>,
-  "summary": "<one-sentence summary of the observation>",
-  "conflictsDetected": [<list of conflicts with known facts or commitments, or empty array>],
-  "relevantFacts": [<list of KNOWLEDGE.json keys that informed your reasoning, or empty array>],
-  "recommendedDomains": [<list of domain names from the priority list that apply, or empty array>]
+  "priority": <integer 1-10>,
+  "summary": "<one sentence, max 120 characters>",
+  "conflictsDetected": [<conflicts with known facts, commitments, or preferences — empty array if none>],
+  "relevantFacts": [<KNOWLEDGE.json keys that informed your reasoning — empty array if none>],
+  "recommendedDomains": [<domain names from the active domains list — empty array if none>]
 }
 
-Priority guide:
-- 1-2: Trivial (greetings, small talk, simple acknowledgments)
-- 3-4: Low (general questions, informational requests)
-- 5-6: Medium (task requests, code changes, decisions needed)
-- 7-8: High (time-sensitive work, blocking issues, commitments at risk)
-- 9-10: Critical (production incidents, security issues, deadline breaches)
+## Priority Calibration
+- 1-2: Trivial — greetings, acknowledgments, no action needed
+- 3-4: Low — general questions, informational requests
+- 5-6: Medium — task requests, code changes, decisions needed
+- 7-8: High — time-sensitive work, blocking issues, commitments at risk
+- 9-10: Critical — production incidents, security issues, deadline breaches, conflicts with active commitments
 
-Return ONLY the JSON object. No markdown fences, no commentary.`;
+If the observation is ambiguous or lacks enough information to classify confidently, default to priority 5 and note the ambiguity in the summary.
+
+Verify your JSON is syntactically valid before responding.`;
 }
 
 // ============================================================================
