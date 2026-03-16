@@ -1,0 +1,14 @@
+{
+  "id": "memory-ooda",
+  "kind": "memory",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "workspacePath": {
+        "type": "string",
+        "description": "Path to the OODA workspace directory containing KNOWLEDGE.json and PRIORITIES.json"
+      }
+    }
+  }
+}

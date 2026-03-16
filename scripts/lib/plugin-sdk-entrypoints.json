@@ -30,6 +30,7 @@
   "mattermost",
   "memory-core",
   "memory-lancedb",
+  "memory-ooda",
   "minimax-portal-auth",
   "nextcloud-talk",
   "nostr",
