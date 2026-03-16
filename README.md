@@ -118,7 +118,9 @@ pnpm test
 
 ### Configuration
 
-Configure in `openclaw.json`:
+OpenCLOODA uses two plugins that need configuration in `openclaw.json`:
+
+**1. memory-ooda** -- the OODA reasoning chain and semantic memory (Tier 3)
 
 ```json
 {
@@ -131,6 +133,56 @@ Configure in `openclaw.json`:
   }
 }
 ```
+
+**2. memory-lancedb** -- episodic memory (Tier 2) with vector embeddings
+
+The episodic tier stores conversation memories as vectors in LanceDB and retrieves them via similarity search. It needs an embedding provider:
+
+```json
+{
+  "extensions": {
+    "memory-lancedb": {
+      "embedding": {
+        "apiKey": "${OPENAI_API_KEY}",
+        "model": "text-embedding-3-small"
+      },
+      "autoCapture": true,
+      "autoRecall": true
+    }
+  }
+}
+```
+
+**Embedding options:**
+
+| Setting                | Default                      | Description                                |
+| ---------------------- | ---------------------------- | ------------------------------------------ |
+| `embedding.apiKey`     | (required)                   | OpenAI API key, or use `${ENV_VAR}` syntax |
+| `embedding.model`      | `text-embedding-3-small`     | Embedding model (1536 dims)                |
+| `embedding.baseUrl`    | OpenAI API                   | Override for compatible providers          |
+| `embedding.dimensions` | Auto from model              | Required for non-standard models           |
+| `dbPath`               | `~/.openclaw/memory/lancedb` | LanceDB storage location                   |
+
+**Using a local/alternative embedding provider:**
+
+Any OpenAI-compatible embeddings endpoint works. For example, with Ollama:
+
+```json
+{
+  "extensions": {
+    "memory-lancedb": {
+      "embedding": {
+        "apiKey": "not-needed",
+        "model": "nomic-embed-text",
+        "baseUrl": "http://localhost:11434/v1",
+        "dimensions": 768
+      }
+    }
+  }
+}
+```
+
+**Agent model configuration** is handled by OpenClaw's standard provider system -- configure your preferred LLM provider (Anthropic, OpenAI, Ollama, etc.) in the `connections` section of `openclaw.json`. The OODA triage and strategy phases use whatever model OpenClaw routes to. See the [OpenClaw docs](https://docs.openclaw.ai/configuration) for provider setup.
 
 ### CLI commands
 
