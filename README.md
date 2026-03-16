@@ -1,4 +1,4 @@
-# OpenClOODA
+# OpenCLOODA
 
 Cognitive OODA agent layer for [OpenClaw](https://github.com/openclaw/openclaw). Transforms the flat Observe-Plan-Act agent loop into a stateful, goal-oriented system with tri-tier memory, structured decision-making, and self-correcting learning.
 
@@ -6,7 +6,7 @@ Cognitive OODA agent layer for [OpenClaw](https://github.com/openclaw/openclaw).
 
 OpenClaw is a multi-channel AI gateway that connects to WhatsApp, Telegram, Discord, Slack, and 30+ other surfaces. By default, every turn runs one model call: observe input, plan, act.
 
-OpenClOODA adds a reasoning chain on top:
+OpenCLOODA adds a reasoning chain on top:
 
 ```
 Observation
@@ -87,7 +87,7 @@ cr/
 
 ## Setup
 
-OpenClOODA is built as a plugin for OpenClaw. It requires the OpenClaw repo as a baseline.
+OpenCLOODA is built as a plugin for OpenClaw. It requires the OpenClaw repo as a baseline.
 
 ```bash
 git clone https://github.com/mpeter88/openclooda.git
