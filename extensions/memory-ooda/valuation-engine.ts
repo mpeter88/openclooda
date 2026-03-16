@@ -10,7 +10,7 @@
  * generation but not the valuation formula directly.
  */
 
-import type { PrioritiesFile, Strategy } from "../../../extensions/memory-ooda/types.js";
+import type { PrioritiesFile, Strategy } from "./types.js";
 
 // ============================================================================
 // Types

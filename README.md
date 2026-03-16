@@ -65,29 +65,43 @@ V = (alignment x 0.40) + (efficiency x 0.35) + (risk x 0.25)
 ```
 extensions/memory-ooda/
   index.ts              # Plugin entry point (hooks, CLI, service)
-  semantic-memory.ts    # KNOWLEDGE.json read/write/format
-  priorities.ts         # PRIORITIES.json read/write/weight updates
-  snapshot.ts           # Timestamped backup/restore for safe writes
-  proposals.ts          # Policy proposal CRUD
-  archivist.ts          # Tier 2 -> Tier 3 distillation
-  cli.ts                # `openclaw workspace` commands
   types.ts              # Canonical type definitions
-
-src/agents/ooda/
   triage.ts             # Phase A: lightweight model produces SITREP
   strategy.ts           # Phase B: decision matrix + scoring
   valuation-engine.ts   # V = sum(Si x Wi) scoring math
   meta-reviewer.ts      # Double-loop: outcome tracking + weight adjustment
+  archivist.ts          # Tier 2 -> Tier 3 distillation
+  semantic-memory.ts    # KNOWLEDGE.json read/write/format
+  priorities.ts         # PRIORITIES.json read/write/weight updates
+  snapshot.ts           # Timestamped backup/restore for safe writes
+  proposals.ts          # Policy proposal CRUD
   parse-utils.ts        # Shared JSON parsing utilities
+  cli.ts                # `openclaw workspace` commands
 
 cr/
   CR_FULL_SYSTEM_PEER_REVIEW.md   # 24-finding peer review
   STATUS.md                        # CR tracking
 ```
 
+## Architecture
+
+OpenCLOODA is a self-contained OpenClaw plugin. All code lives in a single directory (`extensions/memory-ooda/`) with no dependencies on OpenClaw core internals. It integrates entirely through the plugin hook system:
+
+- `before_agent_start` -- runs triage, injects SITREP + strategy into context
+- `agent_end` -- outcome tracking, meta-reviewer
+- Timer/interval -- archivist distillation (Tier 2 to Tier 3)
+
+OpenCLOODA depends on the `memory-lancedb` plugin for Tier 2 episodic storage and embedding (OpenAI `text-embedding-3-small`). The two plugins work together but are independently installable.
+
 ## Setup
 
-OpenCLOODA is built as a plugin for OpenClaw. It requires the OpenClaw repo as a baseline.
+### As a plugin (standalone install)
+
+```bash
+npm install @openclaw/memory-ooda
+```
+
+### Development (from source)
 
 ```bash
 git clone https://github.com/mpeter88/openclooda.git
@@ -100,7 +114,7 @@ pnpm build
 
 ```bash
 # OODA-specific tests (279 tests)
-pnpm test -- extensions/memory-ooda/ src/agents/ooda/
+pnpm test -- extensions/memory-ooda/
 
 # Full suite
 pnpm test
@@ -108,7 +122,7 @@ pnpm test
 
 ### Configuration
 
-The plugin is enabled by default. Configure in `openclaw.json`:
+Configure in `openclaw.json`:
 
 ```json
 {
@@ -157,18 +171,19 @@ openclaw workspace rollback restore priorities # Restore PRIORITIES.json
 
 ## Implementation status
 
-All 7 PRs from the spec are implemented. A 24-finding peer review has been completed and all findings addressed.
+All 7 PRs from the spec are implemented, peer-reviewed (24 findings addressed), and consolidated into a single standalone plugin.
 
-| PR  | Description                        | Status      |
-| --- | ---------------------------------- | ----------- |
-| 1   | Tier 3 semantic memory (extension) | Done        |
-| 2   | Tier 2 episodic memory extensions  | Done        |
-| 3   | Triage phase (core)                | Done        |
-| 4   | Decision matrix + VALUATION_ENGINE | Done        |
-| 5   | Archivist cron                     | Done        |
-| 6   | Meta-Reviewer + outcome tracking   | Done        |
-| 7   | Feature flag removal + CLI         | Done        |
-| CR  | Peer review (24 findings)          | Implemented |
+| PR  | Description                        | Status |
+| --- | ---------------------------------- | ------ |
+| 1   | Tier 3 semantic memory             | Done   |
+| 2   | Tier 2 episodic memory extensions  | Done   |
+| 3   | Triage phase                       | Done   |
+| 4   | Decision matrix + VALUATION_ENGINE | Done   |
+| 5   | Archivist cron                     | Done   |
+| 6   | Meta-Reviewer + outcome tracking   | Done   |
+| 7   | Feature flag removal + CLI         | Done   |
+| CR  | Peer review (24 findings)          | Done   |
+| --  | Plugin extraction (standalone)     | Done   |
 
 ## Spec
 

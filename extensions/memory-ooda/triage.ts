@@ -8,12 +8,8 @@
  * Feature-flagged off by default.
  */
 
-import type {
-  KnowledgeFile,
-  PrioritiesFile,
-  SITREP,
-} from "../../../extensions/memory-ooda/types.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
+import type { KnowledgeFile, PrioritiesFile, SITREP } from "./types.js";
 
 // ============================================================================
 // Types

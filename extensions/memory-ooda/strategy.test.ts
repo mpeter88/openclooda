@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import type { PrioritiesFile, SITREP } from "../../../extensions/memory-ooda/types.js";
 import {
   buildStrategyPrompt,
   createDefaultStrategy,
@@ -8,6 +7,7 @@ import {
   type StrategyInput,
 } from "./strategy.js";
 import type { ModelCallFn } from "./triage.js";
+import type { PrioritiesFile, SITREP } from "./types.js";
 
 // ============================================================================
 // Fixtures

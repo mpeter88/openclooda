@@ -7,9 +7,9 @@
  * Feature-flagged off by default.
  */
 
-import type { PrioritiesFile, SITREP, Strategy } from "../../../extensions/memory-ooda/types.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import type { ModelCallFn } from "./triage.js";
+import type { PrioritiesFile, SITREP, Strategy } from "./types.js";
 import {
   scoreStrategies,
   validateDomainWeights,

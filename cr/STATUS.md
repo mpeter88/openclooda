@@ -29,6 +29,6 @@
 
 At session start:
 
-- [ ] `pnpm test -- extensions/memory-ooda/ src/agents/ooda/` — all 256 tests pass
+- [ ] `pnpm test -- extensions/memory-ooda/` — all 279 tests pass
 - [ ] `git log --oneline` — PRs 1-7 present on `main`
 - [ ] Review `STATUS.md` for outstanding items

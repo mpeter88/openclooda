@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createDefaultKnowledge } from "../../../extensions/memory-ooda/semantic-memory.js";
-import type { KnowledgeFile, PrioritiesFile } from "../../../extensions/memory-ooda/types.js";
+import { createDefaultKnowledge } from "./semantic-memory.js";
 import {
   buildTriagePrompt,
   createDefaultSITREP,
@@ -10,6 +9,7 @@ import {
   type ModelCallFn,
   type TriageInput,
 } from "./triage.js";
+import type { KnowledgeFile, PrioritiesFile } from "./types.js";
 
 // ============================================================================
 // Test Fixtures

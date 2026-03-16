@@ -2,7 +2,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ModelCallFn } from "../../src/agents/ooda/triage.js";
 import {
   buildArchivistPrompt,
   parsePatterns,
@@ -17,6 +16,7 @@ import {
   type PatternExtraction,
   type SemanticStore,
 } from "./archivist.js";
+import type { ModelCallFn } from "./triage.js";
 
 // ============================================================================
 // Fixtures

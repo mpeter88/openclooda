@@ -16,15 +16,15 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { errorMessage, stripCodeFences } from "./parse-utils.js";
+import type { ModelCallFn } from "./triage.js";
 import type {
   ActualOutcome,
   CriticalFailureEvent,
   DomainEntry,
   PolicyProposal,
   PrioritiesFile,
-} from "../../../extensions/memory-ooda/types.js";
-import { errorMessage, stripCodeFences } from "./parse-utils.js";
-import type { ModelCallFn } from "./triage.js";
+} from "./types.js";
 
 // ============================================================================
 // Types

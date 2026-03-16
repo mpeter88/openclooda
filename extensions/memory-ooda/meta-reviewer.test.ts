@@ -1,12 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import type {
-  ActualOutcome,
-  CriticalFailureEvent,
-  DomainEntry,
-  ExpectedOutcome,
-  PolicyProposal,
-  PrioritiesFile,
-} from "../../../extensions/memory-ooda/types.js";
 import {
   adjustWeights,
   buildPolicyReviewPrompt,
@@ -19,6 +11,14 @@ import {
   type ProposalStore,
 } from "./meta-reviewer.js";
 import type { ModelCallFn } from "./triage.js";
+import type {
+  ActualOutcome,
+  CriticalFailureEvent,
+  DomainEntry,
+  ExpectedOutcome,
+  PolicyProposal,
+  PrioritiesFile,
+} from "./types.js";
 
 // ============================================================================
 // Fixtures

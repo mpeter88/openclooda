@@ -10,8 +10,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { errorMessage, stripCodeFences } from "../../src/agents/ooda/parse-utils.js";
-import type { ModelCallFn } from "../../src/agents/ooda/triage.js";
+import { errorMessage, stripCodeFences } from "./parse-utils.js";
+import type { ModelCallFn } from "./triage.js";
 
 // ============================================================================
 // Types
