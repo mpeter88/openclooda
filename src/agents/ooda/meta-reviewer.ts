@@ -23,6 +23,7 @@ import type {
   PolicyProposal,
   PrioritiesFile,
 } from "../../../extensions/memory-ooda/types.js";
+import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import type { ModelCallFn } from "./triage.js";
 
 // ============================================================================
@@ -49,6 +50,8 @@ export interface MetaReviewerResult {
   proposalsCreated: PolicyProposal[];
   weightsAdjusted: Array<{ domain: string; oldWeight: number; newWeight: number }>;
   fromFallback: boolean;
+  /** Last error from model call attempts, if any. */
+  lastError?: string;
 }
 
 // ============================================================================
@@ -74,6 +77,16 @@ export function calculateWeightAdjustment(domain: DomainEntry): {
   newWeight: number;
   shouldAdjust: boolean;
 } {
+  // Guard against NaN/negative counts from manually edited files
+  if (
+    !Number.isFinite(domain.approval_count) ||
+    domain.approval_count < 0 ||
+    !Number.isFinite(domain.override_count) ||
+    domain.override_count < 0
+  ) {
+    return { newWeight: domain.weight, shouldAdjust: false };
+  }
+
   const totalObservations = domain.approval_count + domain.override_count;
 
   if (totalObservations < MIN_OBSERVATIONS) {
@@ -110,12 +123,16 @@ export function adjustWeights(
     const { newWeight, shouldAdjust } = calculateWeightAdjustment(entry);
     if (shouldAdjust) {
       const oldWeight = entry.weight;
-      store.updateDomainWeight(
-        name,
-        newWeight,
-        `Meta-reviewer auto-adjustment: ${entry.approval_count} approvals, ${entry.override_count} overrides`,
-      );
-      adjustments.push({ domain: name, oldWeight, newWeight });
+      try {
+        store.updateDomainWeight(
+          name,
+          newWeight,
+          `Meta-reviewer auto-adjustment: ${entry.approval_count} approvals, ${entry.override_count} overrides`,
+        );
+        adjustments.push({ domain: name, oldWeight, newWeight });
+      } catch {
+        // Log and continue — don't let one domain block others
+      }
     }
   }
 
@@ -148,7 +165,11 @@ export function classifyFailureSeverity(outcome: ActualOutcome): "warning" | "cr
  * a policy review (model call).
  */
 export function shouldTriggerPolicyReview(event: CriticalFailureEvent): boolean {
-  return event.severity === "critical" && event.implicated_rule !== undefined;
+  return (
+    event.severity === "critical" &&
+    typeof event.implicated_rule === "string" &&
+    event.implicated_rule.length > 0
+  );
 }
 
 // ============================================================================
@@ -226,15 +247,6 @@ Verify your JSON is syntactically valid before responding.`;
 // ============================================================================
 // Response Parsing
 // ============================================================================
-
-function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (match) {
-    return (match[1] ?? "").trim();
-  }
-  return trimmed;
-}
 
 export interface RawProposal {
   rule: string;
@@ -314,6 +326,7 @@ export async function runMetaReviewer(
   const reviewable = input.failures.filter(shouldTriggerPolicyReview);
   let proposalsCreated: PolicyProposal[] = [];
   let fromFallback = false;
+  let lastError: unknown;
 
   if (reviewable.length > 0) {
     const prompt = buildPolicyReviewPrompt(reviewable);
@@ -335,8 +348,10 @@ export async function runMetaReviewer(
           proposalsCreated.push(proposal);
         }
 
+        lastError = undefined;
         break;
-      } catch {
+      } catch (err) {
+        lastError = err;
         if (attempt === maxRetries) {
           fromFallback = true;
         }
@@ -351,5 +366,6 @@ export async function runMetaReviewer(
     proposalsCreated,
     weightsAdjusted,
     fromFallback,
+    lastError: lastError ? errorMessage(lastError) : undefined,
   };
 }

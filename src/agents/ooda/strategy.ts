@@ -8,6 +8,7 @@
  */
 
 import type { PrioritiesFile, SITREP, Strategy } from "../../../extensions/memory-ooda/types.js";
+import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import type { ModelCallFn } from "./triage.js";
 import {
   scoreStrategies,
@@ -38,6 +39,8 @@ export interface StrategyResult {
   winner: Strategy;
   /** Whether we fell back to a default strategy */
   fromFallback: boolean;
+  /** Last error from model call attempts, if any. */
+  lastError?: string;
 }
 
 // ============================================================================
@@ -51,7 +54,7 @@ export function createDefaultStrategy(sitrep: SITREP): Strategy {
     alignmentScore: 0.5,
     efficiencyScore: 0.7,
     riskScore: 0.8,
-    weightedTotal: 0.0, // will be scored
+    weightedTotal: 0.0,
   };
 }
 
@@ -136,15 +139,6 @@ Respond with raw JSON only. Do not wrap in code fences or add any text outside t
 // Response Parsing
 // ============================================================================
 
-function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (match) {
-    return (match[1] ?? "").trim();
-  }
-  return trimmed;
-}
-
 export function parseStrategyCandidates(raw: string): UnscoredStrategy[] {
   const cleaned = stripCodeFences(raw);
   const parsed = JSON.parse(cleaned);
@@ -153,7 +147,7 @@ export function parseStrategyCandidates(raw: string): UnscoredStrategy[] {
     throw new Error("Strategy response must be a JSON array");
   }
 
-  if (parsed.length < 1 || parsed.length > 6) {
+  if (parsed.length < 2 || parsed.length > 4) {
     throw new Error(`Expected 2-4 strategies, got ${parsed.length}`);
   }
 
@@ -170,14 +164,22 @@ export function parseStrategyCandidates(raw: string): UnscoredStrategy[] {
     if (typeof obj.reasoning !== "string" || obj.reasoning.length === 0) {
       throw new Error(`Strategy[${idx}] must have non-empty reasoning`);
     }
-    if (typeof obj.alignmentScore !== "number") {
-      throw new Error(`Strategy[${idx}].alignmentScore must be a number`);
+    if (
+      typeof obj.alignmentScore !== "number" ||
+      obj.alignmentScore < 0 ||
+      obj.alignmentScore > 1
+    ) {
+      throw new Error(`Strategy[${idx}].alignmentScore must be a number in [0, 1]`);
     }
-    if (typeof obj.efficiencyScore !== "number") {
-      throw new Error(`Strategy[${idx}].efficiencyScore must be a number`);
+    if (
+      typeof obj.efficiencyScore !== "number" ||
+      obj.efficiencyScore < 0 ||
+      obj.efficiencyScore > 1
+    ) {
+      throw new Error(`Strategy[${idx}].efficiencyScore must be a number in [0, 1]`);
     }
-    if (typeof obj.riskScore !== "number") {
-      throw new Error(`Strategy[${idx}].riskScore must be a number`);
+    if (typeof obj.riskScore !== "number" || obj.riskScore < 0 || obj.riskScore > 1) {
+      throw new Error(`Strategy[${idx}].riskScore must be a number in [0, 1]`);
     }
 
     return {
@@ -235,6 +237,7 @@ export async function runStrategy(
   }
 
   const prompt = buildStrategyPrompt(input);
+  let lastError: unknown;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -247,8 +250,8 @@ export async function runStrategy(
         winner: scored[0],
         fromFallback: false,
       };
-    } catch {
-      // Retry on next iteration or fall through to fallback
+    } catch (err) {
+      lastError = err;
     }
   }
 
@@ -271,5 +274,6 @@ export async function runStrategy(
     candidates: scored,
     winner: scored[0],
     fromFallback: true,
+    lastError: lastError ? errorMessage(lastError) : undefined,
   };
 }

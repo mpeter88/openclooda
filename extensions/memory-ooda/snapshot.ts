@@ -66,7 +66,7 @@ export function createSnapshot(
   if (!fs.existsSync(sourcePath)) return null;
 
   const dir = ensureSnapshotsDir(workspacePath);
-  const timestamp = Math.floor(Date.now() / 1000);
+  const timestamp = Date.now();
   const snapshotPath = path.join(dir, `${filename}.${timestamp}.bak`);
 
   fs.copyFileSync(sourcePath, snapshotPath);
@@ -76,8 +76,8 @@ export function createSnapshot(
   for (const old of existing.slice(maxSnapshots)) {
     try {
       fs.unlinkSync(old.path);
-    } catch {
-      // best-effort cleanup
+    } catch (err) {
+      console.warn(`snapshot: failed to prune ${old.path}: ${String(err)}`);
     }
   }
 
@@ -90,9 +90,16 @@ export function createSnapshot(
  */
 export function restoreLatestSnapshot(workspacePath: string, filename: string): boolean {
   const snapshots = listSnapshots(workspacePath, filename);
-  if (snapshots.length === 0) return false;
-
   const targetPath = path.join(workspacePath, filename);
-  fs.copyFileSync(snapshots[0].path, targetPath);
-  return true;
+
+  for (const snapshot of snapshots) {
+    try {
+      fs.copyFileSync(snapshot.path, targetPath);
+      return true;
+    } catch {
+      continue; // Try next oldest snapshot
+    }
+  }
+
+  return false;
 }

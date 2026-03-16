@@ -171,14 +171,15 @@ export function updateDomainWeight(
   }
 
   const oldWeight = priorities.domains[domain].weight;
-  priorities.domains[domain].weight = newWeight;
+  const roundedWeight = Math.round(newWeight * 1000) / 1000;
+  priorities.domains[domain].weight = roundedWeight;
   priorities._meta.updated_by = "meta_reviewer";
 
   priorities._weight_adjustment_log.push({
     timestamp: new Date().toISOString(),
     domain,
     old_weight: oldWeight,
-    new_weight: newWeight,
+    new_weight: roundedWeight,
     reason,
   });
 

@@ -1,6 +1,6 @@
 # CR Status Log
 
-**Last updated:** 2026-03-16 (Initial peer review session — PRs 1-7 complete)
+**Last updated:** 2026-03-16 (CR findings implemented)
 **Branch:** `main`
 
 ## Status Key
@@ -16,13 +16,14 @@
 
 ## Active CRs
 
-| CR                           | Date       | Status    | Items                         | Notes                                                                     |
-| ---------------------------- | ---------- | --------- | ----------------------------- | ------------------------------------------------------------------------- |
-| `CR_FULL_SYSTEM_PEER_REVIEW` | 2026-03-16 | `WRITTEN` | 24 findings (3C, 6H, 11M, 4L) | 4-agent parallel review of 12 source files. 11 test gap cases identified. |
+| CR                           | Date       | Status        | Items                         | Notes                                                             |
+| ---------------------------- | ---------- | ------------- | ----------------------------- | ----------------------------------------------------------------- |
+| `CR_FULL_SYSTEM_PEER_REVIEW` | 2026-03-16 | `IMPLEMENTED` | 24 findings (3C, 6H, 11M, 4L) | All 24 findings fixed. 279 tests pass (was 256). M6/M11 deferred. |
 
 ## Deferred Items
 
-None yet — all findings are pending implementation.
+- **M6** (`upsertFact` turn count): Adding `currentTurn` param would break the SemanticStore interface across all callers. Deferred to next API iteration.
+- **M11** (logger injection): Requires threading an `OodaLogger` interface through all `run*()` functions. Deferred as a cross-cutting concern for post-MVP.
 
 ## Verification Protocol
 

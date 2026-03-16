@@ -139,10 +139,13 @@ export function upsertFact(
 
 /**
  * Append an entry to the _archivist_log.
+ * Takes a snapshot before writing (matching upsertFact safety pattern).
  */
 export function appendArchivistLog(workspacePath: string, action: string, reason: string): void {
   const knowledge = getFacts(workspacePath);
   const filePath = knowledgePath(workspacePath);
+
+  createSnapshot(workspacePath, KNOWLEDGE_FILENAME);
 
   knowledge._archivist_log.push({
     timestamp: new Date().toISOString(),
@@ -152,7 +155,16 @@ export function appendArchivistLog(workspacePath: string, action: string, reason
 
   knowledge._meta.updated_at = new Date().toISOString();
 
-  fs.writeFileSync(filePath, JSON.stringify(knowledge, null, 2) + "\n", "utf-8");
+  const json = JSON.stringify(knowledge, null, 2) + "\n";
+
+  try {
+    JSON.parse(json);
+  } catch {
+    restoreLatestSnapshot(workspacePath, KNOWLEDGE_FILENAME);
+    throw new Error("appendArchivistLog produced invalid JSON; snapshot restored");
+  }
+
+  fs.writeFileSync(filePath, json, "utf-8");
 }
 
 /**

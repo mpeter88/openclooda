@@ -232,13 +232,58 @@ describe("parseStrategyCandidates", () => {
     expect(() => parseStrategyCandidates('{"label": "test"}')).toThrow("must be a JSON array");
   });
 
-  it("rejects empty array", () => {
+  it("rejects empty array (M1)", () => {
     expect(() => parseStrategyCandidates("[]")).toThrow("Expected 2-4 strategies, got 0");
+  });
+
+  it("rejects single strategy (M1)", () => {
+    const one = JSON.stringify([
+      {
+        label: "fix",
+        reasoning: "test",
+        alignmentScore: 0.5,
+        efficiencyScore: 0.5,
+        riskScore: 0.5,
+      },
+    ]);
+    expect(() => parseStrategyCandidates(one)).toThrow("Expected 2-4 strategies, got 1");
+  });
+
+  it("rejects more than 4 strategies (M1)", () => {
+    const five = Array.from({ length: 5 }, (_, i) => ({
+      label: `s${i}`,
+      reasoning: "test",
+      alignmentScore: 0.5,
+      efficiencyScore: 0.5,
+      riskScore: 0.5,
+    }));
+    expect(() => parseStrategyCandidates(JSON.stringify(five))).toThrow(
+      "Expected 2-4 strategies, got 5",
+    );
+  });
+
+  it("rejects out-of-range scores (M2)", () => {
+    const bad = JSON.stringify([
+      { label: "a", reasoning: "r", alignmentScore: 1.5, efficiencyScore: 0.5, riskScore: 0.5 },
+      { label: "b", reasoning: "r", alignmentScore: 0.5, efficiencyScore: 0.5, riskScore: 0.5 },
+    ]);
+    expect(() => parseStrategyCandidates(bad)).toThrow("alignmentScore must be a number in [0, 1]");
+  });
+
+  it("rejects negative scores (M2)", () => {
+    const bad = JSON.stringify([
+      { label: "a", reasoning: "r", alignmentScore: 0.5, efficiencyScore: -0.1, riskScore: 0.5 },
+      { label: "b", reasoning: "r", alignmentScore: 0.5, efficiencyScore: 0.5, riskScore: 0.5 },
+    ]);
+    expect(() => parseStrategyCandidates(bad)).toThrow(
+      "efficiencyScore must be a number in [0, 1]",
+    );
   });
 
   it("rejects missing label", () => {
     const bad = JSON.stringify([
       { reasoning: "test", alignmentScore: 0.5, efficiencyScore: 0.5, riskScore: 0.5 },
+      { label: "b", reasoning: "r", alignmentScore: 0.5, efficiencyScore: 0.5, riskScore: 0.5 },
     ]);
     expect(() => parseStrategyCandidates(bad)).toThrow("non-empty label");
   });
@@ -246,6 +291,7 @@ describe("parseStrategyCandidates", () => {
   it("rejects missing reasoning", () => {
     const bad = JSON.stringify([
       { label: "test", alignmentScore: 0.5, efficiencyScore: 0.5, riskScore: 0.5 },
+      { label: "b", reasoning: "r", alignmentScore: 0.5, efficiencyScore: 0.5, riskScore: 0.5 },
     ]);
     expect(() => parseStrategyCandidates(bad)).toThrow("non-empty reasoning");
   });
@@ -259,8 +305,9 @@ describe("parseStrategyCandidates", () => {
         efficiencyScore: 0.5,
         riskScore: 0.5,
       },
+      { label: "b", reasoning: "r", alignmentScore: 0.5, efficiencyScore: 0.5, riskScore: 0.5 },
     ]);
-    expect(() => parseStrategyCandidates(bad)).toThrow("alignmentScore must be a number");
+    expect(() => parseStrategyCandidates(bad)).toThrow("alignmentScore must be a number in [0, 1]");
   });
 
   it("rejects invalid JSON", () => {

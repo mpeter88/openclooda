@@ -210,6 +210,19 @@ describe("calculateWeightAdjustment", () => {
     expect(result.shouldAdjust).toBe(false);
   });
 
+  it("does not adjust when approval_count is NaN (H3)", () => {
+    const domain = createTestDomain({ approval_count: NaN, override_count: 5 });
+    const result = calculateWeightAdjustment(domain);
+    expect(result.shouldAdjust).toBe(false);
+    expect(result.newWeight).toBe(domain.weight);
+  });
+
+  it("does not adjust when override_count is negative (H3)", () => {
+    const domain = createTestDomain({ approval_count: 10, override_count: -5 });
+    const result = calculateWeightAdjustment(domain);
+    expect(result.shouldAdjust).toBe(false);
+  });
+
   it("adjusts exactly at minimum observation threshold", () => {
     const domain = createTestDomain({
       weight: 0.5,
@@ -302,6 +315,11 @@ describe("shouldTriggerPolicyReview", () => {
     const event = createTestFailure({ severity: "critical", implicated_rule: undefined });
     expect(shouldTriggerPolicyReview(event)).toBe(false);
   });
+
+  it("returns false for empty implicated_rule string (H2)", () => {
+    const event = createTestFailure({ severity: "critical", implicated_rule: "" });
+    expect(shouldTriggerPolicyReview(event)).toBe(false);
+  });
 });
 
 // ============================================================================
@@ -339,6 +357,37 @@ describe("adjustWeights", () => {
 
     const adjustments = adjustWeights(priorities, store);
     expect(adjustments).toHaveLength(0);
+  });
+
+  it("continues adjusting when one domain throws (M10)", () => {
+    const priorities = createTestPriorities({
+      operations: createTestDomain({
+        weight: 0.5,
+        approval_count: 12,
+        override_count: 2,
+      }),
+      core_project: createTestDomain({
+        weight: 0.8,
+        approval_count: 2,
+        override_count: 10,
+      }),
+    });
+    let callCount = 0;
+    const store: PrioritiesStore = {
+      getPriorities() {
+        return priorities;
+      },
+      updateDomainWeight(_domain: string, _newWeight: number, _reason: string) {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("disk full");
+        }
+      },
+    };
+
+    const adjustments = adjustWeights(priorities, store);
+    // First domain should fail, second should succeed
+    expect(adjustments).toHaveLength(1);
   });
 
   it("adjusts multiple domains independently", () => {

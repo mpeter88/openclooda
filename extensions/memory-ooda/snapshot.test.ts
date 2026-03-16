@@ -35,13 +35,13 @@ describe("snapshot", () => {
     // Create snapshots with different timestamps by manipulating files directly
     const snapshotsDir = path.join(tmpDir, ".snapshots");
     fs.mkdirSync(snapshotsDir, { recursive: true });
-    fs.writeFileSync(path.join(snapshotsDir, "KNOWLEDGE.json.1000.bak"), "old");
-    fs.writeFileSync(path.join(snapshotsDir, "KNOWLEDGE.json.2000.bak"), "new");
+    fs.writeFileSync(path.join(snapshotsDir, "KNOWLEDGE.json.1000000.bak"), "old");
+    fs.writeFileSync(path.join(snapshotsDir, "KNOWLEDGE.json.2000000.bak"), "new");
 
     const list = listSnapshots(tmpDir, "KNOWLEDGE.json");
     expect(list).toHaveLength(2);
-    expect(list[0].timestamp).toBe(2000);
-    expect(list[1].timestamp).toBe(1000);
+    expect(list[0].timestamp).toBe(2000000);
+    expect(list[1].timestamp).toBe(1000000);
   });
 
   it("prunes old snapshots beyond max", () => {

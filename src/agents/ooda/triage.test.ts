@@ -310,9 +310,14 @@ describe("parseSITREP", () => {
   it("rejects invalid priority values", () => {
     expect(() => parseSITREP('{"priority": 0, "summary": "test"}')).toThrow("Invalid priority");
     expect(() => parseSITREP('{"priority": 11, "summary": "test"}')).toThrow("Invalid priority");
-    expect(() => parseSITREP('{"priority": 5.5, "summary": "test"}')).toThrow("Invalid priority");
     expect(() => parseSITREP('{"priority": "high", "summary": "test"}')).toThrow(
       "Invalid priority",
+    );
+  });
+
+  it("rejects non-integer priority (M3)", () => {
+    expect(() => parseSITREP('{"priority": 5.5, "summary": "test"}')).toThrow(
+      "Must be an integer 1-10",
     );
   });
 

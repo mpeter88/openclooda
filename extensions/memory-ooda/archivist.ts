@@ -10,6 +10,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { errorMessage, stripCodeFences } from "../../src/agents/ooda/parse-utils.js";
 import type { ModelCallFn } from "../../src/agents/ooda/triage.js";
 
 // ============================================================================
@@ -73,6 +74,8 @@ export interface ArchivistResult {
   eventsProcessed: number;
   eventsPruned: number;
   fromFallback: boolean;
+  /** Last error from model call attempts, if any. */
+  lastError?: string;
 }
 
 // ============================================================================
@@ -97,6 +100,10 @@ export function readState(workspacePath: string): ArchivistState {
 
   if (typeof parsed.last_run_turn !== "number" || typeof parsed.last_run_at !== "string") {
     throw new Error("Invalid .archivist-state.json: missing last_run_turn or last_run_at");
+  }
+
+  if (isNaN(new Date(parsed.last_run_at).getTime())) {
+    throw new Error("Invalid .archivist-state.json: last_run_at is not a valid timestamp");
   }
 
   return parsed as ArchivistState;
@@ -129,12 +136,18 @@ export function shouldRunArchivist(
 // Prompt Construction
 // ============================================================================
 
+const MAX_EVENT_TEXT_LENGTH = 200;
+
 function formatEventsBlock(events: EpisodicEvent[]): string {
   return events
     .map((e, i) => {
       const date = new Date(e.createdAt).toISOString().slice(0, 16);
       const source = e.source ? ` [${e.source}]` : "";
-      return `${i + 1}. (${date}${source}, importance=${e.importance}) ${e.text}`;
+      const text =
+        e.text.length > MAX_EVENT_TEXT_LENGTH
+          ? e.text.slice(0, MAX_EVENT_TEXT_LENGTH) + "..."
+          : e.text;
+      return `${i + 1}. (${date}${source}, importance=${e.importance}) ${text}`;
     })
     .join("\n");
 }
@@ -192,15 +205,6 @@ Verify your JSON is syntactically valid before responding.`;
 // Response Parsing
 // ============================================================================
 
-function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (match) {
-    return (match[1] ?? "").trim();
-  }
-  return trimmed;
-}
-
 const VALID_SECTIONS = new Set(["stack", "projects", "people", "domain_context"]);
 
 export function parsePatterns(raw: string): PatternExtraction[] {
@@ -235,6 +239,19 @@ export function parsePatterns(raw: string): PatternExtraction[] {
     }
     if (obj.value === undefined || obj.value === null) {
       throw new Error(`Pattern[${idx}] must have a non-null value`);
+    }
+    // Per-section type validation
+    if (
+      (obj.section === "stack" || obj.section === "domain_context") &&
+      typeof obj.value !== "string"
+    ) {
+      throw new Error(`Pattern[${idx}].value must be a string for section "${obj.section}"`);
+    }
+    if (
+      (obj.section === "projects" || obj.section === "people") &&
+      (typeof obj.value !== "object" || Array.isArray(obj.value))
+    ) {
+      throw new Error(`Pattern[${idx}].value must be an object for section "${obj.section}"`);
     }
     if (typeof obj.reason !== "string" || obj.reason.length === 0) {
       throw new Error(`Pattern[${idx}] must have a non-empty reason`);
@@ -288,17 +305,14 @@ export async function runArchivist(
   const events = await episodicStore.retrieveSince(sinceTimestamp, cfg.maxEventsPerRun);
 
   if (events.length === 0) {
-    // Nothing to process — update state and return
-    writeState(workspacePath, {
-      last_run_turn: currentTurn,
-      last_run_at: new Date().toISOString(),
-    });
+    // Do NOT advance state — retrieval may have failed silently (C3)
     return { patternsExtracted: [], eventsProcessed: 0, eventsPruned: 0, fromFallback: false };
   }
 
   // Step 2: Run summarization pass with retries
   let patterns: PatternExtraction[] = [];
   let fromFallback = false;
+  let lastError: unknown;
 
   const prompt = buildArchivistPrompt(events);
 
@@ -306,8 +320,10 @@ export async function runArchivist(
     try {
       const raw = await callModel(prompt);
       patterns = parsePatterns(raw);
+      lastError = undefined;
       break;
-    } catch {
+    } catch (err) {
+      lastError = err;
       if (attempt === cfg.maxRetries) {
         // All attempts failed — still mark events as processed
         // to avoid reprocessing, but extract no patterns
@@ -316,14 +332,18 @@ export async function runArchivist(
     }
   }
 
-  // Step 3: Upsert patterns into Tier 3
+  // Step 3: Upsert patterns into Tier 3 (all upserts before any marking — C1)
   for (const pattern of patterns) {
     semanticStore.upsertFact(pattern.section, pattern.key, pattern.value);
   }
 
-  // Step 4: Mark all events as processed
+  // Step 4: Mark all events as processed (only after upserts succeed — C1)
   for (const event of events) {
-    await episodicStore.markProcessed(event.id);
+    try {
+      await episodicStore.markProcessed(event.id);
+    } catch {
+      // Log and continue — partial marking is recoverable via re-processing
+    }
   }
 
   // Step 5: Append to archivist log
@@ -360,5 +380,6 @@ export async function runArchivist(
     eventsProcessed: events.length,
     eventsPruned,
     fromFallback,
+    lastError: lastError ? errorMessage(lastError) : undefined,
   };
 }

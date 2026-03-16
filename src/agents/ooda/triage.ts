@@ -13,6 +13,7 @@ import type {
   PrioritiesFile,
   SITREP,
 } from "../../../extensions/memory-ooda/types.js";
+import { errorMessage, stripCodeFences } from "./parse-utils.js";
 
 // ============================================================================
 // Types
@@ -37,8 +38,6 @@ export type ModelCallFn = (prompt: string) => Promise<string>;
 export interface TriageOptions {
   /** Max retries on malformed JSON (default: 1) */
   maxRetries?: number;
-  /** Timeout per model call in ms (default: 15000) */
-  timeoutMs?: number;
 }
 
 // ============================================================================
@@ -174,15 +173,6 @@ Verify your JSON is syntactically valid before responding.`;
 // Response Parsing
 // ============================================================================
 
-function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (match) {
-    return (match[1] ?? "").trim();
-  }
-  return trimmed;
-}
-
 const VALID_PRIORITIES = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
 export function parseSITREP(raw: string): SITREP {
@@ -194,8 +184,12 @@ export function parseSITREP(raw: string): SITREP {
   }
 
   const priority = parsed.priority;
-  if (typeof priority !== "number" || !VALID_PRIORITIES.has(priority)) {
-    throw new Error(`Invalid priority: ${String(priority)}. Must be 1-10.`);
+  if (
+    typeof priority !== "number" ||
+    !Number.isInteger(priority) ||
+    !VALID_PRIORITIES.has(priority)
+  ) {
+    throw new Error(`Invalid priority: ${String(priority)}. Must be an integer 1-10.`);
   }
 
   const summary = parsed.summary;
@@ -233,17 +227,18 @@ export async function runTriage(
   input: TriageInput,
   callModel: ModelCallFn,
   options?: TriageOptions,
-): Promise<{ sitrep: SITREP; fromFallback: boolean }> {
+): Promise<{ sitrep: SITREP; fromFallback: boolean; lastError?: string }> {
   const maxRetries = options?.maxRetries ?? 1;
   const prompt = buildTriagePrompt(input);
+  let lastError: unknown;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const raw = await callModel(prompt);
       const sitrep = parseSITREP(raw);
       return { sitrep, fromFallback: false };
-    } catch {
-      // Retry on next iteration or fall through to fallback
+    } catch (err) {
+      lastError = err;
     }
   }
 
@@ -251,6 +246,7 @@ export async function runTriage(
   return {
     sitrep: createDefaultSITREP(input.observation),
     fromFallback: true,
+    lastError: lastError ? errorMessage(lastError) : undefined,
   };
 }
 

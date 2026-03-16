@@ -147,6 +147,14 @@ describe("state management", () => {
       fs.writeFileSync(statePath(tmpDir), JSON.stringify({ last_run_turn: 5 }));
       expect(() => readState(tmpDir)).toThrow("missing last_run_turn or last_run_at");
     });
+
+    it("throws on invalid timestamp (M7)", () => {
+      fs.writeFileSync(
+        statePath(tmpDir),
+        JSON.stringify({ last_run_turn: 5, last_run_at: "not-a-date" }),
+      );
+      expect(() => readState(tmpDir)).toThrow("not a valid timestamp");
+    });
   });
 
   describe("writeState", () => {
@@ -247,6 +255,13 @@ describe("buildArchivistPrompt", () => {
     expect(prompt).toContain("Do not wrap in code fences");
   });
 
+  it("truncates long event text (H4)", () => {
+    const events = [createTestEvent({ text: "x".repeat(500) })];
+    const prompt = buildArchivistPrompt(events);
+    expect(prompt).not.toContain("x".repeat(500));
+    expect(prompt).toContain("x".repeat(200) + "...");
+  });
+
   it("includes privacy constraint", () => {
     const prompt = buildArchivistPrompt([createTestEvent()]);
     expect(prompt).toContain("Never infer sensitive personal information");
@@ -314,6 +329,26 @@ describe("parsePatterns", () => {
 
   it("rejects invalid JSON", () => {
     expect(() => parsePatterns("not json")).toThrow();
+  });
+
+  it("rejects non-string value for stack section (M9)", () => {
+    const bad = [{ section: "stack", key: "lang", value: { nested: true }, reason: "test" }];
+    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be a string for section");
+  });
+
+  it("rejects non-string value for domain_context section (M9)", () => {
+    const bad = [{ section: "domain_context", key: "focus", value: 42, reason: "test" }];
+    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be a string for section");
+  });
+
+  it("rejects non-object value for people section (M9)", () => {
+    const bad = [{ section: "people", key: "alice", value: "just a string", reason: "test" }];
+    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be an object for section");
+  });
+
+  it("rejects array value for projects section (M9)", () => {
+    const bad = [{ section: "projects", key: "proj", value: [1, 2], reason: "test" }];
+    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be an object for section");
   });
 
   it("accepts object values for projects section", () => {
@@ -415,7 +450,10 @@ describe("runArchivist", () => {
     expect(new Date(state.last_run_at).getTime()).toBeGreaterThan(Date.now() - 5000);
   });
 
-  it("handles no events gracefully", async () => {
+  it("handles no events gracefully without advancing state (C3)", async () => {
+    // Pre-set state so we can verify it's not changed
+    writeState(tmpDir, { last_run_turn: 50, last_run_at: "2026-03-15T00:00:00Z" });
+
     const episodic = createMockEpisodicStore([]);
     const semantic = createMockSemanticStore();
     const callModel: ModelCallFn = vi.fn(async () => "should not be called");
@@ -426,8 +464,10 @@ describe("runArchivist", () => {
     expect(result.patternsExtracted).toHaveLength(0);
     expect(result.fromFallback).toBe(false);
     expect(callModel).not.toHaveBeenCalled();
-    // State should still be updated
-    expect(readState(tmpDir).last_run_turn).toBe(100);
+    // State should NOT be advanced on empty retrieval
+    const state = readState(tmpDir);
+    expect(state.last_run_turn).toBe(50);
+    expect(state.last_run_at).toBe("2026-03-15T00:00:00Z");
   });
 
   it("retries on malformed model output and succeeds", async () => {
@@ -521,6 +561,48 @@ describe("runArchivist", () => {
     // Threshold should be ~90 days ago
     const expectedThreshold = now - 90 * 24 * 60 * 60 * 1000;
     expect(episodic.pruneCalls[0].olderThanMs).toBeCloseTo(expectedThreshold, -3);
+  });
+
+  it("continues marking events when markProcessed throws for some (C1)", async () => {
+    const events = createTestEvents(3);
+    let markCalls = 0;
+    const episodic: EpisodicStore & { processedIds: string[] } = {
+      processedIds: [],
+      async retrieveSince() {
+        return events;
+      },
+      async markProcessed(id: string) {
+        markCalls++;
+        if (markCalls === 2) throw new Error("mark failed");
+        this.processedIds.push(id);
+      },
+      async prune() {
+        return 0;
+      },
+    };
+    const semantic = createMockSemanticStore();
+    const callModel: ModelCallFn = vi.fn(async () => VALID_MODEL_RESPONSE);
+
+    const result = await runArchivist(tmpDir, 100, episodic, semantic, callModel);
+
+    // Patterns should still be upserted
+    expect(semantic.upserts).toHaveLength(2);
+    // 2 of 3 marks should succeed (event 2 failed)
+    expect(episodic.processedIds).toHaveLength(2);
+    expect(result.eventsProcessed).toBe(3);
+  });
+
+  it("captures lastError on fallback", async () => {
+    const callModel: ModelCallFn = vi.fn(async () => "bad json");
+    const events = createTestEvents(2);
+    const episodic = createMockEpisodicStore(events);
+    const semantic = createMockSemanticStore();
+
+    const result = await runArchivist(tmpDir, 100, episodic, semantic, callModel);
+
+    expect(result.fromFallback).toBe(true);
+    expect(result.lastError).toBeDefined();
+    expect(result.lastError).toContain("JSON");
   });
 
   it("uses sinceTimestamp from state file for retrieval", async () => {
