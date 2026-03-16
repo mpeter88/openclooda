@@ -43,6 +43,10 @@ type MemoryEntry = {
   importance: number;
   category: MemoryCategory;
   createdAt: number;
+  // OODA fields (optional for backward compat with existing data)
+  source?: string; // "github" | "email" | "chat" | "tool_output" | "user"
+  actionId?: string; // links to ExpectedOutcome for outcome tracking
+  archivistProcessed?: boolean; // has the Archivist distilled this event?
 };
 
 type MemorySearchResult = {
@@ -94,6 +98,9 @@ class MemoryDB {
           importance: 0,
           category: "other",
           createdAt: 0,
+          source: "",
+          actionId: "",
+          archivistProcessed: false,
         },
       ]);
       await this.table.delete('id = "__schema__"');
@@ -131,6 +138,9 @@ class MemoryDB {
           importance: row.importance as number,
           category: row.category as MemoryEntry["category"],
           createdAt: row.createdAt as number,
+          source: (row.source as string) || undefined,
+          actionId: (row.actionId as string) || undefined,
+          archivistProcessed: (row.archivistProcessed as boolean) || false,
         },
         score,
       };
@@ -153,6 +163,80 @@ class MemoryDB {
   async count(): Promise<number> {
     await this.ensureInitialized();
     return this.table!.countRows();
+  }
+
+  // ===========================================================================
+  // OODA methods
+  // ===========================================================================
+
+  /**
+   * Retrieve entries created after a given timestamp, ordered by creation time.
+   * Used by the Archivist to scan recent episodic events for pattern extraction.
+   */
+  async retrieveSince(sinceTimestamp: number, limit = 1000): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    const results = await this.table!.filter(`createdAt > ${sinceTimestamp}`)
+      .limit(limit)
+      .toArray();
+
+    return results
+      .map((row) => ({
+        id: row.id as string,
+        text: row.text as string,
+        vector: row.vector as number[],
+        importance: row.importance as number,
+        category: row.category as MemoryEntry["category"],
+        createdAt: row.createdAt as number,
+        source: (row.source as string) || undefined,
+        actionId: (row.actionId as string) || undefined,
+        archivistProcessed: (row.archivistProcessed as boolean) || false,
+      }))
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  /**
+   * Mark an entry as processed by the Archivist.
+   * Processed entries are eligible for pruning once they age out.
+   */
+  async markProcessed(id: string): Promise<void> {
+    await this.ensureInitialized();
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(id)) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
+    // LanceDB update: delete + re-add with updated field
+    const rows = await this.table!.filter(`id = '${id}'`).toArray();
+    if (rows.length === 0) return;
+
+    const row = rows[0];
+    await this.table!.delete(`id = '${id}'`);
+    await this.table!.add([{ ...row, archivistProcessed: true }]);
+  }
+
+  /**
+   * Prune old entries that have been processed by the Archivist.
+   * Returns the number of entries deleted.
+   *
+   * @param olderThanMs - Delete entries with createdAt before this timestamp (ms)
+   * @param onlyProcessed - If true (default), only prune archivistProcessed entries
+   */
+  async prune(olderThanMs: number, onlyProcessed = true): Promise<number> {
+    await this.ensureInitialized();
+
+    const filter = onlyProcessed
+      ? `createdAt < ${olderThanMs} AND archivistProcessed = true`
+      : `createdAt < ${olderThanMs}`;
+
+    // Count matching rows first
+    const matching = await this.table!.filter(filter).toArray();
+    const count = matching.length;
+
+    if (count > 0) {
+      await this.table!.delete(filter);
+    }
+
+    return count;
   }
 }
 
@@ -644,6 +728,7 @@ const memoryPlugin = {
               vector,
               importance: 0.7,
               category,
+              source: "user",
             });
             stored++;
           }
