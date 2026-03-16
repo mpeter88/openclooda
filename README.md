@@ -85,23 +85,19 @@ cr/
 
 ## Architecture
 
-OpenCLOODA is a self-contained OpenClaw plugin. All code lives in a single directory (`extensions/memory-ooda/`) with no dependencies on OpenClaw core internals. It integrates entirely through the plugin hook system:
+All OODA code lives in a single directory (`extensions/memory-ooda/`) and integrates with OpenClaw through the plugin hook system:
 
 - `before_agent_start` -- runs triage, injects SITREP + strategy into context
 - `agent_end` -- outcome tracking, meta-reviewer
 - Timer/interval -- archivist distillation (Tier 2 to Tier 3)
 
-OpenCLOODA depends on the `memory-lancedb` plugin for Tier 2 episodic storage and embedding (OpenAI `text-embedding-3-small`). The two plugins work together but are independently installable.
+OpenCLOODA depends on the `memory-lancedb` plugin for Tier 2 episodic storage and embedding (OpenAI `text-embedding-3-small`).
+
+> **Future goal:** Extract into a standalone installable plugin (`npm install openclooda`). Currently developed as a fork of the OpenClaw repo.
 
 ## Setup
 
-### As a plugin (standalone install)
-
-```bash
-npm install @openclaw/memory-ooda
-```
-
-### Development (from source)
+This is a fork of OpenClaw with the OODA layer added. Clone and run it like OpenClaw:
 
 ```bash
 git clone https://github.com/mpeter88/openclooda.git
@@ -171,7 +167,7 @@ openclaw workspace rollback restore priorities # Restore PRIORITIES.json
 
 ## Implementation status
 
-All 7 PRs from the spec are implemented, peer-reviewed (24 findings addressed), and consolidated into a single standalone plugin.
+All 7 PRs from the spec are implemented, peer-reviewed (24 findings addressed), and consolidated into a single plugin directory.
 
 | PR  | Description                        | Status |
 | --- | ---------------------------------- | ------ |
