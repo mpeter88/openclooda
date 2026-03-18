@@ -11,10 +11,24 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/memory-ooda";
+import {
+  readState,
+  writeState,
+  shouldRunArchivist,
+  runArchivist,
+  type EpisodicStore,
+  type EpisodicEvent,
+  type SemanticStore,
+} from "./archivist.js";
 import { registerWorkspaceCli } from "./cli.js";
 import { getPriorities } from "./priorities.js";
 import { countPending } from "./proposals.js";
-import { getFacts, formatFactsForContext } from "./semantic-memory.js";
+import {
+  getFacts,
+  formatFactsForContext,
+  upsertFact,
+  appendArchivistLog,
+} from "./semantic-memory.js";
 
 // ============================================================================
 // Config
@@ -31,6 +45,100 @@ export type OodaConfig = {
 
 function resolveWorkspacePath(cfg: OodaConfig): string {
   return cfg.workspacePath || join(homedir(), ".openclaw", "workspace");
+}
+
+// ============================================================================
+// LanceDB EpisodicStore Builder
+// ============================================================================
+
+/**
+ * Resolve the lancedb dbPath from memory-lancedb plugin config or agent workspace fallback.
+ */
+function resolveLanceDbPath(api: OpenClawPluginApi): string {
+  // Try memory-lancedb plugin config
+  const lancedbEntry = api.config.plugins?.entries?.["memory-lancedb"];
+  if (lancedbEntry?.config?.dbPath && typeof lancedbEntry.config.dbPath === "string") {
+    return lancedbEntry.config.dbPath;
+  }
+
+  // Fall back to agent workspace + /../memory
+  const agentWorkspace = api.config.agents?.defaults?.workspace;
+  if (agentWorkspace) {
+    return join(agentWorkspace, "..", "memory");
+  }
+
+  // Default
+  return join(homedir(), ".openclaw", "memory", "lancedb");
+}
+
+const TABLE_NAME = "memories";
+
+async function buildEpisodicStore(api: OpenClawPluginApi): Promise<EpisodicStore | null> {
+  try {
+    const lancedb = await import("@lancedb/lancedb");
+    const dbPath = resolveLanceDbPath(api);
+    const db = await lancedb.connect(dbPath);
+    const tables = await db.tableNames();
+
+    if (!tables.includes(TABLE_NAME)) {
+      api.logger.warn("memory-ooda: lancedb 'memories' table not found — archivist skipped");
+      return null;
+    }
+
+    const table = await db.openTable(TABLE_NAME);
+
+    return {
+      async retrieveSince(sinceTimestamp: number, limit = 1000): Promise<EpisodicEvent[]> {
+        // eslint-disable-next-line -- lancedb Table typing lacks .filter(); cast to any
+        const rows: Record<string, unknown>[] = await (table as any)
+          .filter(`createdAt > ${sinceTimestamp}`)
+          .limit(limit)
+          .toArray();
+        return rows
+          .map((row: Record<string, unknown>) => ({
+            id: row.id as string,
+            text: row.text as string,
+            category: row.category as string,
+            importance: row.importance as number,
+            createdAt: row.createdAt as number,
+            source: (row.source as string) || undefined,
+            actionId: (row.actionId as string) || undefined,
+            archivistProcessed: (row.archivistProcessed as boolean) || false,
+          }))
+          .sort((a: EpisodicEvent, b: EpisodicEvent) => a.createdAt - b.createdAt);
+      },
+
+      async markProcessed(id: string): Promise<void> {
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!uuidRegex.test(id)) {
+          throw new Error(`Invalid memory ID format: ${id}`);
+        }
+        // eslint-disable-next-line -- lancedb Table typing lacks .filter()
+        const rows: Record<string, unknown>[] = await (table as any)
+          .filter(`id = '${id}'`)
+          .toArray();
+        if (rows.length === 0) return;
+        const row = rows[0];
+        await table.delete(`id = '${id}'`);
+        await table.add([{ ...row, archivistProcessed: true }]);
+      },
+
+      async prune(olderThanMs: number, onlyProcessed = false): Promise<number> {
+        let filter = `createdAt < ${olderThanMs}`;
+        if (onlyProcessed) {
+          filter += " AND archivistProcessed = true";
+        }
+        // eslint-disable-next-line -- lancedb Table typing lacks .filter()
+        const rows: unknown[] = await (table as any).filter(filter).toArray();
+        if (rows.length === 0) return 0;
+        await table.delete(filter);
+        return rows.length;
+      },
+    };
+  } catch (err) {
+    api.logger.warn(`memory-ooda: failed to initialize lancedb: ${String(err)}`);
+    return null;
+  }
 }
 
 // ============================================================================
@@ -86,6 +194,141 @@ const oodaPlugin = {
       } catch (err) {
         api.logger.warn(`memory-ooda: failed to inject context: ${String(err)}`);
       }
+    });
+
+    // ========================================================================
+    // Archivist — async Tier 2 → Tier 3 distillation on agent_end
+    // ========================================================================
+
+    let turnCount = 0;
+    try {
+      turnCount = readState(workspacePath).last_run_turn;
+    } catch {
+      // Fresh workspace or corrupt state — start from 0
+    }
+
+    api.on("agent_end", (event) => {
+      if (!event.success) return;
+
+      turnCount++;
+
+      try {
+        writeState(workspacePath, {
+          last_run_turn: turnCount,
+          last_run_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        api.logger.warn(`memory-ooda: failed to persist turn count: ${String(err)}`);
+      }
+
+      // Check if archivist is due
+      let turnInterval: number;
+      try {
+        turnInterval = getPriorities(workspacePath).thresholds.archivist_turn_interval;
+      } catch {
+        turnInterval = 100;
+      }
+
+      const state = { last_run_turn: turnCount - 1, last_run_at: new Date().toISOString() };
+      try {
+        Object.assign(state, readState(workspacePath));
+      } catch {
+        // use defaults
+      }
+
+      if (!shouldRunArchivist(turnCount, state, turnInterval)) return;
+
+      // Fire archivist non-blocking
+      setImmediate(() => {
+        void (async () => {
+          try {
+            // Build EpisodicStore from lancedb
+            const episodicStore = await buildEpisodicStore(api);
+            if (!episodicStore) {
+              api.logger.warn("memory-ooda: archivist skipped — lancedb unavailable");
+              return;
+            }
+
+            // Build SemanticStore
+            const semanticStore: SemanticStore = {
+              upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
+              appendArchivistLog: (action, reason) =>
+                appendArchivistLog(workspacePath, action, reason),
+            };
+
+            // Build callModel via subagent
+            const callModel = async (prompt: string): Promise<string> => {
+              const sessionKey = `ooda-archivist-${Date.now()}`;
+              try {
+                const { runId } = await api.runtime.subagent.run({
+                  sessionKey,
+                  message: prompt,
+                  extraSystemPrompt:
+                    "You are the Archivist. Respond with raw JSON only. No explanation.",
+                  deliver: false,
+                });
+
+                const waitResult = await api.runtime.subagent.waitForRun({
+                  runId,
+                  timeoutMs: 120_000,
+                });
+
+                if (waitResult.status !== "ok") {
+                  throw new Error(
+                    `subagent run failed: ${waitResult.status} ${waitResult.error ?? ""}`,
+                  );
+                }
+
+                const { messages } = await api.runtime.subagent.getSessionMessages({
+                  sessionKey,
+                  limit: 10,
+                });
+
+                // Extract last assistant message text
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  const msg = messages[i] as Record<string, unknown>;
+                  if (msg.role === "assistant" && typeof msg.content === "string") {
+                    return msg.content;
+                  }
+                  // Handle array content (tool_use / text blocks)
+                  if (msg.role === "assistant" && Array.isArray(msg.content)) {
+                    for (let j = (msg.content as unknown[]).length - 1; j >= 0; j--) {
+                      const block = (msg.content as Record<string, unknown>[])[j];
+                      if (block.type === "text" && typeof block.text === "string") {
+                        return block.text;
+                      }
+                    }
+                  }
+                }
+
+                throw new Error("No assistant reply found in subagent session");
+              } finally {
+                // Clean up isolated session
+                try {
+                  await api.runtime.subagent.deleteSession({ sessionKey });
+                } catch {
+                  // best-effort cleanup
+                }
+              }
+            };
+
+            const result = await runArchivist(
+              workspacePath,
+              turnCount,
+              episodicStore,
+              semanticStore,
+              callModel,
+              { turnInterval },
+            );
+
+            api.logger.info(
+              `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
+            );
+          } catch (err) {
+            api.logger.warn(`memory-ooda: archivist failed: ${String(err)}`);
+          }
+        })();
+      });
     });
 
     // ========================================================================
