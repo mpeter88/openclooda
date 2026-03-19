@@ -1,6 +1,5 @@
 {
   "id": "memory-ooda",
-  "kind": "memory",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

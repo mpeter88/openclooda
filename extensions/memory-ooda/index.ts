@@ -29,6 +29,8 @@ import {
   upsertFact,
   appendArchivistLog,
 } from "./semantic-memory.js";
+import { runStrategy } from "./strategy.js";
+import { runTriage, shouldRunFullOODA, type ModelCallFn } from "./triage.js";
 
 // ============================================================================
 // Config
@@ -149,7 +151,8 @@ const oodaPlugin = {
   id: "memory-ooda",
   name: "Memory (OODA)",
   description: "Cognitive OODA agent — Tier 3 semantic memory with knowledge injection",
-  kind: "memory" as const,
+  // No kind — memory-ooda is slotless. memory-lancedb owns the memory slot (Tier 2).
+  // memory-ooda runs alongside as a cognitive layer (Tier 3 distillation + context injection).
 
   register(api: OpenClawPluginApi) {
     const cfg = (api.pluginConfig ?? {}) as OodaConfig;
@@ -165,10 +168,67 @@ const oodaPlugin = {
     api.logger.info(`memory-ooda: registered (workspace: ${workspacePath})`);
 
     // ========================================================================
-    // Context Injection
+    // Shared callModel helper (subagent pattern)
     // ========================================================================
 
-    api.on("before_agent_start", (_event) => {
+    const callModel: ModelCallFn = async (prompt: string): Promise<string> => {
+      const sessionKey = `ooda-${Date.now()}`;
+      try {
+        const { runId } = await api.runtime.subagent.run({
+          sessionKey,
+          message: prompt,
+          extraSystemPrompt:
+            "You are an OODA reasoning agent. Respond with raw JSON only. No explanation.",
+          deliver: false,
+        });
+
+        const waitResult = await api.runtime.subagent.waitForRun({
+          runId,
+          timeoutMs: 120_000,
+        });
+
+        if (waitResult.status !== "ok") {
+          throw new Error(`subagent run failed: ${waitResult.status} ${waitResult.error ?? ""}`);
+        }
+
+        const { messages } = await api.runtime.subagent.getSessionMessages({
+          sessionKey,
+          limit: 10,
+        });
+
+        // Extract last assistant message text
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i] as Record<string, unknown>;
+          if (msg.role === "assistant" && typeof msg.content === "string") {
+            return msg.content;
+          }
+          // Handle array content (tool_use / text blocks)
+          if (msg.role === "assistant" && Array.isArray(msg.content)) {
+            for (let j = (msg.content as unknown[]).length - 1; j >= 0; j--) {
+              const block = (msg.content as Record<string, unknown>[])[j];
+              if (block.type === "text" && typeof block.text === "string") {
+                return block.text;
+              }
+            }
+          }
+        }
+
+        throw new Error("No assistant reply found in subagent session");
+      } finally {
+        // Clean up isolated session
+        try {
+          await api.runtime.subagent.deleteSession({ sessionKey });
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    };
+
+    // ========================================================================
+    // Context Injection + OODA Triage/Strategy
+    // ========================================================================
+
+    api.on("before_agent_start", async (event) => {
       try {
         const knowledge = getFacts(workspacePath);
         const context = formatFactsForContext(knowledge);
@@ -186,6 +246,64 @@ const oodaPlugin = {
               `<ooda-notice>You have ${pending} pending policy proposal${pending === 1 ? "" : "s"}. Run \`openclaw workspace proposals list --pending\` to review.</ooda-notice>`,
             );
           }
+        }
+
+        // ==================================================================
+        // OODA Triage + Strategy
+        // ==================================================================
+
+        // PluginHookBeforeAgentStartEvent has no thinkingLevel field
+        const thinkingLevel: "low" | "medium" | "high" = "low";
+
+        let priorities;
+        try {
+          priorities = getPriorities(workspacePath);
+        } catch (err) {
+          api.logger.warn(`memory-ooda: failed to load priorities: ${String(err)}`);
+          if (parts.length === 0) return;
+          return { prependSystemContext: parts.join("\n\n") };
+        }
+
+        try {
+          const triageResult = await runTriage(
+            { observation: event.prompt, facts: knowledge, priorities },
+            callModel,
+          );
+
+          const sitrep = triageResult.sitrep;
+
+          if (!shouldRunFullOODA(sitrep, priorities, thinkingLevel)) {
+            // Inject minimal SITREP line only
+            parts.push(
+              `<ooda-sitrep>Priority: ${sitrep.priority}/10 | ${sitrep.summary} | Domains: ${sitrep.recommendedDomains.join(", ") || "none"}</ooda-sitrep>`,
+            );
+          } else {
+            // Full OODA: run strategy
+            parts.push(
+              `<ooda-sitrep>Priority: ${sitrep.priority}/10 | ${sitrep.summary} | Domains: ${sitrep.recommendedDomains.join(", ") || "none"}</ooda-sitrep>`,
+            );
+
+            try {
+              const strategyResult = await runStrategy(
+                {
+                  sitrep,
+                  priorities,
+                  observation: event.prompt,
+                  neverDo: knowledge.preferences.never_do,
+                },
+                callModel,
+              );
+
+              const winner = strategyResult.winner;
+              parts.push(
+                `<ooda-strategy>Action: ${winner.label} | ${winner.reasoning}</ooda-strategy>`,
+              );
+            } catch (err) {
+              api.logger.warn(`memory-ooda: strategy failed, skipping: ${String(err)}`);
+            }
+          }
+        } catch (err) {
+          api.logger.warn(`memory-ooda: triage failed, skipping: ${String(err)}`);
         }
 
         if (parts.length === 0) return;
@@ -254,62 +372,6 @@ const oodaPlugin = {
               upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
               appendArchivistLog: (action, reason) =>
                 appendArchivistLog(workspacePath, action, reason),
-            };
-
-            // Build callModel via subagent
-            const callModel = async (prompt: string): Promise<string> => {
-              const sessionKey = `ooda-archivist-${Date.now()}`;
-              try {
-                const { runId } = await api.runtime.subagent.run({
-                  sessionKey,
-                  message: prompt,
-                  extraSystemPrompt:
-                    "You are the Archivist. Respond with raw JSON only. No explanation.",
-                  deliver: false,
-                });
-
-                const waitResult = await api.runtime.subagent.waitForRun({
-                  runId,
-                  timeoutMs: 120_000,
-                });
-
-                if (waitResult.status !== "ok") {
-                  throw new Error(
-                    `subagent run failed: ${waitResult.status} ${waitResult.error ?? ""}`,
-                  );
-                }
-
-                const { messages } = await api.runtime.subagent.getSessionMessages({
-                  sessionKey,
-                  limit: 10,
-                });
-
-                // Extract last assistant message text
-                for (let i = messages.length - 1; i >= 0; i--) {
-                  const msg = messages[i] as Record<string, unknown>;
-                  if (msg.role === "assistant" && typeof msg.content === "string") {
-                    return msg.content;
-                  }
-                  // Handle array content (tool_use / text blocks)
-                  if (msg.role === "assistant" && Array.isArray(msg.content)) {
-                    for (let j = (msg.content as unknown[]).length - 1; j >= 0; j--) {
-                      const block = (msg.content as Record<string, unknown>[])[j];
-                      if (block.type === "text" && typeof block.text === "string") {
-                        return block.text;
-                      }
-                    }
-                  }
-                }
-
-                throw new Error("No assistant reply found in subagent session");
-              } finally {
-                // Clean up isolated session
-                try {
-                  await api.runtime.subagent.deleteSession({ sessionKey });
-                } catch {
-                  // best-effort cleanup
-                }
-              }
             };
 
             const result = await runArchivist(

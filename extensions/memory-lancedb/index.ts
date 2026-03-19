@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import type * as LanceDB from "@lancedb/lancedb";
 import { Type } from "@sinclair/typebox";
 import OpenAI from "openai";
@@ -24,13 +25,17 @@ import {
 // ============================================================================
 
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null = null;
+let lancedbAvailable: boolean | null = null; // null = untested
 const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
   if (!lancedbImportPromise) {
     lancedbImportPromise = import("@lancedb/lancedb");
   }
   try {
-    return await lancedbImportPromise;
+    const mod = await lancedbImportPromise;
+    lancedbAvailable = true;
+    return mod;
   } catch (err) {
+    lancedbAvailable = false;
     // Common on macOS today: upstream package may not ship darwin native bindings.
     throw new Error(`memory-lancedb: failed to load LanceDB. ${String(err)}`, { cause: err });
   }
@@ -241,6 +246,250 @@ class MemoryDB {
 }
 
 // ============================================================================
+// sqlite-vec Fallback
+// ============================================================================
+
+type SqliteDatabase = import("node:sqlite").DatabaseSync;
+
+class SqliteVecMemoryDB {
+  private db: SqliteDatabase | null = null;
+
+  constructor(
+    private readonly dbPath: string,
+    private readonly vectorDim: number,
+  ) {}
+
+  private initPromise: Promise<void> | null = null;
+
+  private async ensureInitialized(): Promise<SqliteDatabase> {
+    if (this.db) return this.db;
+    if (!this.initPromise) {
+      this.initPromise = this.doInitialize();
+    }
+    await this.initPromise;
+    return this.db!;
+  }
+
+  private async doInitialize(): Promise<void> {
+    const { DatabaseSync } = await import("node:sqlite");
+    const { mkdirSync } = await import("node:fs");
+    const sqlitePath = path.join(this.dbPath, "memories.sqlite");
+    mkdirSync(this.dbPath, { recursive: true });
+    const db = new DatabaseSync(sqlitePath, { allowExtension: true });
+
+    // Load sqlite-vec extension
+    const sqliteVec = await import("sqlite-vec");
+    sqliteVec.load(db as unknown as Parameters<typeof sqliteVec.load>[0]);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY,
+        text TEXT NOT NULL,
+        importance REAL NOT NULL DEFAULT 0.7,
+        category TEXT NOT NULL DEFAULT 'other',
+        createdAt INTEGER NOT NULL,
+        source TEXT,
+        actionId TEXT,
+        archivistProcessed INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+
+    db.exec(
+      `CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(vector float[${this.vectorDim}])`,
+    );
+
+    this.db = db;
+  }
+
+  async store(entry: Omit<MemoryEntry, "id" | "createdAt">): Promise<MemoryEntry> {
+    const db = await this.ensureInitialized();
+
+    const fullEntry: MemoryEntry = {
+      ...entry,
+      id: randomUUID(),
+      createdAt: Date.now(),
+    };
+
+    // Insert into both tables in a transaction using the same rowid
+    db.exec("BEGIN");
+    try {
+      const insertMeta = db.prepare(
+        `INSERT INTO memories (id, text, importance, category, createdAt, source, actionId, archivistProcessed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      insertMeta.run(
+        fullEntry.id,
+        fullEntry.text,
+        fullEntry.importance,
+        fullEntry.category,
+        fullEntry.createdAt,
+        fullEntry.source ?? null,
+        fullEntry.actionId ?? null,
+        fullEntry.archivistProcessed ? 1 : 0,
+      );
+
+      // Get the rowid just inserted
+      const rowid = (db.prepare("SELECT last_insert_rowid() as rid").get() as { rid: number }).rid;
+
+      const insertVec = db.prepare("INSERT INTO memories_vec (rowid, vector) VALUES (?, ?)");
+      insertVec.run(rowid, new Float32Array(fullEntry.vector));
+
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+
+    return fullEntry;
+  }
+
+  async search(vector: number[], limit = 5, minScore = 0.5): Promise<MemorySearchResult[]> {
+    const db = await this.ensureInitialized();
+
+    const rows = db
+      .prepare(
+        `SELECT m.*, mv.distance
+         FROM memories_vec mv
+         JOIN memories m ON mv.rowid = m.rowid
+         WHERE mv.vector MATCH ? AND k = ?
+         ORDER BY mv.distance`,
+      )
+      .all(new Float32Array(vector), limit) as Array<
+      Record<string, unknown> & { distance: number }
+    >;
+
+    return rows
+      .map((row) => {
+        const distance = row.distance ?? 0;
+        const score = 1 / (1 + distance);
+        return {
+          entry: {
+            id: row.id as string,
+            text: row.text as string,
+            vector, // original query vector as placeholder (sqlite-vec doesn't return stored vectors)
+            importance: row.importance as number,
+            category: row.category as MemoryCategory,
+            createdAt: row.createdAt as number,
+            source: (row.source as string) || undefined,
+            actionId: (row.actionId as string) || undefined,
+            archivistProcessed: row.archivistProcessed === 1,
+          },
+          score,
+        };
+      })
+      .filter((r) => r.score >= minScore);
+  }
+
+  async delete(id: string): Promise<boolean> {
+    const db = await this.ensureInitialized();
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(id)) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
+
+    // Find the rowid for cascade delete into vec table
+    const row = db.prepare("SELECT rowid FROM memories WHERE id = ?").get(id) as
+      | { rowid: number }
+      | undefined;
+    if (!row) return false;
+
+    db.exec("BEGIN");
+    try {
+      db.prepare("DELETE FROM memories WHERE id = ?").run(id);
+      db.prepare("DELETE FROM memories_vec WHERE rowid = ?").run(row.rowid);
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+    return true;
+  }
+
+  async count(): Promise<number> {
+    const db = await this.ensureInitialized();
+    const row = db.prepare("SELECT COUNT(*) as cnt FROM memories").get() as { cnt: number };
+    return row.cnt;
+  }
+
+  async retrieveSince(sinceTimestamp: number, limit = 1000): Promise<MemoryEntry[]> {
+    const db = await this.ensureInitialized();
+
+    const rows = db
+      .prepare("SELECT * FROM memories WHERE createdAt > ? ORDER BY createdAt ASC LIMIT ?")
+      .all(sinceTimestamp, limit) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      id: row.id as string,
+      text: row.text as string,
+      vector: [], // not stored in sqlite metadata table
+      importance: row.importance as number,
+      category: row.category as MemoryCategory,
+      createdAt: row.createdAt as number,
+      source: (row.source as string) || undefined,
+      actionId: (row.actionId as string) || undefined,
+      archivistProcessed: row.archivistProcessed === 1,
+    }));
+  }
+
+  async markProcessed(id: string): Promise<void> {
+    const db = await this.ensureInitialized();
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(id)) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
+    db.prepare("UPDATE memories SET archivistProcessed = 1 WHERE id = ?").run(id);
+  }
+
+  async prune(olderThanMs: number, onlyProcessed = true): Promise<number> {
+    const db = await this.ensureInitialized();
+
+    const condition = onlyProcessed ? "createdAt < ? AND archivistProcessed = 1" : "createdAt < ?";
+
+    // Find rowids to delete from vec table
+    const rows = db
+      .prepare(`SELECT rowid FROM memories WHERE ${condition}`)
+      .all(olderThanMs) as Array<{ rowid: number }>;
+
+    if (rows.length === 0) return 0;
+
+    db.exec("BEGIN");
+    try {
+      db.prepare(`DELETE FROM memories WHERE ${condition}`).run(olderThanMs);
+      for (const row of rows) {
+        db.prepare("DELETE FROM memories_vec WHERE rowid = ?").run(row.rowid);
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+
+    return rows.length;
+  }
+}
+
+// ============================================================================
+// Backend Factory
+// ============================================================================
+
+async function createMemoryBackend(
+  dbPath: string,
+  vectorDim: number,
+  logger: { info: (msg: string) => void; warn: (msg: string) => void },
+): Promise<MemoryDB | SqliteVecMemoryDB> {
+  try {
+    await loadLanceDB();
+    logger.info(`memory-lancedb: using LanceDB backend (db: ${dbPath})`);
+    return new MemoryDB(dbPath, vectorDim);
+  } catch {
+    logger.info(
+      `memory-lancedb: LanceDB unavailable on this platform — using sqlite-vec fallback (db: ${path.join(dbPath, "memories.sqlite")})`,
+    );
+    return new SqliteVecMemoryDB(dbPath, vectorDim);
+  }
+}
+
+// ============================================================================
 // OpenAI Embeddings
 // ============================================================================
 
@@ -352,6 +601,46 @@ export function shouldCapture(text: string, options?: { maxChars?: number }): bo
   return MEMORY_TRIGGERS.some((r) => r.test(text));
 }
 
+/**
+ * Returns true if an assistant turn is worth capturing as an episodic event.
+ * Filters out short acks, pure tool confirmations, and filler responses.
+ * Targets: insights, decisions, discrepancies, patterns, analytical conclusions.
+ */
+export function isSubstantiveAssistantTurn(text: string): boolean {
+  if (text.length < 120) return false; // skip short acks ("Got it.", "Done.")
+
+  // Skip injected memory context
+  if (text.includes("<relevant-memories>") || text.includes("<ooda-notice>")) return false;
+
+  // Must contain at least one signal of insight/decision/analysis
+  const INSIGHT_SIGNALS = [
+    /\broot cause\b/i,
+    /\bdiscrepancy\b|\bmismatch\b|\bgap\b/i,
+    /\bdecision\b|\bdecided\b|\bchose\b/i,
+    /\bconfirmed\b|\bverified\b|\bfound\b/i,
+    /\bthe (fix|issue|problem|bug|cause) is\b/i,
+    /\bthis means\b|\bimplication\b/i,
+    /\bpattern\b|\brecurring\b/i,
+    /\bsynergy\b|\bleverages\b|\bcombines\b/i,
+    /\bnever passes\b|\balways fails\b|\bconsistently\b/i,
+    /\barchitectural\b|\bdesign decision\b/i,
+  ];
+
+  return INSIGHT_SIGNALS.some((r) => r.test(text));
+}
+
+/**
+ * Detect memory category for assistant-sourced captures.
+ * More aggressive decision/fact detection than user message heuristic.
+ */
+export function detectAssistantCategory(text: string): MemoryCategory {
+  if (/root cause|the (fix|issue|problem|bug) is|discrepancy|mismatch/i.test(text)) return "fact";
+  if (/decided|decision|chose|the right (approach|path|call)/i.test(text)) return "decision";
+  if (/pattern|recurring|consistently|always|never/i.test(text)) return "fact";
+  if (/prefer|better than|superior|worse than/i.test(text)) return "preference";
+  return "other";
+}
+
 export function detectCategory(text: string): MemoryCategory {
   const lower = text.toLowerCase();
   if (/prefer|radši|like|love|hate|want/i.test(lower)) {
@@ -386,8 +675,23 @@ const memoryPlugin = {
     const { model, dimensions, apiKey, baseUrl } = cfg.embedding;
 
     const vectorDim = dimensions ?? vectorDimsForModel(model);
-    const db = new MemoryDB(resolvedDbPath, vectorDim);
     const embeddings = new Embeddings(apiKey, model, baseUrl, dimensions);
+
+    // Lazy-init: register() cannot be async, so defer backend selection to first use
+    let db: MemoryDB | SqliteVecMemoryDB | null = null;
+    let dbInitPromise: Promise<MemoryDB | SqliteVecMemoryDB> | null = null;
+    const getDb = async (): Promise<MemoryDB | SqliteVecMemoryDB> => {
+      if (db) return db;
+      if (!dbInitPromise) {
+        dbInitPromise = createMemoryBackend(resolvedDbPath, vectorDim, api.logger).then(
+          (backend) => {
+            db = backend;
+            return backend;
+          },
+        );
+      }
+      return dbInitPromise;
+    };
 
     api.logger.info(`memory-lancedb: plugin registered (db: ${resolvedDbPath}, lazy init)`);
 
@@ -409,7 +713,8 @@ const memoryPlugin = {
           const { query, limit = 5 } = params as { query: string; limit?: number };
 
           const vector = await embeddings.embed(query);
-          const results = await db.search(vector, limit, 0.1);
+          const backend = await getDb();
+          const results = await backend.search(vector, limit, 0.1);
 
           if (results.length === 0) {
             return {
@@ -471,9 +776,10 @@ const memoryPlugin = {
           };
 
           const vector = await embeddings.embed(text);
+          const backend = await getDb();
 
           // Check for duplicates
-          const existing = await db.search(vector, 1, 0.95);
+          const existing = await backend.search(vector, 1, 0.95);
           if (existing.length > 0) {
             return {
               content: [
@@ -490,7 +796,7 @@ const memoryPlugin = {
             };
           }
 
-          const entry = await db.store({
+          const entry = await backend.store({
             text,
             vector,
             importance,
@@ -517,9 +823,10 @@ const memoryPlugin = {
         }),
         async execute(_toolCallId, params) {
           const { query, memoryId } = params as { query?: string; memoryId?: string };
+          const backend = await getDb();
 
           if (memoryId) {
-            await db.delete(memoryId);
+            await backend.delete(memoryId);
             return {
               content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
               details: { action: "deleted", id: memoryId },
@@ -528,7 +835,7 @@ const memoryPlugin = {
 
           if (query) {
             const vector = await embeddings.embed(query);
-            const results = await db.search(vector, 5, 0.7);
+            const results = await backend.search(vector, 5, 0.7);
 
             if (results.length === 0) {
               return {
@@ -538,7 +845,7 @@ const memoryPlugin = {
             }
 
             if (results.length === 1 && results[0].score > 0.9) {
-              await db.delete(results[0].entry.id);
+              await backend.delete(results[0].entry.id);
               return {
                 content: [{ type: "text", text: `Forgotten: "${results[0].entry.text}"` }],
                 details: { action: "deleted", id: results[0].entry.id },
@@ -589,7 +896,8 @@ const memoryPlugin = {
           .command("list")
           .description("List memories")
           .action(async () => {
-            const count = await db.count();
+            const backend = await getDb();
+            const count = await backend.count();
             console.log(`Total memories: ${count}`);
           });
 
@@ -599,8 +907,9 @@ const memoryPlugin = {
           .argument("<query>", "Search query")
           .option("--limit <n>", "Max results", "5")
           .action(async (query, opts) => {
+            const backend = await getDb();
             const vector = await embeddings.embed(query);
-            const results = await db.search(vector, parseInt(opts.limit), 0.3);
+            const results = await backend.search(vector, parseInt(opts.limit), 0.3);
             // Strip vectors for output
             const output = results.map((r) => ({
               id: r.entry.id,
@@ -616,7 +925,8 @@ const memoryPlugin = {
           .command("stats")
           .description("Show memory statistics")
           .action(async () => {
-            const count = await db.count();
+            const backend = await getDb();
+            const count = await backend.count();
             console.log(`Total memories: ${count}`);
           });
       },
@@ -636,7 +946,8 @@ const memoryPlugin = {
 
         try {
           const vector = await embeddings.embed(event.prompt);
-          const results = await db.search(vector, 3, 0.3);
+          const backend = await getDb();
+          const results = await backend.search(vector, 3, 0.3);
 
           if (results.length === 0) {
             return;
@@ -707,23 +1018,21 @@ const memoryPlugin = {
           const toCapture = texts.filter(
             (text) => text && shouldCapture(text, { maxChars: cfg.captureMaxChars }),
           );
-          if (toCapture.length === 0) {
-            return;
-          }
 
-          // Store each capturable piece (limit to 3 per conversation)
+          // Store each capturable user message (limit to 3 per turn)
+          const backend = await getDb();
           let stored = 0;
           for (const text of toCapture.slice(0, 3)) {
             const category = detectCategory(text);
             const vector = await embeddings.embed(text);
 
             // Check for duplicates (high similarity threshold)
-            const existing = await db.search(vector, 1, 0.95);
+            const existing = await backend.search(vector, 1, 0.95);
             if (existing.length > 0) {
               continue;
             }
 
-            await db.store({
+            await backend.store({
               text,
               vector,
               importance: 0.7,
@@ -731,6 +1040,64 @@ const memoryPlugin = {
               source: "user",
             });
             stored++;
+          }
+
+          // ── Assistant turn summary capture ──────────────────────────────
+          // Capture the last substantive assistant message at lower importance.
+          // Insights, decisions, discrepancies, and patterns live in assistant
+          // turns — not just user messages. Filtered separately from user
+          // captures to avoid self-poisoning from raw tool output.
+          const lastAssistantText = (() => {
+            for (let i = event.messages.length - 1; i >= 0; i--) {
+              const msg = event.messages[i] as Record<string, unknown>;
+              if (msg.role !== "assistant") continue;
+              const content = msg.content;
+              // Extract text from string content
+              if (typeof content === "string" && content.length > 0) {
+                return content;
+              }
+              // Extract text blocks from array content (skip pure tool_use turns)
+              if (Array.isArray(content)) {
+                const textBlocks = content
+                  .filter(
+                    (b) =>
+                      b &&
+                      typeof b === "object" &&
+                      (b as Record<string, unknown>).type === "text" &&
+                      typeof (b as Record<string, unknown>).text === "string",
+                  )
+                  .map((b) => (b as Record<string, unknown>).text as string)
+                  .join("\n")
+                  .trim();
+                if (textBlocks.length > 0) return textBlocks;
+              }
+              break; // only check last assistant message
+            }
+            return null;
+          })();
+
+          if (lastAssistantText && isSubstantiveAssistantTurn(lastAssistantText)) {
+            try {
+              // Truncate to avoid storing walls of text
+              const summary = lastAssistantText.slice(
+                0,
+                cfg.captureMaxChars ?? DEFAULT_CAPTURE_MAX_CHARS,
+              );
+              const vector = await embeddings.embed(summary);
+              const existing = await backend.search(vector, 1, 0.95);
+              if (existing.length === 0) {
+                await backend.store({
+                  text: summary,
+                  vector,
+                  importance: 0.5,
+                  category: detectAssistantCategory(summary),
+                  source: "assistant",
+                });
+                stored++;
+              }
+            } catch {
+              // best-effort — don't fail user capture if assistant capture errors
+            }
           }
 
           if (stored > 0) {
