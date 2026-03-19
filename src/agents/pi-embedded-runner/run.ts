@@ -331,6 +331,7 @@ export async function runEmbeddedPiAgent(
         messageProvider: params.messageProvider ?? undefined,
         trigger: params.trigger,
         channelId: params.messageChannel ?? params.messageProvider ?? undefined,
+        thinkingLevel: params.thinkLevel ?? "off",
       };
       if (hookRunner?.hasHooks("before_model_resolve")) {
         try {

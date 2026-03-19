@@ -1338,6 +1338,8 @@ export type PluginHookAgentContext = {
   trigger?: string;
   /** Channel identifier (e.g. "telegram", "discord", "whatsapp"). */
   channelId?: string;
+  /** Thinking/reasoning level for this agent run. */
+  thinkingLevel?: string;
 };
 
 // before_model_resolve hook

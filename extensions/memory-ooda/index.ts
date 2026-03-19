@@ -228,7 +228,7 @@ const oodaPlugin = {
     // Context Injection + OODA Triage/Strategy
     // ========================================================================
 
-    api.on("before_agent_start", async (event) => {
+    api.on("before_agent_start", async (event, ctx) => {
       try {
         const knowledge = getFacts(workspacePath);
         const context = formatFactsForContext(knowledge);
@@ -252,8 +252,15 @@ const oodaPlugin = {
         // OODA Triage + Strategy
         // ==================================================================
 
-        // PluginHookBeforeAgentStartEvent has no thinkingLevel field
-        const thinkingLevel: "low" | "medium" | "high" = "low";
+        // Read thinkingLevel from hook context (exposed via PluginHookAgentContext.thinkingLevel).
+        // Normalise to the three levels the OODA chain recognises; anything ≤ "low" stays "low".
+        const rawLevel = ctx?.thinkingLevel ?? "off";
+        const thinkingLevel: "low" | "medium" | "high" =
+          rawLevel === "high" || rawLevel === "xhigh"
+            ? "high"
+            : rawLevel === "medium" || rawLevel === "adaptive"
+              ? "medium"
+              : "low";
 
         let priorities;
         try {
