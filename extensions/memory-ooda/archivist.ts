@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
+import { addArchivistProposals, type ProposalCandidate } from "./proposals.js";
 import type { ModelCallFn } from "./triage.js";
 
 // ============================================================================
@@ -323,6 +324,87 @@ const DEFAULT_CONFIG: ArchivistConfig = {
  * 6. Prune old processed events.
  * 7. Update state file.
  */
+// ============================================================================
+// Proposal Extraction (second model pass)
+// ============================================================================
+
+const PROPOSAL_PROMPT_TEMPLATE = `You are scanning recent session memory for actionable suggestions worth surfacing proactively.
+
+## Recent Events (showing first 40):
+{EVENTS}
+
+## Already Pending Proposals (do NOT duplicate):
+{PENDING}
+
+## What to look for:
+1. RECURRING PROBLEMS — same issue appeared 3+ times → suggest a fix or process change
+2. MISSING TOOLS — task done manually repeatedly → suggest building automation
+3. ARCHITECTURAL GAPS — pattern of workarounds for a known root cause → suggest addressing root cause
+4. PROCESS INEFFICIENCY — repeated friction in workflow → suggest streamlining
+
+## Rules:
+- Only emit proposals with confidence >= 0.6
+- Maximum 3 proposals
+- Each must be concrete and actionable (not vague)
+- Do NOT propose things already in pending proposals above
+- Do NOT propose things clearly outside the agent's scope
+
+## Output:
+Raw JSON array only. Empty array if nothing warrants a proposal.
+[
+  {
+    "category": "project" | "workflow" | "technical",
+    "rule": "<domain label e.g. AMF Pipeline, OpenCLOODA, Daily workflow>",
+    "proposal": "<1-2 sentences: concrete action>",
+    "reasoning": "<why this matters>",
+    "evidence": ["<specific example 1>", "<specific example 2>"],
+    "confidence": <0.0-1.0>
+  }
+]`;
+
+async function extractProposals(
+  events: EpisodicEvent[],
+  workspacePath: string,
+  callModel: ModelCallFn,
+): Promise<ProposalCandidate[]> {
+  // Need enough events to identify a pattern
+  if (events.length < 5) return [];
+
+  const { getProposals } = await import("./proposals.js");
+  const existing = getProposals(workspacePath);
+  const pendingText =
+    existing
+      .filter((p) => p.status === "pending")
+      .map((p) => `- [${p.rule}] ${p.proposal}`)
+      .join("\n") || "(none)";
+
+  const eventSummary = events
+    .slice(0, 40)
+    .map((e, i) => `${i + 1}. [${e.category}] ${e.text.slice(0, 180)}`)
+    .join("\n");
+
+  const prompt = PROPOSAL_PROMPT_TEMPLATE.replace("{EVENTS}", eventSummary).replace(
+    "{PENDING}",
+    pendingText,
+  );
+
+  try {
+    const raw = await callModel(prompt);
+    const parsed = JSON.parse(stripCodeFences(raw));
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.filter(
+      (p: ProposalCandidate) =>
+        typeof p.proposal === "string" &&
+        p.proposal.trim().length > 0 &&
+        typeof p.confidence === "number" &&
+        p.confidence >= 0.6,
+    );
+  } catch {
+    return [];
+  }
+}
+
 export async function runArchivist(
   workspacePath: string,
   currentTurn: number,
@@ -409,6 +491,21 @@ export async function runArchivist(
     last_run_turn: currentTurn,
     last_run_at: new Date().toISOString(),
   });
+
+  // Step 8: Proposal extraction (second pass — best effort, non-blocking)
+  try {
+    const candidates = await extractProposals(events, workspacePath, callModel);
+    const added = addArchivistProposals(workspacePath, candidates);
+    if (added > 0) {
+      semanticStore.appendArchivistLog(
+        "proposals_generated",
+        `Generated ${added} proposal(s) from ${events.length} events`,
+      );
+    }
+  } catch (err) {
+    // Non-fatal — proposals are best-effort
+    semanticStore.appendArchivistLog("proposals_error", errorMessage(err));
+  }
 
   return {
     patternsExtracted: patterns,
