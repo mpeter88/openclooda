@@ -150,8 +150,21 @@ Respond with raw JSON only. Do not wrap in code fences or add any text outside t
   "summary": "<one sentence, max 120 characters>",
   "conflictsDetected": [<conflicts with known facts, commitments, or preferences — empty array if none>],
   "relevantFacts": [<KNOWLEDGE.json keys that informed your reasoning — empty array if none>],
-  "recommendedDomains": [<domain names from the active domains list — empty array if none>]
+  "recommendedDomains": [<domain names from the active domains list — empty array if none>],
+  "attention": "<optional — only when priority >= 6: single imperative ≤15 words for the executive>"
 }
+
+## attention field
+When priority >= 6, add an "attention" field — a single imperative sentence (≤15 words)
+directing the responding model on what to emphasize or watch for this turn.
+Leave "attention" out entirely for priority <= 5.
+
+Examples:
+  "Deadline pressure is high — surface blockers before context."
+  "User is debugging a live run — skip theory, go straight to cause."
+  "This is client-facing — cite evidence, not opinion."
+  "Multiple open CRs in flight — confirm which is being addressed."
+  "Pattern matches a known failure mode — check for the documented fix first."
 
 ## Priority Calibration
 - 1-2: Trivial — greetings, acknowledgments, no action needed
@@ -205,6 +218,14 @@ export function parseSITREP(raw: string): SITREP {
     recommendedDomains: Array.isArray(parsed.recommendedDomains)
       ? parsed.recommendedDomains.filter((s: unknown) => typeof s === "string")
       : [],
+    attention: (() => {
+      if (typeof parsed.attention !== "string" || parsed.attention.trim().length === 0) {
+        return undefined;
+      }
+      // Trim to 15 words max
+      const words = parsed.attention.trim().split(/\s+/);
+      return words.length > 15 ? words.slice(0, 15).join(" ") + "…" : parsed.attention.trim();
+    })(),
   };
 }
 

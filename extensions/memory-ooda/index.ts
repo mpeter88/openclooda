@@ -279,16 +279,21 @@ const oodaPlugin = {
 
           const sitrep = triageResult.sitrep;
 
+          // Format SITREP — attention field bolded at top when present
+          const sitrepLines: string[] = [];
+          if (sitrep.attention) {
+            sitrepLines.push(`**ATTENTION:** ${sitrep.attention}`);
+          }
+          sitrepLines.push(
+            `Priority: ${sitrep.priority}/10 | ${sitrep.summary} | Domains: ${sitrep.recommendedDomains.join(", ") || "none"}`,
+          );
+          const sitrepBlock = `<ooda-sitrep>${sitrepLines.join("\n")}</ooda-sitrep>`;
+
           if (!shouldRunFullOODA(sitrep, priorities, thinkingLevel)) {
-            // Inject minimal SITREP line only
-            parts.push(
-              `<ooda-sitrep>Priority: ${sitrep.priority}/10 | ${sitrep.summary} | Domains: ${sitrep.recommendedDomains.join(", ") || "none"}</ooda-sitrep>`,
-            );
+            parts.push(sitrepBlock);
           } else {
             // Full OODA: run strategy
-            parts.push(
-              `<ooda-sitrep>Priority: ${sitrep.priority}/10 | ${sitrep.summary} | Domains: ${sitrep.recommendedDomains.join(", ") || "none"}</ooda-sitrep>`,
-            );
+            parts.push(sitrepBlock);
 
             try {
               const strategyResult = await runStrategy(
@@ -305,6 +310,12 @@ const oodaPlugin = {
               parts.push(
                 `<ooda-strategy>Action: ${winner.label} | ${winner.reasoning}</ooda-strategy>`,
               );
+              // OODA_DEBUG: show raw strategy output for calibration
+              if (process.env.OODA_DEBUG === "true") {
+                parts.push(
+                  `<ooda-strategy-debug>${JSON.stringify(strategyResult, null, 2)}</ooda-strategy-debug>`,
+                );
+              }
             } catch (err) {
               api.logger.warn(`memory-ooda: strategy failed, skipping: ${String(err)}`);
             }

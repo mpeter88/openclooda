@@ -62,7 +62,13 @@ export interface ArchivistConfig {
 
 /** A single pattern extracted by the model from episodic events. */
 export interface PatternExtraction {
-  section: "stack" | "projects" | "people" | "domain_context";
+  section:
+    | "stack"
+    | "projects"
+    | "people"
+    | "domain_context"
+    | "lessons_learned"
+    | "preferences_notes";
   key: string;
   value: unknown;
   reason: string;
@@ -155,48 +161,67 @@ function formatEventsBlock(events: EpisodicEvent[]): string {
 export function buildArchivistPrompt(events: EpisodicEvent[]): string {
   const eventsBlock = formatEventsBlock(events);
 
-  return `You are the Archivist, a pattern-extraction agent that distills episodic memory into stable semantic facts.
+  return `You are the Archivist — a long-term memory distillation agent.
 
-Given a batch of recent episodic events from a user's AI assistant, identify stable patterns that should be promoted to long-term semantic memory.
+You receive a batch of recent episodic events from an AI assistant session.
+Your job: extract durable knowledge worth remembering across future sessions.
 
 ## Episodic Events
 ${eventsBlock}
 
-## What to Extract
-Look for:
-- Recurring preferences (e.g., user consistently prefers async communication)
-- Technology patterns (e.g., user keeps using TypeScript + Vitest)
-- People patterns (e.g., "Alex" appears frequently as a collaborator)
-- Project patterns (e.g., a project has shifted from active to paused)
-- Domain context (e.g., user is currently focused on infrastructure work)
+## Target Sections (extract to each one actively)
 
-Only extract patterns supported by multiple events or high-importance signals. Do not promote one-off observations.
+### lessons_learned  ← MOST IMPORTANT
+Mistakes made, bugs found, anti-patterns encountered, and what they teach.
+Every bug report, revert, wrong assumption, or "we should have known better" is a lesson.
+Key: 3-5 words snake_case (e.g. "claude_streaming_required", "check_all_branches")
+Value: 1-2 sentence actionable lesson.
+
+Examples:
+  "claude_streaming_required": "Always use messages.stream() not messages.create() — the Anthropic SDK enforces a 10-minute timeout on blocking calls that large generations exceed."
+  "check_all_branches": "When auditing for code violations, check worktree branches too — violations hide in in-flight branches, not just committed code."
+  "package_detection_first_match": "Assembly script must use the shortest qualifying package (≥3 segments), not the first match — can land on a subpackage and misplace files."
+
+### preferences_notes
+How the user prefers to work, what they value, what they avoid. Free-form string.
+Key: short label, Value: 1 sentence.
+
+Examples:
+  "cr_before_code": "Always write the CR spec before implementing — no code without a CR."
+  "proactive_not_reactive": "Don't wait to be asked — surface blockers, propose improvements, act on patterns."
+
+### people
+Anyone mentioned by name with role and relevant context.
+Value: object { "role", "relationship", "communication_preference", "notes" }
+
+### projects
+Update status, constraints, key patterns. Don't repeat what's already captured.
+
+### domain_context
+Cross-project patterns, recurring failure modes, architectural decisions that recur.
+
+### stack
+Technology, tools, versions that are stable across sessions.
 
 ## Output Format
-Respond with raw JSON only. Do not wrap in code fences or add any text outside the JSON.
+Respond with raw JSON only. No code fences, no text outside the JSON.
 
 [
   {
-    "section": "<stack | projects | people | domain_context>",
-    "key": "<identifier for this fact>",
-    "value": <string for stack/domain_context, or object for projects/people>,
-    "reason": "<brief explanation of which events support this pattern>"
+    "section": "<stack | projects | people | domain_context | lessons_learned | preferences_notes>",
+    "key": "<identifier>",
+    "value": <string for stack/domain_context/lessons_learned/preferences_notes, object for projects/people>,
+    "reason": "<which events support this>"
   }
 ]
 
-Return an empty array [] if no stable patterns are found.
-
-## Section Value Formats
-- stack: string value (e.g., "TypeScript 5.x")
-- domain_context: string value (e.g., "Currently focused on OODA agent implementation")
-- projects: object with { "status": "active"|"paused"|"complete", "priority_domain": "<domain>", "key_constraint": "<constraint>", "notes": "<notes>" }
-- people: object with { "role": "<role>", "relationship": "<relationship>", "communication_preference": "<preference>", "notes": "<notes>" }
+Return [] if no patterns found. Maximum 15 patterns per batch.
 
 ## Constraints
-- Maximum 10 patterns per batch
-- Each pattern must cite at least 2 supporting events in the reason
+- lessons_learned entries can come from a SINGLE event if it clearly describes a mistake or lesson
+- All other sections require 2+ supporting events
+- Never infer sensitive personal information (health, finances)
 - Prefer updating existing facts over creating new ones
-- Never infer sensitive personal information (health, finances, relationships beyond professional)
 
 Verify your JSON is syntactically valid before responding.`;
 }
@@ -205,7 +230,14 @@ Verify your JSON is syntactically valid before responding.`;
 // Response Parsing
 // ============================================================================
 
-const VALID_SECTIONS = new Set(["stack", "projects", "people", "domain_context"]);
+const VALID_SECTIONS = new Set([
+  "stack",
+  "projects",
+  "people",
+  "domain_context",
+  "lessons_learned",
+  "preferences_notes",
+]);
 
 export function parsePatterns(raw: string): PatternExtraction[] {
   const cleaned = stripCodeFences(raw);
@@ -242,7 +274,10 @@ export function parsePatterns(raw: string): PatternExtraction[] {
     }
     // Per-section type validation
     if (
-      (obj.section === "stack" || obj.section === "domain_context") &&
+      (obj.section === "stack" ||
+        obj.section === "domain_context" ||
+        obj.section === "lessons_learned" ||
+        obj.section === "preferences_notes") &&
       typeof obj.value !== "string"
     ) {
       throw new Error(`Pattern[${idx}].value must be a string for section "${obj.section}"`);

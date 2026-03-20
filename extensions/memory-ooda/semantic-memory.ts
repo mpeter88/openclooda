@@ -45,6 +45,7 @@ export function createDefaultKnowledge(): KnowledgeFile {
     },
     commitments: [],
     domain_context: {},
+    lessons_learned: {},
     _archivist_log: [],
   };
 }
@@ -102,11 +103,23 @@ export function upsertFact(
   const filePath = knowledgePath(workspacePath);
 
   // Validate that the section is a Record-style section we can upsert into
-  const recordSections = ["stack", "projects", "people", "domain_context"];
+  const recordSections = [
+    "stack",
+    "projects",
+    "people",
+    "domain_context",
+    "lessons_learned",
+    "preferences_notes",
+  ];
   if (!recordSections.includes(section)) {
     throw new Error(
       `Cannot upsert into section "${section}". Allowed: ${recordSections.join(", ")}`,
     );
+  }
+
+  // Auto-initialise section if not yet present in the file (e.g. lessons_learned)
+  if (!(section in knowledge)) {
+    (knowledge as Record<string, unknown>)[section] = {};
   }
 
   // Snapshot before writing

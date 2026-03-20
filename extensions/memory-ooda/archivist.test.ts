@@ -233,26 +233,30 @@ describe("buildArchivistPrompt", () => {
 
   it("includes section format descriptions", () => {
     const prompt = buildArchivistPrompt([createTestEvent()]);
-    expect(prompt).toContain("stack: string value");
-    expect(prompt).toContain("projects: object with");
-    expect(prompt).toContain("people: object with");
-    expect(prompt).toContain("domain_context: string value");
+    // P4: prompt updated to include new sections
+    expect(prompt).toContain("lessons_learned");
+    expect(prompt).toContain("preferences_notes");
+    expect(prompt).toContain("projects");
+    expect(prompt).toContain("people");
+    expect(prompt).toContain("domain_context");
   });
 
-  it("includes constraint about max 10 patterns", () => {
+  it("includes constraint about max patterns", () => {
     const prompt = buildArchivistPrompt([createTestEvent()]);
-    expect(prompt).toContain("Maximum 10 patterns");
+    expect(prompt).toContain("Maximum 15 patterns");
   });
 
-  it("includes the 2-event citation requirement", () => {
+  it("includes citation requirements", () => {
     const prompt = buildArchivistPrompt([createTestEvent()]);
-    expect(prompt).toContain("at least 2 supporting events");
+    // lessons_learned can come from single event; others need 2+
+    expect(prompt).toContain("lessons_learned entries can come from a SINGLE event");
+    expect(prompt).toContain("2+ supporting events");
   });
 
   it("includes output format instructions", () => {
     const prompt = buildArchivistPrompt([createTestEvent()]);
     expect(prompt).toContain("Respond with raw JSON only");
-    expect(prompt).toContain("Do not wrap in code fences");
+    expect(prompt).toContain("No code fences");
   });
 
   it("truncates long event text (H4)", () => {

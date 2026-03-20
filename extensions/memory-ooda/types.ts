@@ -60,6 +60,9 @@ export interface KnowledgeFile {
     blocking: boolean;
   }>;
   domain_context: Record<string, string>;
+  /** Distilled lessons from past sessions. Key: short label (snake_case).
+   *  Value: 1-2 sentence actionable lesson. Written by the Archivist. */
+  lessons_learned: Record<string, string>;
   _archivist_log: Array<{
     timestamp: string;
     action: string;
@@ -127,6 +130,10 @@ export interface SITREP {
   conflictsDetected: string[];
   relevantFacts: string[];
   recommendedDomains: string[];
+  /** Single imperative sentence (≤15 words) directing the executive on
+   *  what to emphasize or watch for this turn.
+   *  Only present when priority >= 6. */
+  attention?: string;
 }
 
 export interface Strategy {
