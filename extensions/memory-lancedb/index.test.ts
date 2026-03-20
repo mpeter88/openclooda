@@ -12,6 +12,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
+import { isSubstantiveAssistantTurn } from "./index.js";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "test-key";
 const HAS_OPENAI_KEY = Boolean(process.env.OPENAI_API_KEY);
@@ -750,4 +751,117 @@ describeLive("memory plugin live tests", () => {
 
     expect(recallAfterForget.details?.count).toBe(0);
   }, 60000); // 60s timeout for live API calls
+});
+
+// ============================================================================
+// isSubstantiveAssistantTurn unit tests (CR_CAPABILITY_UPLIFT_P1_CAPTURE)
+// ============================================================================
+
+describe("isSubstantiveAssistantTurn", () => {
+  // --- existing signal coverage ---
+  test("captures root cause analysis", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "The root cause is that messages.stream() was replaced with messages.create().",
+      ),
+    ).toBe(true);
+  });
+
+  test("captures decisions", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "We decided to use the HAL dual-backend pattern rather than hardcoding the Honeywell SDK.",
+      ),
+    ).toBe(true);
+  });
+
+  // --- new signals ---
+  test("captures regression analysis", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "This is a regression — the streaming call was replaced with a blocking call.",
+      ),
+    ).toBe(true);
+  });
+
+  test("captures recommendations", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "I recommend using the centralized model client pattern instead of direct SDK instantiation.",
+      ),
+    ).toBe(true);
+  });
+
+  test("captures 'the right approach' phrasing", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "The right approach here is to wire the AST extractor before the deterministic scanners run.",
+      ),
+    ).toBe(true);
+  });
+
+  test("captures CR references", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "CR_MANIFEST_PEER_REVIEW_FIXES addresses the root cause — see the STATUS.md entry.",
+      ),
+    ).toBe(true);
+  });
+
+  test("captures parity signal", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "The parity score dropped from 74 to 52 — state machine phase failed.",
+      ),
+    ).toBe(true);
+  });
+
+  test("captures 'should never' lessons", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "You should never use bare except: — it catches SystemExit and KeyboardInterrupt.",
+      ),
+    ).toBe(true);
+  });
+
+  test("captures trade-off analysis", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "The trade-off here is cost vs precision — Opus at 3-8K tokens is ~$0.05.",
+      ),
+    ).toBe(true);
+  });
+
+  // --- length floor ---
+  test("captures long responses regardless of signals", () => {
+    expect(isSubstantiveAssistantTurn("x".repeat(601))).toBe(true);
+  });
+
+  test("does NOT capture at exactly 600 chars without signal", () => {
+    // 600 x's — no signal, not > 600, but > 50 minimum
+    expect(isSubstantiveAssistantTurn("x".repeat(600))).toBe(false);
+  });
+
+  // --- filters ---
+  test("filters short acks", () => {
+    expect(isSubstantiveAssistantTurn("Got it.")).toBe(false);
+    expect(isSubstantiveAssistantTurn("Done.")).toBe(false);
+    expect(isSubstantiveAssistantTurn("HEARTBEAT_OK")).toBe(false);
+  });
+
+  test("filters injected memory context", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "<relevant-memories>Some memory content here that is quite long and detailed.</relevant-memories>",
+      ),
+    ).toBe(false);
+  });
+
+  test("filters ooda notice injections", () => {
+    expect(
+      isSubstantiveAssistantTurn(
+        "<ooda-notice>You have 2 pending proposals. Run openclaw workspace proposals list.</ooda-notice>",
+      ),
+    ).toBe(false);
+  });
 });

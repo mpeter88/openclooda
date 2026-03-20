@@ -26,9 +26,22 @@ import {
 
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null = null;
 let lancedbAvailable: boolean | null = null; // null = untested
+
+const LANCEDB_PROBE_TIMEOUT_MS = 3_000; // fail fast on platforms with missing native bindings
+
 const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
   if (!lancedbImportPromise) {
-    lancedbImportPromise = import("@lancedb/lancedb");
+    // Race the dynamic import against a short timeout so Intel Mac fails fast
+    // instead of hanging for minutes before throwing module-not-found.
+    lancedbImportPromise = Promise.race([
+      import("@lancedb/lancedb"),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("LanceDB import timed out — native binding likely missing")),
+          LANCEDB_PROBE_TIMEOUT_MS,
+        ),
+      ),
+    ]);
   }
   try {
     const mod = await lancedbImportPromise;
@@ -36,7 +49,9 @@ const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
     return mod;
   } catch (err) {
     lancedbAvailable = false;
-    // Common on macOS today: upstream package may not ship darwin native bindings.
+    // Reset so a future retry can attempt again (e.g. after native binding is installed)
+    lancedbImportPromise = null;
+    // Common on macOS: upstream package may not ship darwin-x64 native bindings.
     throw new Error(`memory-lancedb: failed to load LanceDB. ${String(err)}`, { cause: err });
   }
 };
@@ -607,13 +622,17 @@ export function shouldCapture(text: string, options?: { maxChars?: number }): bo
  * Targets: insights, decisions, discrepancies, patterns, analytical conclusions.
  */
 export function isSubstantiveAssistantTurn(text: string): boolean {
-  if (text.length < 120) return false; // skip short acks ("Got it.", "Done.")
+  if (text.length < 50) return false; // skip short acks ("Got it.", "Done.", "HEARTBEAT_OK")
 
   // Skip injected memory context
   if (text.includes("<relevant-memories>") || text.includes("<ooda-notice>")) return false;
 
+  // Long responses are substantive by definition — no need to pattern-match
+  if (text.length > 600) return true;
+
   // Must contain at least one signal of insight/decision/analysis
   const INSIGHT_SIGNALS = [
+    // --- existing: analysis + decisions ---
     /\broot cause\b/i,
     /\bdiscrepancy\b|\bmismatch\b|\bgap\b/i,
     /\bdecision\b|\bdecided\b|\bchose\b/i,
@@ -624,6 +643,28 @@ export function isSubstantiveAssistantTurn(text: string): boolean {
     /\bsynergy\b|\bleverages\b|\bcombines\b/i,
     /\bnever passes\b|\balways fails\b|\bconsistently\b/i,
     /\barchitectural\b|\bdesign decision\b/i,
+
+    // --- code-level reasoning ---
+    /\bregression\b|\bviolation\b|\banti-pattern\b/i,
+    /\bwired\b.{0,30}\bnot\b|\bnever.*called\b|\bsilently.*fail/i,
+    /\bdeadlock\b|\brace condition\b|\btimeout\b/i,
+    /\bblind spot\b|\bnever.*fires\b/i,
+
+    // --- recommendations ---
+    /\brecommend\b|\bsuggestion\b|\badvise\b/i,
+    /\bthe right (approach|way|call|tool|pattern)\b/i,
+    /\bbetter (to|approach|option|choice)\b/i,
+    /\btrade.?off\b|\bconsequence of\b/i,
+
+    // --- project-specific signal ---
+    /\bparity (score|gap|check|fail)\b/i,
+    /\bgenerat(ed|ion) (code|output|artifact)\b/i,
+    /\bCR_\w+\b/,
+    /\bPhase [1-9]\b|\bP[0-9] —\b/i,
+
+    // --- bugs and lessons ---
+    /\bshould (never|always|not)\b/i,
+    /\bthe lesson\b|\bwhat this means\b|\bwhat happened\b/i,
   ];
 
   return INSIGHT_SIGNALS.some((r) => r.test(text));
@@ -677,7 +718,10 @@ const memoryPlugin = {
     const vectorDim = dimensions ?? vectorDimsForModel(model);
     const embeddings = new Embeddings(apiKey, model, baseUrl, dimensions);
 
-    // Lazy-init: register() cannot be async, so defer backend selection to first use
+    // Eagerly probe backend at registration time so failover completes before
+    // any hooks fire. register() is sync, so we fire-and-forget the promise
+    // and let getDb() await it. This avoids the ~4min hang on Intel Mac where
+    // the LanceDB native binding is missing and the dynamic import times out.
     let db: MemoryDB | SqliteVecMemoryDB | null = null;
     let dbInitPromise: Promise<MemoryDB | SqliteVecMemoryDB> | null = null;
     const getDb = async (): Promise<MemoryDB | SqliteVecMemoryDB> => {
@@ -693,7 +737,10 @@ const memoryPlugin = {
       return dbInitPromise;
     };
 
-    api.logger.info(`memory-lancedb: plugin registered (db: ${resolvedDbPath}, lazy init)`);
+    // Kick off now — don't wait for first tool/hook call to discover the backend
+    void getDb();
+
+    api.logger.info(`memory-lancedb: plugin registered (db: ${resolvedDbPath}, probing backend)`);
 
     // ========================================================================
     // Tools
@@ -939,7 +986,8 @@ const memoryPlugin = {
 
     // Auto-recall: inject relevant memories before agent starts
     if (cfg.autoRecall) {
-      api.on("before_agent_start", async (event) => {
+      api.on("before_agent_start", async (event, ctx) => {
+        if (ctx?.sessionKey?.startsWith("ooda-")) return;
         if (!event.prompt || event.prompt.length < 5) {
           return;
         }
@@ -968,7 +1016,8 @@ const memoryPlugin = {
 
     // Auto-capture: analyze and store important information after agent ends
     if (cfg.autoCapture) {
-      api.on("agent_end", async (event) => {
+      api.on("agent_end", async (event, ctx) => {
+        if (ctx?.sessionKey?.startsWith("ooda-")) return;
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
@@ -1089,7 +1138,7 @@ const memoryPlugin = {
                 await backend.store({
                   text: summary,
                   vector,
-                  importance: 0.5,
+                  importance: 0.65,
                   category: detectAssistantCategory(summary),
                   source: "assistant",
                 });
