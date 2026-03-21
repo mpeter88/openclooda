@@ -75,10 +75,68 @@ function resolveLanceDbPath(api: OpenClawPluginApi): string {
 
 const TABLE_NAME = "memories";
 
+/**
+ * Build an EpisodicStore backed by the sqlite-vec fallback database.
+ *
+ * memory-lancedb's SqliteVecMemoryDB writes to `memories.sqlite` in the same
+ * dbPath directory. We open it here with node:sqlite (no vector extension
+ * needed — archivist only needs sequential reads and status updates, not ANN
+ * search). This runs on Intel Mac where @lancedb/lancedb-darwin-x64 is absent.
+ */
+async function buildSqliteEpisodicStore(dbPath: string): Promise<EpisodicStore> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { join: pathJoin } = await import("node:path");
+  const sqlitePath = pathJoin(dbPath, "memories.sqlite");
+  const db = new DatabaseSync(sqlitePath);
+
+  return {
+    async retrieveSince(sinceTimestamp: number, limit = 1000): Promise<EpisodicEvent[]> {
+      const rows = db
+        .prepare(
+          `SELECT id, text, category, importance, createdAt, source, actionId, archivistProcessed
+           FROM memories
+           WHERE createdAt > ?
+           ORDER BY createdAt ASC
+           LIMIT ?`,
+        )
+        .all(sinceTimestamp, limit) as Array<Record<string, unknown>>;
+
+      return rows.map((row) => ({
+        id: row.id as string,
+        text: row.text as string,
+        category: row.category as string,
+        importance: row.importance as number,
+        createdAt: row.createdAt as number,
+        source: (row.source as string) || undefined,
+        actionId: (row.actionId as string) || undefined,
+        archivistProcessed: row.archivistProcessed === 1 || row.archivistProcessed === true,
+      }));
+    },
+
+    async markProcessed(id: string): Promise<void> {
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!uuidRegex.test(id)) {
+        throw new Error(`Invalid memory ID format: ${id}`);
+      }
+      db.prepare("UPDATE memories SET archivistProcessed = 1 WHERE id = ?").run(id);
+    },
+
+    async prune(olderThanMs: number, onlyProcessed = false): Promise<number> {
+      const stmt = onlyProcessed
+        ? db.prepare("DELETE FROM memories WHERE createdAt < ? AND archivistProcessed = 1")
+        : db.prepare("DELETE FROM memories WHERE createdAt < ?");
+      const result = stmt.run(olderThanMs) as { changes: number };
+      return result.changes ?? 0;
+    },
+  };
+}
+
 async function buildEpisodicStore(api: OpenClawPluginApi): Promise<EpisodicStore | null> {
+  const dbPath = resolveLanceDbPath(api);
+
+  // ── Path 1: LanceDB (preferred, ARM Mac / Linux / Windows) ──────────────
   try {
     const lancedb = await import("@lancedb/lancedb");
-    const dbPath = resolveLanceDbPath(api);
     const db = await lancedb.connect(dbPath);
     const tables = await db.tableNames();
 
@@ -137,8 +195,31 @@ async function buildEpisodicStore(api: OpenClawPluginApi): Promise<EpisodicStore
         return rows.length;
       },
     };
+  } catch (_lanceErr) {
+    // LanceDB unavailable (e.g. Intel Mac missing @lancedb/lancedb-darwin-x64).
+    // Fall through to sqlite-vec fallback.
+  }
+
+  // ── Path 2: sqlite-vec fallback (Intel Mac / no native LanceDB binding) ──
+  try {
+    const { existsSync } = await import("node:fs");
+    const { join: pathJoin } = await import("node:path");
+    const sqlitePath = pathJoin(dbPath, "memories.sqlite");
+
+    if (!existsSync(sqlitePath)) {
+      // memory-lancedb hasn't written anything yet — nothing to read
+      api.logger.warn(
+        "memory-ooda: sqlite-vec fallback selected but memories.sqlite not found — archivist skipped until memory-lancedb captures first event",
+      );
+      return null;
+    }
+
+    api.logger.info(
+      `memory-ooda: LanceDB unavailable — using sqlite-vec fallback (db: ${sqlitePath})`,
+    );
+    return await buildSqliteEpisodicStore(dbPath);
   } catch (err) {
-    api.logger.warn(`memory-ooda: failed to initialize lancedb: ${String(err)}`);
+    api.logger.warn(`memory-ooda: sqlite-vec fallback also failed: ${String(err)}`);
     return null;
   }
 }
