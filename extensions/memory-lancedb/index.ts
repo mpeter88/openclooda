@@ -538,15 +538,29 @@ class Embeddings {
 // ============================================================================
 
 const MEMORY_TRIGGERS = [
+  // Explicit memory requests
   /zapamatuj si|pamatuj|remember/i,
   /preferuji|radši|nechci|prefer/i,
   /rozhodli jsme|budeme používat/i,
+  // Contact info
   /\+\d{10,}/,
   /[\w.-]+@[\w.-]+\.\w+/,
+  // Personal statements
   /můj\s+\w+\s+je|je\s+můj/i,
   /my\s+\w+\s+is|is\s+my/i,
   /i (like|prefer|hate|love|want|need)/i,
   /always|never|important/i,
+  // Technical work / dev session
+  /\b(fix|bug|issue|error|crash|broken|regression)\b/i,
+  /\b(implement|deploy|refactor|migrate|upgrade|install)\b/i,
+  /\b(PR|pull request|commit|branch|merge|rebase)\b/i,
+  /\b(test|failing|passing|coverage|lint)\b/i,
+  /\b(config|env|setup|install|build|compile)\b/i,
+  /\b(api|endpoint|route|schema|model|database|query)\b/i,
+  /\b(plugin|extension|hook|event|handler)\b/i,
+  /\b(decision|decided|agreed|confirmed|conclusion|approach)\b/i,
+  /\b(blocked|waiting|depends|prerequisite)\b/i,
+  /\b(working on|let'?s|we should|we need|next step)\b/i,
 ];
 
 const PROMPT_INJECTION_PATTERNS = [
@@ -600,8 +614,11 @@ export function shouldCapture(text: string, options?: { maxChars?: number }): bo
   if (text.startsWith("<") && text.includes("</")) {
     return false;
   }
-  // Skip agent summary responses (contain markdown formatting)
-  if (text.includes("**") && text.includes("\n-")) {
+  // Skip very long structured agent output (tables, multi-section reports, diffs)
+  // Heuristic: 4+ markdown bold tokens + 4+ list items = likely a generated report, not user input
+  const boldCount = (text.match(/\*\*/g) || []).length / 2;
+  const listItemCount = (text.match(/^\s*[-*]\s/gm) || []).length;
+  if (boldCount >= 4 && listItemCount >= 4) {
     return false;
   }
   // Skip emoji-heavy responses (likely agent output)
@@ -624,8 +641,8 @@ export function shouldCapture(text: string, options?: { maxChars?: number }): bo
 export function isSubstantiveAssistantTurn(text: string): boolean {
   if (text.length < 50) return false; // skip short acks ("Got it.", "Done.", "HEARTBEAT_OK")
 
-  // Skip injected memory context
-  if (text.includes("<relevant-memories>") || text.includes("<ooda-notice>")) return false;
+  // Skip injected memory/system context (these appear in system prompt, not assistant replies)
+  if (text.includes("<relevant-memories>")) return false;
 
   // Long responses are substantive by definition — no need to pattern-match
   if (text.length > 600) return true;
