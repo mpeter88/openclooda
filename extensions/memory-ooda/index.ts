@@ -30,6 +30,14 @@ import {
   appendArchivistLog,
 } from "./semantic-memory.js";
 import { runStrategy } from "./strategy.js";
+import {
+  dispatchTask,
+  getTaskStatus,
+  listTasks,
+  cancelTask,
+  wakeSync,
+  evaluateDispatch,
+} from "./task-bridge.js";
 import { runTriage, shouldRunFullOODA, type ModelCallFn } from "./triage.js";
 
 // ============================================================================
@@ -504,14 +512,119 @@ const oodaPlugin = {
     });
 
     // ========================================================================
+    // Wake Sync — surface completed cloud tasks on session start
+    // ========================================================================
+
+    api.on("session_start", async () => {
+      try {
+        const completed = wakeSync(workspacePath);
+        if (completed.length === 0) return;
+
+        const lines = completed.map((t) => {
+          const status = t.status === "failed" ? "❌ failed" : "✅ done";
+          const result = t.result ? ` — ${t.result.split("\n")[0].slice(0, 120)}` : "";
+          return `• [${status}] ${t.title}${result}`;
+        });
+
+        const msg =
+          completed.length === 1
+            ? `While you were away, a cloud task completed:\n${lines[0]}`
+            : `While you were away, ${completed.length} cloud tasks completed:\n${lines.join("\n")}`;
+
+        api.logger.info(`memory-ooda: wake sync — ${completed.length} task(s) surfaced`);
+
+        return { prependSystemContext: `<ooda-notice>${msg}</ooda-notice>` };
+      } catch (err) {
+        api.logger.warn(`memory-ooda: wake sync failed: ${String(err)}`);
+      }
+    });
+
+    // ========================================================================
+    // Task Bridge — expose dispatch/status/cancel/list as plugin methods
+    // ========================================================================
+
+    // Attach task bridge methods to plugin API for use by agent and CLI
+    (api as unknown as Record<string, unknown>).tasks = {
+      dispatch: (spec: Parameters<typeof dispatchTask>[1]) => dispatchTask(workspacePath, spec),
+      status: (query: string) => getTaskStatus(workspacePath, query),
+      list: (filter?: Parameters<typeof listTasks>[1]) => listTasks(workspacePath, filter),
+      cancel: (query: string) => cancelTask(workspacePath, query),
+      evaluateDispatch: (params: Parameters<typeof evaluateDispatch>[0]) =>
+        evaluateDispatch(params),
+    };
+
+    // ========================================================================
     // CLI Commands
     // ========================================================================
 
     api.registerCli(
       ({ program }) => {
         registerWorkspaceCli(program, workspacePath);
+
+        // Task bridge CLI
+        const tasks = program.command("tasks").description("Cloud task queue");
+
+        tasks
+          .command("list")
+          .description("List all tasks")
+          .option("--pending", "Only pending tasks")
+          .option("--active", "Only active tasks")
+          .option("--done", "Only completed tasks")
+          .action((opts) => {
+            const filter = opts.pending
+              ? "pending"
+              : opts.active
+                ? "active"
+                : opts.done
+                  ? "done"
+                  : undefined;
+            const items = listTasks(workspacePath, filter);
+            if (items.length === 0) {
+              console.log("No tasks found.");
+              return;
+            }
+            for (const { task } of items) {
+              const age = Math.round((Date.now() - new Date(task.createdAt).getTime()) / 60000);
+              console.log(`[${task.status}] ${task.id}: ${task.title} (${age}m ago)`);
+            }
+          });
+
+        tasks
+          .command("status <query>")
+          .description("Get status of a task by ID or title")
+          .action((query: string) => {
+            const found = getTaskStatus(workspacePath, query);
+            if (!found) {
+              console.log(`No task found matching: ${query}`);
+              return;
+            }
+            const { task } = found;
+            console.log(`ID:      ${task.id}`);
+            console.log(`Title:   ${task.title}`);
+            console.log(`Status:  ${task.status}`);
+            console.log(`Created: ${task.createdAt}`);
+            if (task.claimedAt) console.log(`Claimed: ${task.claimedAt} by ${task.claimedBy}`);
+            if (task.completedAt) console.log(`Done:    ${task.completedAt}`);
+            if (task.log.length > 0) {
+              console.log(`\nLast log entries:`);
+              for (const e of task.log.slice(-5)) {
+                console.log(`  ${e.timestamp} [${e.source}] ${e.message}`);
+              }
+            }
+            if (task.result) {
+              console.log(`\nResult:\n${task.result.slice(0, 500)}`);
+            }
+          });
+
+        tasks
+          .command("cancel <query>")
+          .description("Cancel a pending or active task")
+          .action((query: string) => {
+            const ok = cancelTask(workspacePath, query);
+            console.log(ok ? `Task cancelled.` : `No cancellable task found matching: ${query}`);
+          });
       },
-      { commands: ["workspace"] },
+      { commands: ["workspace", "tasks"] },
     );
 
     // ========================================================================
