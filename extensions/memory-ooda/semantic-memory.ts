@@ -67,7 +67,9 @@ export function getFacts(workspacePath: string): KnowledgeFile {
   if (!fs.existsSync(filePath)) {
     const defaults = createDefaultKnowledge();
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(defaults, null, 2) + "\n", "utf-8");
+    const tmpPath = filePath + ".tmp";
+    fs.writeFileSync(tmpPath, JSON.stringify(defaults, null, 2) + "\n", "utf-8");
+    fs.renameSync(tmpPath, filePath);
     return defaults;
   }
 
@@ -135,7 +137,7 @@ export function upsertFact(
   knowledge._meta.updated_at = new Date().toISOString();
   knowledge._meta.updated_by = "archivist";
 
-  // Write with validation
+  // Write with validation + atomic rename (crash-safe)
   const json = JSON.stringify(knowledge, null, 2) + "\n";
 
   // Verify the JSON we're about to write is valid by re-parsing
@@ -147,7 +149,11 @@ export function upsertFact(
     throw new Error("upsertFact produced invalid JSON; snapshot restored");
   }
 
-  fs.writeFileSync(filePath, json, "utf-8");
+  // Atomic write: write to .tmp then rename — a crash mid-write leaves
+  // the .tmp as garbage but the last good KNOWLEDGE.json intact.
+  const tmpPath = filePath + ".tmp";
+  fs.writeFileSync(tmpPath, json, "utf-8");
+  fs.renameSync(tmpPath, filePath);
 }
 
 /**
@@ -177,7 +183,9 @@ export function appendArchivistLog(workspacePath: string, action: string, reason
     throw new Error("appendArchivistLog produced invalid JSON; snapshot restored");
   }
 
-  fs.writeFileSync(filePath, json, "utf-8");
+  const tmpPath = filePath + ".tmp";
+  fs.writeFileSync(tmpPath, json, "utf-8");
+  fs.renameSync(tmpPath, filePath);
 }
 
 /**
