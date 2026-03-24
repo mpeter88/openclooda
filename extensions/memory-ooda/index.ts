@@ -52,6 +52,13 @@ export type OodaConfig = {
   enabled?: boolean;
   /** Inject pending proposal count into agent preamble. Default: true */
   notifyPendingProposals?: boolean;
+  /**
+   * Show a compact OODA summary line in each reply (visible in TUI/chat).
+   * "off"     — silent (default)
+   * "inline"  — one-line SITREP+strategy summary prepended to each reply
+   * "verbose" — inline + council trace when system2 fired
+   */
+  debugMode?: "off" | "inline" | "verbose";
 };
 
 function resolveWorkspacePath(cfg: OodaConfig): string {
@@ -249,6 +256,7 @@ const oodaPlugin = {
     const enabled = cfg.enabled !== false; // enabled by default
     const workspacePath = resolveWorkspacePath(cfg);
     const notifyProposals = cfg.notifyPendingProposals !== false; // enabled by default
+    const debugMode = cfg.debugMode ?? "off";
 
     if (!enabled) {
       api.logger.info("memory-ooda: disabled via config");
@@ -372,8 +380,12 @@ const oodaPlugin = {
           return { prependSystemContext: parts.join("\n\n") };
         }
 
+        // Refs for debug summary (hoisted so the summary block below can read them)
+        let triageResult: Awaited<ReturnType<typeof runTriage>> | undefined;
+        let councilResultRef: import("./council.js").CouncilResult | undefined;
+
         try {
-          const triageResult = await runTriage(
+          triageResult = await runTriage(
             { observation: event.prompt, facts: knowledge, priorities },
             callModel,
           );
@@ -418,6 +430,7 @@ const oodaPlugin = {
               }
 
               const councilResult = await runCouncil(strategyInput, councilMode, callModel);
+              councilResultRef = councilResult;
               const winner = councilResult.winner;
 
               parts.push(
@@ -458,7 +471,38 @@ const oodaPlugin = {
 
         if (parts.length === 0) return;
 
-        return { prependSystemContext: parts.join("\n\n") };
+        // Build optional visible OODA summary for TUI/chat
+        let oodaSummary: string | undefined;
+        if (debugMode !== "off") {
+          // Always show: priority + strategy winner
+          const sitrepStr = `P${triageResult?.sitrep?.priority ?? "?"}/10`;
+          const strategyStr = councilResultRef?.winner?.label ?? "—";
+          const councilStr =
+            councilResultRef?.mode === "system2"
+              ? ` | council:S2${councilResultRef.dissent ? "⚠️dissent" : ""}`
+              : councilResultRef?.mode === "system1"
+                ? " | council:S1"
+                : "";
+          const summaryLine = `\`[OODA ${sitrepStr} | ${strategyStr}${councilStr}]\``;
+
+          if (
+            debugMode === "verbose" &&
+            councilResultRef?.mode === "system2" &&
+            Object.keys(councilResultRef.council_trace).length > 0
+          ) {
+            const traceStr = Object.entries(councilResultRef.council_trace)
+              .map(([role, out]) => `  **${role}:** ${(out as string).slice(0, 120)}`)
+              .join("\n");
+            oodaSummary = `${summaryLine}\n${traceStr}`;
+          } else {
+            oodaSummary = summaryLine;
+          }
+        }
+
+        return {
+          prependSystemContext: parts.join("\n\n"),
+          ...(oodaSummary ? { prependContext: oodaSummary } : {}),
+        };
       } catch (err) {
         api.logger.warn(`memory-ooda: failed to inject context: ${String(err)}`);
       }
