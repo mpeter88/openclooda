@@ -48,16 +48,22 @@ echo "    • tmux (persistent terminal sessions)"
 echo "    • Tailscale (remote access from anywhere)"
 echo "=================================================="
 echo ""
-read -p "Continue? (y/n) " -n 1 -r; echo
-[[ ! $REPLY =~ ^[Yy]$ ]] && { log_error "Aborted."; exit 1; }
+if [[ "${AUTO_CONFIRM:-}" != "1" ]]; then
+    read -p "Continue? (y/n) " -n 1 -r; echo
+    [[ ! $REPLY =~ ^[Yy]$ ]] && { log_error "Aborted."; exit 1; }
+fi
 
 # ─── Tailscale auth key ───────────────────────────────────────────────────────
 echo ""
-log_info "You'll need a Tailscale auth key (reusable, ephemeral OK)."
-log_info "Generate one at: https://login.tailscale.com/admin/settings/keys"
-echo ""
-read -rsp "Tailscale auth key (ts-key-...): " TAILSCALE_AUTH_KEY; echo
-[[ -z "$TAILSCALE_AUTH_KEY" ]] && { log_error "Tailscale auth key required."; exit 1; }
+if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
+    log_info "You'll need a Tailscale auth key (reusable, ephemeral OK)."
+    log_info "Generate one at: https://login.tailscale.com/admin/settings/keys"
+    echo ""
+    read -rsp "Tailscale auth key (ts-key-...): " TAILSCALE_AUTH_KEY; echo
+    [[ -z "$TAILSCALE_AUTH_KEY" ]] && { log_error "Tailscale auth key required."; exit 1; }
+else
+    log_info "Using TAILSCALE_AUTH_KEY from environment"
+fi
 
 # ─── Prerequisites ───────────────────────────────────────────────────────────
 log_info "Checking prerequisites..."
