@@ -1,7 +1,7 @@
 # CR: OODA Cloud Task Bridge
 
 **Date:** 2026-03-21
-**Status:** WRITTEN
+**Status:** IMPLEMENTED
 **Priority:** HIGH — enables always-on async work independent of laptop sleep state
 **Author:** Design session with michaelpeter
 
@@ -74,7 +74,7 @@ Location: `tasks/` directory in the workspace private git repo.
 ```markdown
 # TASK-2026-03-21T2125-001: Review AMF translation phase CRs
 
-**Status:** pending
+**Status:** IMPLEMENTED
 **Created:** 2026-03-21T21:25:00Z
 **Origin:** laptop (main session)
 **Claimed:** —

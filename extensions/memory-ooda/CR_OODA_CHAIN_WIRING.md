@@ -1,7 +1,7 @@
 # CR: OODA Chain Wiring — Archivist + Turn Counter
 
 **Date:** 2026-03-18  
-**Status:** WRITTEN  
+**Status:** IMPLEMENTED  
 **Priority:** P0 — Plugin is loaded but OODA chain is not running  
 **Author:** Diagnostic session with michaelpeter
 
