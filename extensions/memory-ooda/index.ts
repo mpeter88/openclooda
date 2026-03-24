@@ -21,6 +21,7 @@ import {
   type SemanticStore,
 } from "./archivist.js";
 import { registerWorkspaceCli } from "./cli.js";
+import { runCouncil, type CouncilMode } from "./council.js";
 import { getPriorities } from "./priorities.js";
 import { countPending, getProposals } from "./proposals.js";
 import {
@@ -396,28 +397,59 @@ const oodaPlugin = {
             parts.push(sitrepBlock);
 
             try {
-              const strategyResult = await runStrategy(
-                {
-                  sitrep,
-                  priorities,
-                  observation: event.prompt,
-                  neverDo: knowledge.preferences.never_do,
-                },
-                callModel,
-              );
+              const strategyInput = {
+                sitrep,
+                priorities,
+                observation: event.prompt,
+                neverDo: knowledge.preferences.never_do,
+              };
 
-              const winner = strategyResult.winner;
+              // Determine council mode
+              const thinkingRank = { low: 0, medium: 1, high: 2 };
+              let councilMode: CouncilMode = "none";
+              if (
+                priorities.thresholds.council_system2_enabled &&
+                sitrep.priority >= (priorities.thresholds.council_priority_threshold ?? 7) &&
+                thinkingRank[thinkingLevel] >= thinkingRank.medium
+              ) {
+                councilMode = "system2";
+              } else if (priorities.thresholds.council_system1_enabled) {
+                councilMode = "system1";
+              }
+
+              const councilResult = await runCouncil(strategyInput, councilMode, callModel);
+              const winner = councilResult.winner;
+
               parts.push(
                 `<ooda-strategy>Action: ${winner.label} | ${winner.reasoning}</ooda-strategy>`,
               );
-              // OODA_DEBUG: show raw strategy output for calibration
+
+              // System 2: inject council block
+              if (
+                councilResult.mode === "system2" &&
+                Object.keys(councilResult.council_trace).length > 0
+              ) {
+                const traceLines = Object.entries(councilResult.council_trace)
+                  .map(([role, output]) => `[${role}]: ${output}`)
+                  .join("\n");
+                parts.push(`<ooda-council>${traceLines}</ooda-council>`);
+              }
+
+              // Log dissent
+              if (councilResult.dissent) {
+                api.logger.info(
+                  `memory-ooda: council dissent — chair overrode strategist (mode=${councilResult.mode}, winner=${winner.label})`,
+                );
+              }
+
+              // OODA_DEBUG: show raw council output for calibration
               if (process.env.OODA_DEBUG === "true") {
                 parts.push(
-                  `<ooda-strategy-debug>${JSON.stringify(strategyResult, null, 2)}</ooda-strategy-debug>`,
+                  `<ooda-strategy-debug>${JSON.stringify(councilResult, null, 2)}</ooda-strategy-debug>`,
                 );
               }
             } catch (err) {
-              api.logger.warn(`memory-ooda: strategy failed, skipping: ${String(err)}`);
+              api.logger.warn(`memory-ooda: strategy/council failed, skipping: ${String(err)}`);
             }
           }
         } catch (err) {

@@ -136,6 +136,64 @@ Respond with raw JSON only. Do not wrap in code fences or add any text outside t
 }
 
 // ============================================================================
+// Council Prompt Builders
+// ============================================================================
+
+export function buildDevilsAdvocatePrompt(winner: Strategy, sitrep: SITREP): string {
+  return `You are a Devil's Advocate reviewing a proposed strategy for an AI agent.
+
+## Context
+SITREP priority: ${sitrep.priority}/10
+SITREP summary: ${sitrep.summary}
+
+## Proposed Winning Strategy
+Label: ${winner.label}
+Reasoning: ${winner.reasoning}
+Scores: alignment=${winner.alignmentScore}, efficiency=${winner.efficiencyScore}, risk=${winner.riskScore}, weighted=${winner.weightedTotal}
+
+## Task
+Generate the single strongest 1-2 sentence objection to this strategy. Focus on what could go wrong, what assumption is most fragile, or what the strategy overlooks. Be specific to THIS strategy, not generic.
+
+Respond with raw text only — no JSON, no formatting.`;
+}
+
+export function buildChairPrompt(
+  members: Array<{ role: string; output: string }>,
+  sitrep: SITREP,
+  priorities: PrioritiesFile,
+): string {
+  const memberBlock = members.map((m) => `### ${m.role}\n${m.output}`).join("\n\n");
+
+  return `You are the Chair of a strategy council for an AI agent. Three council members have analyzed a situation. Synthesize their perspectives and select the best strategy.
+
+## SITREP
+Priority: ${sitrep.priority}/10
+Summary: ${sitrep.summary}
+
+## Council Member Outputs
+${memberBlock}
+
+## Available Strategy Archetypes
+${priorities.strategy_labels.map((s) => `- ${s.label}: ${s.description}`).join("\n")}
+
+## Task
+1. Consider all three perspectives
+2. Select the best strategy (use one of the archetype labels above)
+3. If you disagree with the Strategist's top recommendation, set dissent to true
+
+Respond with raw JSON only:
+{
+  "label": "<archetype label>",
+  "reasoning": "<your synthesis reasoning, 1-2 sentences>",
+  "alignmentScore": <0.0-1.0>,
+  "efficiencyScore": <0.0-1.0>,
+  "riskScore": <0.0-1.0>,
+  "dissent": <true|false>,
+  "chairReasoning": "<why you chose this strategy over alternatives, 1-2 sentences>"
+}`;
+}
+
+// ============================================================================
 // Response Parsing
 // ============================================================================
 

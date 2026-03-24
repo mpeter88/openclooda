@@ -110,6 +110,9 @@ export interface PrioritiesFile {
     critical_failure_score_floor: number;
     archivist_turn_interval: number;
     meta_reviewer_weekly_enabled: boolean;
+    council_priority_threshold: number;
+    council_system1_enabled: boolean;
+    council_system2_enabled: boolean;
   };
   _weight_adjustment_log: Array<{
     timestamp: string;
@@ -136,6 +139,13 @@ export interface SITREP {
   attention?: string;
 }
 
+export interface CouncilTrace {
+  mode: "system1" | "system2";
+  members: Array<{ role: string; output: string }>;
+  chairReasoning: string;
+  dissent: boolean;
+}
+
 export interface Strategy {
   label: string;
   reasoning: string;
@@ -143,6 +153,7 @@ export interface Strategy {
   efficiencyScore: number;
   riskScore: number;
   weightedTotal: number;
+  councilTrace?: CouncilTrace;
 }
 
 export interface ExpectedOutcome {

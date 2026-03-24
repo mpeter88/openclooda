@@ -84,6 +84,9 @@ export function createDefaultPriorities(): PrioritiesFile {
       critical_failure_score_floor: 0.3,
       archivist_turn_interval: 100,
       meta_reviewer_weekly_enabled: false,
+      council_priority_threshold: 7,
+      council_system1_enabled: true,
+      council_system2_enabled: true,
     },
     _weight_adjustment_log: [],
   };
