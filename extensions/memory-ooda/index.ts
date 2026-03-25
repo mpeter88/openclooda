@@ -513,8 +513,11 @@ const oodaPlugin = {
     // ========================================================================
 
     let turnCount = 0;
+    let lastArchivistRunTurn = 0;
     try {
-      turnCount = readState(workspacePath).last_run_turn;
+      const initialState = readState(workspacePath);
+      turnCount = initialState.last_run_turn;
+      lastArchivistRunTurn = initialState.last_run_turn;
     } catch {
       // Fresh workspace or corrupt state — start from 0
     }
@@ -541,14 +544,14 @@ const oodaPlugin = {
         turnInterval = 100;
       }
 
-      const state = { last_run_turn: turnCount - 1, last_run_at: new Date().toISOString() };
-      try {
-        Object.assign(state, readState(workspacePath));
-      } catch {
-        // use defaults
-      }
+      // Use lastRunTurn captured BEFORE incrementing — writing state first then re-reading
+      // causes last_run_turn == turnCount so the delta is always 0 and Archivist never fires.
+      const archivistState = {
+        last_run_turn: lastArchivistRunTurn,
+        last_run_at: new Date().toISOString(),
+      };
 
-      if (!shouldRunArchivist(turnCount, state, turnInterval)) return;
+      if (!shouldRunArchivist(turnCount, archivistState, turnInterval)) return;
 
       // Fire archivist non-blocking
       setImmediate(() => {
@@ -577,6 +580,7 @@ const oodaPlugin = {
               { turnInterval },
             );
 
+            lastArchivistRunTurn = turnCount;
             api.logger.info(
               `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
             );
