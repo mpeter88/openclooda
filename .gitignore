@@ -1,0 +1,26 @@
+# Build output
+dist/
+dist-runtime/*
+!dist-runtime/extensions/
+dist-runtime/extensions/*
+!dist-runtime/extensions/memory-ooda/
+dist-runtime/extensions/memory-ooda/*
+!dist-runtime/extensions/memory-ooda/openclaw.plugin.json
+
+# Dependencies
+node_modules/
+packages/*/node_modules/
+extensions/*/node_modules/
+apps/*/node_modules/
+
+# Docs / local assets (large files, screenshots)
+docs/*.pdf
+docs/*.png
+docs/*.jpg
+
+# Misc
+.buildstamp
+*.local
+.env
+.env.*
+!.env.example
