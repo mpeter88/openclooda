@@ -82,7 +82,7 @@ export function createDefaultPriorities(): PrioritiesFile {
       min_priority_for_full_ooda: 5,
       min_thinking_level_for_full_ooda: "medium",
       critical_failure_score_floor: 0.3,
-      archivist_turn_interval: 100,
+      archivist_turn_interval: 15,
       meta_reviewer_weekly_enabled: false,
       council_priority_threshold: 7,
       council_system1_enabled: true,

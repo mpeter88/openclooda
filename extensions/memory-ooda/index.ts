@@ -516,8 +516,9 @@ const oodaPlugin = {
     let lastArchivistRunTurn = 0;
     try {
       const initialState = readState(workspacePath);
-      turnCount = initialState.last_run_turn;
-      lastArchivistRunTurn = initialState.last_run_turn;
+      // last_processed_turn is the global turn counter; last_archivist_turn gates the archivist.
+      turnCount = initialState.last_processed_turn;
+      lastArchivistRunTurn = initialState.last_archivist_turn;
     } catch {
       // Fresh workspace or corrupt state — start from 0
     }
@@ -528,9 +529,12 @@ const oodaPlugin = {
       turnCount++;
 
       try {
+        // Only persist the turn counter here. last_archivist_turn is updated inside runArchivist.
+        const currentState = readState(workspacePath);
         writeState(workspacePath, {
-          last_run_turn: turnCount,
-          last_run_at: new Date().toISOString(),
+          last_processed_turn: turnCount,
+          last_archivist_turn: currentState.last_archivist_turn,
+          last_run_at: currentState.last_run_at,
         });
       } catch (err) {
         api.logger.warn(`memory-ooda: failed to persist turn count: ${String(err)}`);
@@ -541,13 +545,14 @@ const oodaPlugin = {
       try {
         turnInterval = getPriorities(workspacePath).thresholds.archivist_turn_interval;
       } catch {
-        turnInterval = 100;
+        turnInterval = 15;
       }
 
-      // Use lastRunTurn captured BEFORE incrementing — writing state first then re-reading
-      // causes last_run_turn == turnCount so the delta is always 0 and Archivist never fires.
+      // Gate on lastArchivistRunTurn (in-memory), not the persisted turn counter.
+      // This prevents re-reading state between write and check, which caused delta=0.
       const archivistState = {
-        last_run_turn: lastArchivistRunTurn,
+        last_processed_turn: turnCount,
+        last_archivist_turn: lastArchivistRunTurn,
         last_run_at: new Date().toISOString(),
       };
 

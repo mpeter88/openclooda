@@ -45,8 +45,13 @@ export interface SemanticStore {
 
 /** Persisted state across archivist runs. */
 export interface ArchivistState {
-  last_run_turn: number;
+  /** Turn counter — incremented on every agent_end. Persists across restarts. */
+  last_processed_turn: number;
+  /** Turn count at which the archivist last ran. Used for interval gating. */
+  last_archivist_turn: number;
   last_run_at: string;
+  /** @deprecated renamed to last_processed_turn — kept for migration compat */
+  last_run_turn?: number;
 }
 
 /** Configuration for a single archivist run. */
@@ -99,18 +104,32 @@ export function readState(workspacePath: string): ArchivistState {
   const filePath = statePath(workspacePath);
 
   if (!fs.existsSync(filePath)) {
-    return { last_run_turn: 0, last_run_at: "1970-01-01T00:00:00Z" };
+    return {
+      last_processed_turn: 0,
+      last_archivist_turn: 0,
+      last_run_at: "1970-01-01T00:00:00Z",
+    };
   }
 
   const raw = fs.readFileSync(filePath, "utf-8");
   const parsed = JSON.parse(raw);
 
-  if (typeof parsed.last_run_turn !== "number" || typeof parsed.last_run_at !== "string") {
-    throw new Error("Invalid .archivist-state.json: missing last_run_turn or last_run_at");
+  if (typeof parsed.last_run_at !== "string") {
+    throw new Error("Invalid .archivist-state.json: missing last_run_at");
   }
 
   if (isNaN(new Date(parsed.last_run_at).getTime())) {
     throw new Error("Invalid .archivist-state.json: last_run_at is not a valid timestamp");
+  }
+
+  // Migration: old format used last_run_turn for both counters
+  if (typeof parsed.last_processed_turn !== "number") {
+    const legacy = typeof parsed.last_run_turn === "number" ? parsed.last_run_turn : 0;
+    parsed.last_processed_turn = legacy;
+    parsed.last_archivist_turn = legacy;
+  }
+  if (typeof parsed.last_archivist_turn !== "number") {
+    parsed.last_archivist_turn = parsed.last_processed_turn;
   }
 
   return parsed as ArchivistState;
@@ -136,7 +155,7 @@ export function shouldRunArchivist(
   turnInterval: number,
 ): boolean {
   if (turnInterval <= 0) return false;
-  return currentTurn - state.last_run_turn >= turnInterval;
+  return currentTurn - state.last_archivist_turn >= turnInterval;
 }
 
 // ============================================================================
@@ -486,9 +505,12 @@ export async function runArchivist(
   const pruneThreshold = Date.now() - cfg.pruneAfterDays * 24 * 60 * 60 * 1000;
   const eventsPruned = await episodicStore.prune(pruneThreshold, true);
 
-  // Step 7: Update state
+  // Step 7: Update state — only update last_archivist_turn here; last_processed_turn
+  // is maintained by index.ts on every agent_end.
+  const prevState = readState(workspacePath);
   writeState(workspacePath, {
-    last_run_turn: currentTurn,
+    last_processed_turn: prevState.last_processed_turn,
+    last_archivist_turn: currentTurn,
     last_run_at: new Date().toISOString(),
   });
 
