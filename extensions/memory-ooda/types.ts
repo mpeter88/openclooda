@@ -109,7 +109,10 @@ export interface PrioritiesFile {
     min_thinking_level_for_full_ooda: "low" | "medium" | "high";
     critical_failure_score_floor: number;
     archivist_turn_interval: number;
+    /** @deprecated Use meta_reviewer_archivist_interval instead */
     meta_reviewer_weekly_enabled: boolean;
+    /** Run meta-reviewer after this many archivist completions (0 = disabled). Default: 5 */
+    meta_reviewer_archivist_interval: number;
     council_priority_threshold: number;
     council_system1_enabled: boolean;
     council_system2_enabled: boolean;

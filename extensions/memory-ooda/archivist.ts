@@ -50,6 +50,8 @@ export interface ArchivistState {
   /** Turn count at which the archivist last ran. Used for interval gating. */
   last_archivist_turn: number;
   last_run_at: string;
+  /** Number of archivist completions since the meta-reviewer last ran. */
+  archivist_runs_since_meta_review: number;
   /** @deprecated renamed to last_processed_turn — kept for migration compat */
   last_run_turn?: number;
 }
@@ -130,6 +132,9 @@ export function readState(workspacePath: string): ArchivistState {
   }
   if (typeof parsed.last_archivist_turn !== "number") {
     parsed.last_archivist_turn = parsed.last_processed_turn;
+  }
+  if (typeof parsed.archivist_runs_since_meta_review !== "number") {
+    parsed.archivist_runs_since_meta_review = 0;
   }
 
   return parsed as ArchivistState;
@@ -512,6 +517,7 @@ export async function runArchivist(
     last_processed_turn: prevState.last_processed_turn,
     last_archivist_turn: currentTurn,
     last_run_at: new Date().toISOString(),
+    archivist_runs_since_meta_review: prevState.archivist_runs_since_meta_review + 1,
   });
 
   // Step 8: Proposal extraction (second pass — best effort, non-blocking)

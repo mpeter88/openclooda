@@ -22,8 +22,9 @@ import {
 } from "./archivist.js";
 import { registerWorkspaceCli } from "./cli.js";
 import { runCouncil, type CouncilMode } from "./council.js";
-import { getPriorities } from "./priorities.js";
-import { countPending, getProposals } from "./proposals.js";
+import { runMetaReviewer, type PrioritiesStore, type ProposalStore } from "./meta-reviewer.js";
+import { getPriorities, updateDomainWeight } from "./priorities.js";
+import { countPending, getProposals, addProposal } from "./proposals.js";
 import {
   getFacts,
   formatFactsForContext,
@@ -589,6 +590,49 @@ const oodaPlugin = {
             api.logger.info(
               `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
             );
+
+            // ── Meta-reviewer trigger ───────────────────────────────────────
+            // Fire after every N archivist completions (archivist_runs_since_meta_review
+            // is incremented inside runArchivist before we read it here).
+            try {
+              const updatedState = readState(workspacePath);
+              const metaInterval =
+                getPriorities(workspacePath).thresholds.meta_reviewer_archivist_interval ?? 5;
+              if (
+                metaInterval > 0 &&
+                updatedState.archivist_runs_since_meta_review >= metaInterval
+              ) {
+                api.logger.info(
+                  `memory-ooda: meta-reviewer triggered (${updatedState.archivist_runs_since_meta_review} archivist runs since last review)`,
+                );
+                const priorities = getPriorities(workspacePath);
+                const prioritiesStore: PrioritiesStore = {
+                  getPriorities: () => getPriorities(workspacePath),
+                  updateDomainWeight: (domain, newWeight, reason) =>
+                    updateDomainWeight(workspacePath, domain, newWeight, reason),
+                };
+                const proposalStore: ProposalStore = {
+                  addProposal: (p) => addProposal(workspacePath, p),
+                };
+                const metaResult = await runMetaReviewer(
+                  { failures: [], priorities },
+                  prioritiesStore,
+                  proposalStore,
+                  callModel,
+                );
+                // Reset counter
+                const stateAfterMeta = readState(workspacePath);
+                writeState(workspacePath, {
+                  ...stateAfterMeta,
+                  archivist_runs_since_meta_review: 0,
+                });
+                api.logger.info(
+                  `memory-ooda: meta-reviewer completed — ${metaResult.weightsAdjusted.length} weight adjustments, ${metaResult.proposalsCreated.length} proposals`,
+                );
+              }
+            } catch (metaErr) {
+              api.logger.warn(`memory-ooda: meta-reviewer failed: ${String(metaErr)}`);
+            }
           } catch (err) {
             api.logger.warn(`memory-ooda: archivist failed: ${String(err)}`);
           }
