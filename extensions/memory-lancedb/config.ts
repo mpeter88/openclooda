@@ -11,6 +11,8 @@ export type MemoryConfig = {
     dimensions?: number;
   };
   dbPath?: string;
+  /** Force sqlite-vec backend instead of auto-detecting LanceDB. */
+  backend?: "auto" | "sqlite-vec";
   autoCapture?: boolean;
   autoRecall?: boolean;
   captureMaxChars?: number;
@@ -97,7 +99,7 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "dbPath", "autoCapture", "autoRecall", "captureMaxChars"],
+      ["embedding", "dbPath", "backend", "autoCapture", "autoRecall", "captureMaxChars"],
       "memory config",
     );
 
@@ -118,6 +120,8 @@ export const memoryConfigSchema = {
       throw new Error("captureMaxChars must be between 100 and 10000");
     }
 
+    const backend = cfg.backend === "sqlite-vec" ? "sqlite-vec" : "auto";
+
     return {
       embedding: {
         provider: "openai",
@@ -128,6 +132,7 @@ export const memoryConfigSchema = {
         dimensions: typeof embedding.dimensions === "number" ? embedding.dimensions : undefined,
       },
       dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
+      backend,
       autoCapture: cfg.autoCapture === true,
       autoRecall: cfg.autoRecall !== false,
       captureMaxChars: captureMaxChars ?? DEFAULT_CAPTURE_MAX_CHARS,

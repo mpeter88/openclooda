@@ -30,6 +30,11 @@
       "placeholder": "~/.openclaw/memory/lancedb",
       "advanced": true
     },
+    "backend": {
+      "label": "Storage Backend",
+      "help": "Force sqlite-vec instead of auto-detecting LanceDB",
+      "advanced": true
+    },
     "autoCapture": {
       "label": "Auto-Capture",
       "help": "Automatically capture important information from conversations"
@@ -70,6 +75,11 @@
       },
       "dbPath": {
         "type": "string"
+      },
+      "backend": {
+        "type": "string",
+        "enum": ["auto", "sqlite-vec"],
+        "description": "Storage backend: auto (try LanceDB, fall back to sqlite-vec) or sqlite-vec (force sqlite-vec)"
       },
       "autoCapture": {
         "type": "boolean"

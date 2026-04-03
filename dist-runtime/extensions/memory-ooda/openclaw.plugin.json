@@ -15,6 +15,11 @@
       "notifyPendingProposals": {
         "type": "boolean",
         "description": "Inject pending proposal count into agent preamble. Default: true"
+      },
+      "debugMode": {
+        "type": "string",
+        "enum": ["off", "inline", "verbose"],
+        "description": "Show OODA summary in TUI/chat replies. off=silent, inline=one-line, verbose=inline+council trace"
       }
     }
   }
