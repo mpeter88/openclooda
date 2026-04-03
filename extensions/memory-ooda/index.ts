@@ -80,10 +80,11 @@ function resolveLanceDbPath(api: OpenClawPluginApi): string {
     return lancedbEntry.config.dbPath;
   }
 
-  // Fall back to agent workspace + /../memory
+  // Fall back to agent workspace + /../memory/lancedb
+  // memory-lancedb writes to <stateDir>/memory/lancedb by default.
   const agentWorkspace = api.config.agents?.defaults?.workspace;
   if (agentWorkspace) {
-    return join(agentWorkspace, "..", "memory");
+    return join(agentWorkspace, "..", "memory", "lancedb");
   }
 
   // Default
