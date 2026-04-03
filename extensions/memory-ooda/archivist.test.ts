@@ -361,13 +361,13 @@ describe("parsePatterns", () => {
   });
 
   it("rejects too many patterns", () => {
-    const many = Array.from({ length: 11 }, (_, i) => ({
+    const many = Array.from({ length: 16 }, (_, i) => ({
       section: "stack",
       key: `key${i}`,
       value: "v",
       reason: "r",
     }));
-    expect(() => parsePatterns(JSON.stringify(many))).toThrow("Too many patterns: 11");
+    expect(() => parsePatterns(JSON.stringify(many))).toThrow("Too many patterns: 16");
   });
 
   it("rejects invalid section", () => {

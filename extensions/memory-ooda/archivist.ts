@@ -288,8 +288,8 @@ export function parsePatterns(raw: string): PatternExtraction[] {
     throw new Error("Archivist response must be a JSON array");
   }
 
-  if (parsed.length > 10) {
-    throw new Error(`Too many patterns: ${parsed.length} (max 10)`);
+  if (parsed.length > 15) {
+    throw new Error(`Too many patterns: ${parsed.length} (max 15)`);
   }
 
   // Empty array is valid — no patterns found
