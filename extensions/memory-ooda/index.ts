@@ -514,12 +514,9 @@ const oodaPlugin = {
     // ========================================================================
 
     let turnCount = 0;
-    let lastArchivistRunTurn = 0;
     try {
       const initialState = readState(workspacePath);
-      // last_processed_turn is the global turn counter; last_archivist_turn gates the archivist.
       turnCount = initialState.last_processed_turn;
-      lastArchivistRunTurn = initialState.last_archivist_turn;
     } catch {
       // Fresh workspace or corrupt state — start from 0
     }
@@ -529,16 +526,23 @@ const oodaPlugin = {
 
       turnCount++;
 
+      // Increment turns_since_last_archivist and persist. The archivist resets
+      // it to 0 after a successful run. No two-counter subtraction, no drift.
+      let currentState: ReturnType<typeof readState>;
       try {
-        // Only persist the turn counter here. last_archivist_turn is updated inside runArchivist.
-        const currentState = readState(workspacePath);
+        currentState = readState(workspacePath);
         writeState(workspacePath, {
+          ...currentState,
           last_processed_turn: turnCount,
-          last_archivist_turn: currentState.last_archivist_turn,
-          last_run_at: currentState.last_run_at,
+          turns_since_last_archivist: currentState.turns_since_last_archivist + 1,
         });
+        currentState = {
+          ...currentState,
+          turns_since_last_archivist: currentState.turns_since_last_archivist + 1,
+        };
       } catch (err) {
         api.logger.warn(`memory-ooda: failed to persist turn count: ${String(err)}`);
+        return;
       }
 
       // Check if archivist is due
@@ -549,15 +553,7 @@ const oodaPlugin = {
         turnInterval = 15;
       }
 
-      // Gate on lastArchivistRunTurn (in-memory), not the persisted turn counter.
-      // This prevents re-reading state between write and check, which caused delta=0.
-      const archivistState = {
-        last_processed_turn: turnCount,
-        last_archivist_turn: lastArchivistRunTurn,
-        last_run_at: new Date().toISOString(),
-      };
-
-      if (!shouldRunArchivist(turnCount, archivistState, turnInterval)) return;
+      if (!shouldRunArchivist(currentState, turnInterval)) return;
 
       // Fire archivist non-blocking
       setImmediate(() => {
@@ -586,7 +582,6 @@ const oodaPlugin = {
               { turnInterval },
             );
 
-            lastArchivistRunTurn = turnCount;
             api.logger.info(
               `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
             );

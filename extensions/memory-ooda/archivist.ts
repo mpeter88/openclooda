@@ -47,11 +47,17 @@ export interface SemanticStore {
 export interface ArchivistState {
   /** Turn counter — incremented on every agent_end. Persists across restarts. */
   last_processed_turn: number;
-  /** Turn count at which the archivist last ran. Used for interval gating. */
-  last_archivist_turn: number;
+  /**
+   * Turns elapsed since the archivist last ran. Incremented on every agent_end,
+   * reset to 0 after a successful archivist run. No subtraction of two global
+   * counters — this counter is self-contained and restart-safe.
+   */
+  turns_since_last_archivist: number;
   last_run_at: string;
   /** Number of archivist completions since the meta-reviewer last ran. */
   archivist_runs_since_meta_review: number;
+  /** @deprecated use turns_since_last_archivist — kept for migration compat */
+  last_archivist_turn?: number;
   /** @deprecated renamed to last_processed_turn — kept for migration compat */
   last_run_turn?: number;
 }
@@ -108,8 +114,9 @@ export function readState(workspacePath: string): ArchivistState {
   if (!fs.existsSync(filePath)) {
     return {
       last_processed_turn: 0,
-      last_archivist_turn: 0,
+      turns_since_last_archivist: 0,
       last_run_at: "1970-01-01T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     };
   }
 
@@ -128,11 +135,23 @@ export function readState(workspacePath: string): ArchivistState {
   if (typeof parsed.last_processed_turn !== "number") {
     const legacy = typeof parsed.last_run_turn === "number" ? parsed.last_run_turn : 0;
     parsed.last_processed_turn = legacy;
-    parsed.last_archivist_turn = legacy;
   }
-  if (typeof parsed.last_archivist_turn !== "number") {
-    parsed.last_archivist_turn = parsed.last_processed_turn;
+
+  // Migration: old format used last_archivist_turn (two global counters, drift-prone).
+  // Convert to turns_since_last_archivist (self-contained counter).
+  if (typeof parsed.turns_since_last_archivist !== "number") {
+    if (typeof parsed.last_archivist_turn === "number") {
+      // Estimate from old counters — may be off if restarted mid-run, but
+      // better than starting from 0 and skipping a run that's already due.
+      parsed.turns_since_last_archivist = Math.max(
+        0,
+        parsed.last_processed_turn - parsed.last_archivist_turn,
+      );
+    } else {
+      parsed.turns_since_last_archivist = 0;
+    }
   }
+
   if (typeof parsed.archivist_runs_since_meta_review !== "number") {
     parsed.archivist_runs_since_meta_review = 0;
   }
@@ -151,16 +170,13 @@ export function writeState(workspacePath: string, state: ArchivistState): void {
 // ============================================================================
 
 /**
- * Determine whether the Archivist should run based on the current turn
- * count and the configured interval.
+ * Determine whether the Archivist should run.
+ * Uses turns_since_last_archivist — a self-contained counter that resets to 0
+ * after each run. Restart-safe: no subtraction of two global counters.
  */
-export function shouldRunArchivist(
-  currentTurn: number,
-  state: ArchivistState,
-  turnInterval: number,
-): boolean {
+export function shouldRunArchivist(state: ArchivistState, turnInterval: number): boolean {
   if (turnInterval <= 0) return false;
-  return currentTurn - state.last_archivist_turn >= turnInterval;
+  return state.turns_since_last_archivist >= turnInterval;
 }
 
 // ============================================================================
@@ -510,12 +526,12 @@ export async function runArchivist(
   const pruneThreshold = Date.now() - cfg.pruneAfterDays * 24 * 60 * 60 * 1000;
   const eventsPruned = await episodicStore.prune(pruneThreshold, true);
 
-  // Step 7: Update state — only update last_archivist_turn here; last_processed_turn
-  // is maintained by index.ts on every agent_end.
+  // Step 7: Reset turns_since_last_archivist to 0. last_processed_turn is
+  // maintained by index.ts on every agent_end — don't touch it here.
   const prevState = readState(workspacePath);
   writeState(workspacePath, {
     last_processed_turn: prevState.last_processed_turn,
-    last_archivist_turn: currentTurn,
+    turns_since_last_archivist: 0,
     last_run_at: new Date().toISOString(),
     archivist_runs_since_meta_review: prevState.archivist_runs_since_meta_review + 1,
   });

@@ -122,21 +122,37 @@ describe("state management", () => {
   describe("readState", () => {
     it("returns default state when file does not exist", () => {
       const state = readState(tmpDir);
-      expect(state.last_archivist_turn).toBe(0);
+      expect(state.turns_since_last_archivist).toBe(0);
       expect(state.last_run_at).toBe("1970-01-01T00:00:00Z");
     });
 
     it("reads existing state file", () => {
       const state: ArchivistState = {
         last_processed_turn: 200,
-        last_archivist_turn: 200,
+        turns_since_last_archivist: 15,
         last_run_at: "2026-03-15T10:00:00Z",
+        archivist_runs_since_meta_review: 0,
       };
       fs.writeFileSync(statePath(tmpDir), JSON.stringify(state));
 
       const result = readState(tmpDir);
-      expect(result.last_archivist_turn).toBe(200);
+      expect(result.turns_since_last_archivist).toBe(15);
       expect(result.last_run_at).toBe("2026-03-15T10:00:00Z");
+    });
+
+    it("migrates old last_archivist_turn to turns_since_last_archivist", () => {
+      // Old format: two global counters
+      fs.writeFileSync(
+        statePath(tmpDir),
+        JSON.stringify({
+          last_processed_turn: 100,
+          last_archivist_turn: 80,
+          last_run_at: "2026-03-15T10:00:00Z",
+        }),
+      );
+      const result = readState(tmpDir);
+      // Should compute the delta: 100 - 80 = 20
+      expect(result.turns_since_last_archivist).toBe(20);
     });
 
     it("throws on malformed state file", () => {
@@ -147,7 +163,7 @@ describe("state management", () => {
     it("throws on missing required fields", () => {
       fs.writeFileSync(
         statePath(tmpDir),
-        JSON.stringify({ last_processed_turn: 5, last_archivist_turn: 5 }),
+        JSON.stringify({ last_processed_turn: 5, turns_since_last_archivist: 5 }),
       );
       expect(() => readState(tmpDir)).toThrow("missing last_run_at");
     });
@@ -157,7 +173,7 @@ describe("state management", () => {
         statePath(tmpDir),
         JSON.stringify({
           last_processed_turn: 5,
-          last_archivist_turn: 5,
+          turns_since_last_archivist: 5,
           last_run_at: "not-a-date",
         }),
       );
@@ -169,12 +185,13 @@ describe("state management", () => {
     it("writes state to disk", () => {
       writeState(tmpDir, {
         last_processed_turn: 100,
-        last_archivist_turn: 100,
+        turns_since_last_archivist: 5,
         last_run_at: "2026-03-16T12:00:00Z",
+        archivist_runs_since_meta_review: 0,
       });
 
       const state = readState(tmpDir);
-      expect(state.last_archivist_turn).toBe(100);
+      expect(state.turns_since_last_archivist).toBe(5);
       expect(state.last_run_at).toBe("2026-03-16T12:00:00Z");
     });
 
@@ -182,8 +199,9 @@ describe("state management", () => {
       const deepPath = path.join(tmpDir, "deep", "nested");
       writeState(deepPath, {
         last_processed_turn: 50,
-        last_archivist_turn: 50,
+        turns_since_last_archivist: 0,
         last_run_at: "2026-03-16T12:00:00Z",
+        archivist_runs_since_meta_review: 0,
       });
       expect(fs.existsSync(statePath(deepPath))).toBe(true);
     });
@@ -197,47 +215,52 @@ describe("state management", () => {
 describe("shouldRunArchivist", () => {
   it("returns true when enough turns have passed", () => {
     const state: ArchivistState = {
-      last_processed_turn: 0,
-      last_archivist_turn: 0,
+      last_processed_turn: 100,
+      turns_since_last_archivist: 100,
       last_run_at: "2026-03-15T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     };
-    expect(shouldRunArchivist(100, state, 100)).toBe(true);
+    expect(shouldRunArchivist(state, 100)).toBe(true);
   });
 
   it("returns false when not enough turns have passed", () => {
     const state: ArchivistState = {
-      last_processed_turn: 0,
-      last_archivist_turn: 0,
+      last_processed_turn: 99,
+      turns_since_last_archivist: 99,
       last_run_at: "2026-03-15T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     };
-    expect(shouldRunArchivist(99, state, 100)).toBe(false);
+    expect(shouldRunArchivist(state, 100)).toBe(false);
   });
 
   it("returns true when more than interval turns have passed", () => {
     const state: ArchivistState = {
-      last_processed_turn: 50,
-      last_archivist_turn: 50,
+      last_processed_turn: 200,
+      turns_since_last_archivist: 150,
       last_run_at: "2026-03-15T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     };
-    expect(shouldRunArchivist(200, state, 100)).toBe(true);
+    expect(shouldRunArchivist(state, 100)).toBe(true);
   });
 
   it("returns false when turnInterval is 0", () => {
     const state: ArchivistState = {
-      last_processed_turn: 0,
-      last_archivist_turn: 0,
+      last_processed_turn: 1000,
+      turns_since_last_archivist: 1000,
       last_run_at: "2026-03-15T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     };
-    expect(shouldRunArchivist(1000, state, 0)).toBe(false);
+    expect(shouldRunArchivist(state, 0)).toBe(false);
   });
 
   it("returns false when turnInterval is negative", () => {
     const state: ArchivistState = {
-      last_processed_turn: 0,
-      last_archivist_turn: 0,
+      last_processed_turn: 1000,
+      turns_since_last_archivist: 1000,
       last_run_at: "2026-03-15T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     };
-    expect(shouldRunArchivist(1000, state, -1)).toBe(false);
+    expect(shouldRunArchivist(state, -1)).toBe(false);
   });
 });
 
@@ -486,7 +509,8 @@ describe("runArchivist", () => {
     await runArchivist(tmpDir, 150, episodic, semantic, callModel);
 
     const state = readState(tmpDir);
-    expect(state.last_archivist_turn).toBe(150);
+    // After a successful run, turns_since_last_archivist resets to 0
+    expect(state.turns_since_last_archivist).toBe(0);
     expect(new Date(state.last_run_at).getTime()).toBeGreaterThan(Date.now() - 5000);
   });
 
@@ -494,8 +518,9 @@ describe("runArchivist", () => {
     // Pre-set state so we can verify it's not changed
     writeState(tmpDir, {
       last_processed_turn: 50,
-      last_archivist_turn: 50,
+      turns_since_last_archivist: 10,
       last_run_at: "2026-03-15T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     });
 
     const episodic = createMockEpisodicStore([]);
@@ -510,7 +535,7 @@ describe("runArchivist", () => {
     expect(callModel).not.toHaveBeenCalled();
     // State should NOT be advanced on empty retrieval
     const state = readState(tmpDir);
-    expect(state.last_archivist_turn).toBe(50);
+    expect(state.turns_since_last_archivist).toBe(10);
     expect(state.last_run_at).toBe("2026-03-15T00:00:00Z");
   });
 
@@ -653,8 +678,9 @@ describe("runArchivist", () => {
     // Write a state file with a known last_run_at
     writeState(tmpDir, {
       last_processed_turn: 50,
-      last_archivist_turn: 50,
+      turns_since_last_archivist: 5,
       last_run_at: "2026-03-15T00:00:00Z",
+      archivist_runs_since_meta_review: 0,
     });
 
     let capturedTimestamp: number | undefined;
