@@ -527,9 +527,10 @@ const oodaPlugin = {
       // Fresh workspace or corrupt state — start from 0
     }
 
-    api.on("agent_end", (event) => {
-      if (!event.success) return;
-
+    api.on("agent_end", (_event) => {
+      // Do NOT gate on event.success. The archivist reads from the episodic
+      // store (prior events), not the current turn. A failed turn — e.g. Ollama
+      // down, embedding error, prompt error — must not prevent distillation.
       turnCount++;
 
       // Increment turns_since_last_archivist and persist. The archivist resets
