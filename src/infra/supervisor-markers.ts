@@ -16,8 +16,10 @@ export type RespawnSupervisor = "launchd" | "systemd" | "schtasks";
 
 function hasAnyHint(env: NodeJS.ProcessEnv, keys: readonly string[]): boolean {
   return keys.some((key) => {
-    const value = env[key];
-    return typeof value === "string" && value.trim().length > 0;
+    const value = env[key]?.trim();
+    // macOS sets XPC_SERVICE_NAME=0 in every terminal session — not a real
+    // supervisor marker. Only treat non-empty, non-"0" values as evidence.
+    return typeof value === "string" && value.length > 0 && value !== "0";
   });
 }
 
