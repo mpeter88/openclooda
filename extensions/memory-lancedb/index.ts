@@ -491,7 +491,14 @@ async function createMemoryBackend(
   dbPath: string,
   vectorDim: number,
   logger: { info: (msg: string) => void; warn: (msg: string) => void },
+  forceSqliteVec = false,
 ): Promise<MemoryDB | SqliteVecMemoryDB> {
+  if (forceSqliteVec) {
+    logger.info(
+      `memory-lancedb: sqlite-vec backend forced via config (db: ${path.join(dbPath, "memories.sqlite")})`,
+    );
+    return new SqliteVecMemoryDB(dbPath, vectorDim);
+  }
   try {
     await loadLanceDB();
     logger.info(`memory-lancedb: using LanceDB backend (db: ${dbPath})`);
@@ -720,6 +727,8 @@ export function detectCategory(text: string): MemoryCategory {
 // Plugin Definition
 // ============================================================================
 
+let registered = false;
+
 const memoryPlugin = {
   id: "memory-lancedb",
   name: "Memory (LanceDB)",
@@ -728,6 +737,9 @@ const memoryPlugin = {
   configSchema: memoryConfigSchema,
 
   register(api: OpenClawPluginApi) {
+    if (registered) return;
+    registered = true;
+
     const cfg = memoryConfigSchema.parse(api.pluginConfig);
     const resolvedDbPath = api.resolvePath(cfg.dbPath!);
     const { model, dimensions, apiKey, baseUrl } = cfg.embedding;
@@ -744,12 +756,15 @@ const memoryPlugin = {
     const getDb = async (): Promise<MemoryDB | SqliteVecMemoryDB> => {
       if (db) return db;
       if (!dbInitPromise) {
-        dbInitPromise = createMemoryBackend(resolvedDbPath, vectorDim, api.logger).then(
-          (backend) => {
-            db = backend;
-            return backend;
-          },
-        );
+        dbInitPromise = createMemoryBackend(
+          resolvedDbPath,
+          vectorDim,
+          api.logger,
+          cfg.backend === "sqlite-vec",
+        ).then((backend) => {
+          db = backend;
+          return backend;
+        });
       }
       return dbInitPromise;
     };

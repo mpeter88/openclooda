@@ -64,6 +64,7 @@ export type PluginLoadOptions = {
 
 const MAX_PLUGIN_REGISTRY_CACHE_ENTRIES = 128;
 const registryCache = new Map<string, PluginRegistry>();
+const registeredPluginIds = new Set<string>();
 const openAllowlistWarningCache = new Set<string>();
 const LAZY_RUNTIME_REFLECTION_KEYS = [
   "version",
@@ -83,6 +84,7 @@ const LAZY_RUNTIME_REFLECTION_KEYS = [
 
 export function clearPluginLoaderCache(): void {
   registryCache.clear();
+  registeredPluginIds.clear();
   openAllowlistWarningCache.clear();
 }
 
@@ -1306,14 +1308,19 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
     });
 
     try {
-      const result = register(api);
-      if (result && typeof result.then === "function") {
-        registry.diagnostics.push({
-          level: "warn",
-          pluginId: record.id,
-          source: record.source,
-          message: "plugin register returned a promise; async registration is ignored",
-        });
+      // Only call register() once per plugin ID across all load cycles.
+      // Subsequent loads reuse the cached side effects (event listeners, state).
+      if (!registeredPluginIds.has(pluginId)) {
+        const result = register(api);
+        if (result && typeof result.then === "function") {
+          registry.diagnostics.push({
+            level: "warn",
+            pluginId: record.id,
+            source: record.source,
+            message: "plugin register returned a promise; async registration is ignored",
+          });
+        }
+        registeredPluginIds.add(pluginId);
       }
       registry.plugins.push(record);
       seenIds.set(pluginId, candidate.origin);

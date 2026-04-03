@@ -245,6 +245,8 @@ async function buildEpisodicStore(api: OpenClawPluginApi): Promise<EpisodicStore
 // Plugin
 // ============================================================================
 
+let registered = false;
+
 const oodaPlugin = {
   id: "memory-ooda",
   name: "Memory (OODA)",
@@ -253,6 +255,8 @@ const oodaPlugin = {
   // memory-ooda runs alongside as a cognitive layer (Tier 3 distillation + context injection).
 
   register(api: OpenClawPluginApi) {
+    if (registered) return;
+
     const cfg = (api.pluginConfig ?? {}) as OodaConfig;
     const enabled = cfg.enabled !== false; // enabled by default
     const workspacePath = resolveWorkspacePath(cfg);
@@ -264,6 +268,7 @@ const oodaPlugin = {
       return;
     }
 
+    registered = true;
     api.logger.info(`memory-ooda: registered (workspace: ${workspacePath})`);
 
     // ========================================================================
