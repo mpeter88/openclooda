@@ -174,6 +174,32 @@ bash workdir:~/project command:"claude --permission-mode bypassPermissions --pri
 bash workdir:~/project background:true command:"claude --permission-mode bypassPermissions --print 'Your task'"
 ```
 
+### 📋 CR-Based Tasks (modify existing code)
+
+When implementing a CR or spec that modifies existing code, **always use the read-first pattern**.
+Point the agent at the spec file — never paraphrase it inline:
+
+```bash
+cd /path/to/project && claude --permission-mode bypassPermissions --print '
+Read <path/to/CR_FILE.md> fully before writing any code.
+
+Before making any changes:
+1. Read every file you will modify
+2. Read the key files those files import from (one level deep)
+3. In 2-3 sentences, describe what the existing code already does in this area
+4. If the CR asks you to build something that already exists, USE the existing code — do not reimplement it
+
+Then implement the CR exactly as specified.
+
+Run tests: <test command>
+When done: openclaw system event --text "<CR_NAME> implemented" --mode now
+'
+```
+
+**Why this matters:** Agents that skip the read phase behave like junior engineers — they implement the spec without knowing what infrastructure already exists, creating duplicate logic and subtle bugs. The read-first preamble forces senior-engineer behavior.
+
+**Never paraphrase the CR** into the prompt — always point to the file. Paraphrasing loses detail and introduces drift.
+
 ---
 
 ## OpenCode
