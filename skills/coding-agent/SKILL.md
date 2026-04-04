@@ -198,7 +198,13 @@ When done: openclaw system event --text "<CR_NAME> implemented" --mode now
 
 **Why this matters:** Agents that skip the read phase behave like junior engineers — they implement the spec without knowing what infrastructure already exists, creating duplicate logic and subtle bugs. The read-first preamble forces senior-engineer behavior.
 
-**Never paraphrase the CR** into the prompt — always point to the file. Paraphrasing loses detail and introduces drift.
+**The CR file IS the task.** It serves three purposes simultaneously:
+
+- Executable spec for the agent (what to build)
+- Architecture documentation for humans (why it was decided)
+- Audit trail (what changed and when)
+
+**Never paraphrase the CR into the prompt.** Always point to the file. Paraphrasing loses detail, introduces drift, and breaks the documentation chain. The agent reads the same artifact that the engineer reviewed.
 
 ---
 
