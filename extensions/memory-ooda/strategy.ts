@@ -41,6 +41,8 @@ export interface StrategyResult {
   fromFallback: boolean;
   /** Last error from model call attempts, if any. */
   lastError?: string;
+  /** Domain inferred from SITREP recommendedDomains (for outcome correlation). */
+  domain?: string;
 }
 
 // ============================================================================
@@ -267,6 +269,8 @@ export async function runStrategy(
 ): Promise<StrategyResult> {
   const maxRetries = options?.maxRetries ?? 1;
   const rubric = input.priorities.scoring_rubric;
+  // Tag domain from SITREP for downstream outcome correlation (V1)
+  const domain = input.sitrep.recommendedDomains[0];
 
   // Validate rubric and domains upfront
   try {
@@ -291,6 +295,7 @@ export async function runStrategy(
       candidates: scored,
       winner: scored[0],
       fromFallback: true,
+      domain,
     };
   }
 
@@ -307,6 +312,7 @@ export async function runStrategy(
         candidates: scored,
         winner: scored[0],
         fromFallback: false,
+        domain,
       };
     } catch (err) {
       lastError = err;
@@ -332,6 +338,7 @@ export async function runStrategy(
     candidates: scored,
     winner: scored[0],
     fromFallback: true,
+    domain,
     lastError: lastError ? errorMessage(lastError) : undefined,
   };
 }

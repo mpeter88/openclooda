@@ -3,10 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  aggregateDomainOutcomes,
   buildArchivistPrompt,
+  generateWeightProposals,
+  inferDomain,
   parsePatterns,
   readState,
   runArchivist,
+  shouldProposeWeightAdjustment,
   shouldRunArchivist,
   statePath,
   writeState,
@@ -17,6 +21,7 @@ import {
   type SemanticStore,
 } from "./archivist.js";
 import type { ModelCallFn } from "./triage.js";
+import type { DomainEntry, PrioritiesFile } from "./types.js";
 
 // ============================================================================
 // Fixtures
@@ -876,5 +881,205 @@ describe("lessons_learned extraction", () => {
     expect(() => parsePatterns(JSON.stringify(bad))).toThrow(
       'must be a string for section "lessons_learned"',
     );
+  });
+});
+
+// ============================================================================
+// V1: inferDomain + aggregateDomainOutcomes
+// ============================================================================
+
+describe("inferDomain", () => {
+  it("maps amf keywords to amf_pipeline", () => {
+    expect(inferDomain("Fixed AMF pipeline regression")).toBe("amf_pipeline");
+    expect(inferDomain("kohlscore calculation error")).toBe("amf_pipeline");
+  });
+
+  it("maps ooda keywords to openclooda", () => {
+    expect(inferDomain("Archivist extracted 5 patterns")).toBe("openclooda");
+    expect(inferDomain("SITREP priority was wrong")).toBe("openclooda");
+  });
+
+  it("maps infra keywords to infrastructure", () => {
+    expect(inferDomain("Deploy to kubernetes failed")).toBe("infrastructure");
+  });
+
+  it("returns unknown for unmatched text", () => {
+    expect(inferDomain("Had a great lunch")).toBe("unknown");
+  });
+});
+
+describe("aggregateDomainOutcomes", () => {
+  it("bins events by domain and computes success rate", () => {
+    const events: EpisodicEvent[] = [
+      createTestEvent({
+        text: "AMF pipeline fix",
+        outcome: "success",
+        createdAt: Date.now() - 1000,
+      }),
+      createTestEvent({
+        text: "AMF assembly error",
+        outcome: "failure",
+        createdAt: Date.now() - 2000,
+        id: "11111111-bbbb-cccc-dddd-eeeeeeeeeeee",
+      }),
+      createTestEvent({
+        text: "AMF kohlscore update",
+        outcome: "success",
+        createdAt: Date.now() - 3000,
+        id: "22222222-bbbb-cccc-dddd-eeeeeeeeeeee",
+      }),
+      createTestEvent({
+        text: "OODA archivist run",
+        outcome: "success",
+        createdAt: Date.now() - 4000,
+        id: "33333333-bbbb-cccc-dddd-eeeeeeeeeeee",
+      }),
+    ];
+
+    const stats = aggregateDomainOutcomes(events);
+    const amf = stats.find((s) => s.domain === "amf_pipeline");
+    expect(amf).toBeDefined();
+    expect(amf!.decisions).toBe(3);
+    expect(amf!.successes).toBe(2);
+    expect(amf!.failures).toBe(1);
+    expect(amf!.successRate).toBeCloseTo(2 / 3);
+
+    const ooda = stats.find((s) => s.domain === "openclooda");
+    expect(ooda).toBeDefined();
+    expect(ooda!.decisions).toBe(1);
+    expect(ooda!.successRate).toBe(1);
+  });
+
+  it("excludes events older than the window", () => {
+    const oldEvent = createTestEvent({
+      text: "AMF pipeline fix",
+      outcome: "success",
+      createdAt: Date.now() - 60 * 24 * 60 * 60 * 1000, // 60 days ago
+    });
+    const stats = aggregateDomainOutcomes([oldEvent]);
+    expect(stats).toHaveLength(0);
+  });
+
+  it("excludes events without an outcome", () => {
+    const noOutcome = createTestEvent({ text: "AMF pipeline check" });
+    const stats = aggregateDomainOutcomes([noOutcome]);
+    expect(stats).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// V2: shouldProposeWeightAdjustment + generateWeightProposals
+// ============================================================================
+
+describe("shouldProposeWeightAdjustment", () => {
+  it("proposes adjustment when delta > 0.2 and n >= 5", () => {
+    const stats = {
+      domain: "amf_pipeline",
+      decisions: 10,
+      successes: 3,
+      failures: 7,
+      partials: 0,
+      successRate: 0.3,
+    };
+    const result = shouldProposeWeightAdjustment(stats, 0.9);
+    expect(result).not.toBeNull();
+    expect(result!.domain).toBe("amf_pipeline");
+    expect(result!.currentWeight).toBe(0.9);
+    // delta = 0.3 - 0.9 = -0.6, proposed = 0.9 + (-0.6 * 0.3) = 0.72
+    expect(result!.proposedWeight).toBeCloseTo(0.72);
+  });
+
+  it("returns null when delta <= 0.2", () => {
+    const stats = {
+      domain: "amf_pipeline",
+      decisions: 10,
+      successes: 8,
+      failures: 2,
+      partials: 0,
+      successRate: 0.8,
+    };
+    expect(shouldProposeWeightAdjustment(stats, 0.9)).toBeNull();
+  });
+
+  it("returns null when decisions < 5", () => {
+    const stats = {
+      domain: "amf_pipeline",
+      decisions: 3,
+      successes: 0,
+      failures: 3,
+      partials: 0,
+      successRate: 0.0,
+    };
+    expect(shouldProposeWeightAdjustment(stats, 0.9)).toBeNull();
+  });
+
+  it("clamps proposed weight to [0.1, 1.0]", () => {
+    // Very high success rate with low weight → proposed would exceed 1.0
+    const stats = {
+      domain: "test",
+      decisions: 10,
+      successes: 10,
+      failures: 0,
+      partials: 0,
+      successRate: 1.0,
+    };
+    const result = shouldProposeWeightAdjustment(stats, 0.3);
+    expect(result).not.toBeNull();
+    expect(result!.proposedWeight).toBeLessThanOrEqual(1.0);
+    expect(result!.proposedWeight).toBeGreaterThanOrEqual(0.1);
+  });
+});
+
+describe("generateWeightProposals", () => {
+  function makeDomainEntry(weight: number): DomainEntry {
+    return { weight, description: "", examples: [], approval_count: 0, override_count: 0 };
+  }
+
+  const priorities = {
+    domains: {
+      amf_pipeline: makeDomainEntry(0.9),
+      openclooda: makeDomainEntry(0.8),
+    },
+  } as PrioritiesFile;
+
+  it("generates proposals for domains with significant deviation", () => {
+    const domainStats = [
+      {
+        domain: "amf_pipeline",
+        decisions: 10,
+        successes: 3,
+        failures: 7,
+        partials: 0,
+        successRate: 0.3,
+      },
+      {
+        domain: "openclooda",
+        decisions: 10,
+        successes: 8,
+        failures: 2,
+        partials: 0,
+        successRate: 0.8,
+      },
+    ];
+    const proposals = generateWeightProposals(domainStats, priorities);
+    // amf_pipeline: delta = 0.3 - 0.9 = -0.6, |delta| > 0.2 → proposal
+    // openclooda: delta = 0.8 - 0.8 = 0.0, |delta| <= 0.2 → no proposal
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0].domain).toBe("amf_pipeline");
+  });
+
+  it("skips domains not in priorities", () => {
+    const domainStats = [
+      {
+        domain: "unknown_domain",
+        decisions: 10,
+        successes: 2,
+        failures: 8,
+        partials: 0,
+        successRate: 0.2,
+      },
+    ];
+    const proposals = generateWeightProposals(domainStats, priorities);
+    expect(proposals).toHaveLength(0);
   });
 });

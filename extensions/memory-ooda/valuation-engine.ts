@@ -10,7 +10,7 @@
  * generation but not the valuation formula directly.
  */
 
-import type { PrioritiesFile, Strategy } from "./types.js";
+import type { DomainOutcomeStats, PrioritiesFile, Strategy } from "./types.js";
 
 // ============================================================================
 // Types
@@ -133,4 +133,66 @@ export function selectBestStrategy(
 ): Strategy | undefined {
   const scored = scoreStrategies(candidates, rubric);
   return scored[0];
+}
+
+// ============================================================================
+// V4: Rubric Calibration Diagnostic
+// ============================================================================
+
+/** A strategy paired with its outcome for rubric calibration analysis. */
+export interface StrategyOutcome {
+  strategy: Strategy;
+  outcome: "success" | "failure" | "partial";
+}
+
+/**
+ * Analyze which scoring axis most often led to selecting strategies that
+ * later failed. Returns a diagnostic string for the SITREP attention field,
+ * or null if insufficient data (< 3 data points).
+ *
+ * Logic: for each failed strategy, identify the axis with the highest score
+ * (the axis that "pulled" the strategy into selection). If one axis dominates
+ * failures, it may be over-indexed.
+ */
+export function calibrateRubric(outcomes: StrategyOutcome[]): string | null {
+  const failures = outcomes.filter((o) => o.outcome === "failure");
+  if (failures.length < 3) return null;
+
+  const axisCounts: Record<string, number> = { alignment: 0, efficiency: 0, risk: 0 };
+
+  for (const { strategy } of failures) {
+    const scores: Array<[string, number]> = [
+      ["alignment", strategy.alignmentScore],
+      ["efficiency", strategy.efficiencyScore],
+      ["risk", strategy.riskScore],
+    ];
+    // Find the axis with the highest score on the failed strategy
+    scores.sort((a, b) => b[1] - a[1]);
+    const dominantAxis = scores[0][0];
+    axisCounts[dominantAxis]++;
+  }
+
+  // Find the axis that dominates failures
+  const entries = Object.entries(axisCounts).sort((a, b) => b[1] - a[1]);
+  const [topAxis, topCount] = entries[0];
+  const totalFailures = failures.length;
+
+  // Only surface if one axis accounts for majority of failures
+  if (topCount >= Math.ceil(totalFailures * 0.6)) {
+    const otherAxis = entries.filter(([a]) => a !== topAxis).map(([a]) => a);
+    const lowAxes = otherAxis.filter((a) => {
+      // Check if this axis was consistently low on failed strategies
+      const avgScore =
+        failures.reduce((sum, f) => {
+          const key = `${a}Score` as keyof Strategy;
+          return sum + (f.strategy[key] as number);
+        }, 0) / totalFailures;
+      return avgScore < 0.5;
+    });
+
+    const lowAxesNote = lowAxes.length > 0 ? `, low-${lowAxes.join("/")}` : "";
+    return `${topAxis} weighting appears over-indexed — ${topCount}/${totalFailures} recent failures were high-${topAxis}${lowAxesNote} strategies`;
+  }
+
+  return null;
 }

@@ -12,8 +12,9 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
-import { addArchivistProposals, type ProposalCandidate } from "./proposals.js";
+import { addArchivistProposals, addProposal, type ProposalCandidate } from "./proposals.js";
 import type { ModelCallFn } from "./triage.js";
+import type { DomainOutcomeStats, PrioritiesFile, WeightProposal } from "./types.js";
 
 // ============================================================================
 // Types
@@ -381,6 +382,158 @@ export function isDecision(pattern: PatternExtraction): boolean {
   return false;
 }
 
+// ============================================================================
+// V1: Domain Outcome Aggregation
+// ============================================================================
+
+/**
+ * Keyword → domain mapping. Each domain has keywords that, when found in the
+ * memory text (case-insensitive), assign that memory to the domain.
+ */
+const DOMAIN_KEYWORDS: Record<string, string[]> = {
+  amf_pipeline: ["amf", "pipeline", "kohlscore", "kohl", "assembly"],
+  openclooda: ["ooda", "archivist", "triage", "valuation", "sitrep", "strategy", "knowledge.json"],
+  infrastructure: ["deploy", "ci/cd", "docker", "kubernetes", "infra", "server"],
+  testing: ["test", "vitest", "coverage", "spec", "e2e"],
+};
+
+/**
+ * Infer which domain a memory belongs to, based on keyword matching.
+ * Returns the first matching domain, or "unknown" if none match.
+ */
+export function inferDomain(text: string): string {
+  const lower = text.toLowerCase();
+  for (const [domain, keywords] of Object.entries(DOMAIN_KEYWORDS)) {
+    if (keywords.some((kw) => lower.includes(kw))) {
+      return domain;
+    }
+  }
+  return "unknown";
+}
+
+/**
+ * Aggregate outcome data per domain from episodic events that have outcomes.
+ * Only considers events from the last 30 days by default.
+ */
+export function aggregateDomainOutcomes(
+  events: EpisodicEvent[],
+  windowMs: number = 30 * 24 * 60 * 60 * 1000,
+): DomainOutcomeStats[] {
+  const cutoff = Date.now() - windowMs;
+  const withOutcome = events.filter((e) => e.outcome && e.createdAt >= cutoff);
+
+  const byDomain = new Map<string, { successes: number; failures: number; partials: number }>();
+
+  for (const e of withOutcome) {
+    const domain = inferDomain(e.text);
+    const stats = byDomain.get(domain) ?? { successes: 0, failures: 0, partials: 0 };
+    if (e.outcome === "success") stats.successes++;
+    else if (e.outcome === "failure") stats.failures++;
+    else if (e.outcome === "partial") stats.partials++;
+    byDomain.set(domain, stats);
+  }
+
+  const result: DomainOutcomeStats[] = [];
+  for (const [domain, stats] of byDomain) {
+    const decisions = stats.successes + stats.failures + stats.partials;
+    result.push({
+      domain,
+      decisions,
+      successes: stats.successes,
+      failures: stats.failures,
+      partials: stats.partials,
+      successRate: decisions > 0 ? stats.successes / decisions : 0,
+    });
+  }
+
+  return result;
+}
+
+// ============================================================================
+// V2: Weight Proposal Generation
+// ============================================================================
+
+/** Clamp a value to [min, max]. */
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * Determine whether a domain's outcome stats warrant a weight adjustment.
+ * Fires when: |successRate - currentWeight| > 0.2 AND decisions >= 5.
+ * Adjustment is conservative: 0.3× of delta.
+ */
+export function shouldProposeWeightAdjustment(
+  stats: DomainOutcomeStats,
+  currentWeight: number,
+): WeightProposal | null {
+  const expectedSuccessRate = currentWeight;
+  const delta = stats.successRate - expectedSuccessRate;
+  if (Math.abs(delta) > 0.2 && stats.decisions >= 5) {
+    const proposedWeight = clamp(currentWeight + delta * 0.3, 0.1, 1.0);
+    return {
+      domain: stats.domain,
+      currentWeight,
+      proposedWeight,
+      rationale: `${stats.decisions} decisions, ${(stats.successRate * 100).toFixed(0)}% success rate vs ${(currentWeight * 100).toFixed(0)}% weight`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Generate weight proposals for all domains that have outcome stats
+ * deviating significantly from their current weights.
+ */
+export function generateWeightProposals(
+  domainStats: DomainOutcomeStats[],
+  priorities: PrioritiesFile,
+): WeightProposal[] {
+  const proposals: WeightProposal[] = [];
+  for (const stats of domainStats) {
+    const domainEntry = priorities.domains[stats.domain];
+    if (!domainEntry) continue;
+    const proposal = shouldProposeWeightAdjustment(stats, domainEntry.weight);
+    if (proposal) proposals.push(proposal);
+  }
+  return proposals;
+}
+
+// ============================================================================
+// V3: Weight Proposals → PolicyProposal System
+// ============================================================================
+
+/**
+ * Convert weight proposals into PolicyProposals and add them to the store.
+ * Returns the number of proposals added.
+ */
+export function addWeightProposals(
+  workspacePath: string,
+  weightProposals: WeightProposal[],
+): number {
+  let added = 0;
+  for (const wp of weightProposals) {
+    addProposal(workspacePath, {
+      id: `weight-${wp.domain}-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      category: "weight_adjustment",
+      rule: wp.domain,
+      proposal: `Adjust ${wp.domain} weight: ${wp.currentWeight} → ${wp.proposedWeight.toFixed(2)}`,
+      reasoning: wp.rationale,
+      evidence: [
+        `Domain ${wp.domain}: current weight=${wp.currentWeight}, observed success rate=${wp.proposedWeight > wp.currentWeight ? "higher" : "lower"} than expected`,
+      ],
+      confidence: Math.min(
+        0.9,
+        wp.rationale.match(/^(\d+)/)?.[1] ? Number(wp.rationale.match(/^(\d+)/)?.[1]) / 20 : 0.5,
+      ),
+      autoGenerated: true,
+    });
+    added++;
+  }
+  return added;
+}
+
 const DEFAULT_CONFIG: ArchivistConfig = {
   turnInterval: 100,
   pruneAfterDays: 90,
@@ -487,6 +640,8 @@ export async function runArchivist(
   semanticStore: SemanticStore,
   callModel: ModelCallFn,
   config?: Partial<ArchivistConfig>,
+  /** Optional: pass priorities to enable V3 weight proposal generation. */
+  priorities?: PrioritiesFile,
 ): Promise<ArchivistResult> {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const state = readState(workspacePath);
@@ -640,6 +795,26 @@ export async function runArchivist(
   } catch (err) {
     // Non-fatal — proposals are best-effort
     semanticStore.appendArchivistLog("proposals_error", errorMessage(err));
+  }
+
+  // Step 9 (V3): Weight proposal generation from domain outcome stats
+  if (priorities) {
+    try {
+      const allRecent = await episodicStore.retrieveSince(0, 10_000);
+      const domainStats = aggregateDomainOutcomes(allRecent);
+      const weightProposals = generateWeightProposals(domainStats, priorities);
+      if (weightProposals.length > 0) {
+        const wpAdded = addWeightProposals(workspacePath, weightProposals);
+        if (wpAdded > 0) {
+          semanticStore.appendArchivistLog(
+            "weight_proposals_generated",
+            `Generated ${wpAdded} weight adjustment proposal(s): ${weightProposals.map((wp) => `${wp.domain} ${wp.currentWeight}→${wp.proposedWeight.toFixed(2)}`).join(", ")}`,
+          );
+        }
+      }
+    } catch {
+      // Best-effort — weight proposals are supplementary
+    }
   }
 
   return {

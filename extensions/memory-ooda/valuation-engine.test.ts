@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  calibrateRubric,
   scoreStrategies,
   scoreStrategy,
   selectBestStrategy,
   validateDomainWeights,
   validateRubric,
   type ScoringRubric,
+  type StrategyOutcome,
   type UnscoredStrategy,
 } from "./valuation-engine.js";
 
@@ -240,5 +242,83 @@ describe("selectBestStrategy", () => {
 
     const best = selectBestStrategy(candidates, DEFAULT_RUBRIC);
     expect(best?.label).toBe("first");
+  });
+});
+
+// ============================================================================
+// calibrateRubric (V4)
+// ============================================================================
+
+describe("calibrateRubric", () => {
+  function makeOutcome(
+    outcome: "success" | "failure" | "partial",
+    scores: { alignment: number; efficiency: number; risk: number },
+  ): StrategyOutcome {
+    return {
+      strategy: {
+        label: "test",
+        reasoning: "test",
+        alignmentScore: scores.alignment,
+        efficiencyScore: scores.efficiency,
+        riskScore: scores.risk,
+        weightedTotal: 0.5,
+      },
+      outcome,
+    };
+  }
+
+  it("returns null with fewer than 3 failures", () => {
+    const outcomes: StrategyOutcome[] = [
+      makeOutcome("failure", { alignment: 0.9, efficiency: 0.3, risk: 0.2 }),
+      makeOutcome("failure", { alignment: 0.8, efficiency: 0.4, risk: 0.3 }),
+    ];
+    expect(calibrateRubric(outcomes)).toBeNull();
+  });
+
+  it("detects alignment over-indexing when it dominates failures", () => {
+    const outcomes: StrategyOutcome[] = [
+      makeOutcome("failure", { alignment: 0.9, efficiency: 0.3, risk: 0.2 }),
+      makeOutcome("failure", { alignment: 0.8, efficiency: 0.4, risk: 0.3 }),
+      makeOutcome("failure", { alignment: 0.85, efficiency: 0.2, risk: 0.4 }),
+      makeOutcome("success", { alignment: 0.5, efficiency: 0.8, risk: 0.9 }),
+    ];
+    const result = calibrateRubric(outcomes);
+    expect(result).not.toBeNull();
+    expect(result).toContain("alignment");
+    expect(result).toContain("over-indexed");
+    expect(result).toContain("3/3");
+  });
+
+  it("detects risk over-indexing", () => {
+    const outcomes: StrategyOutcome[] = [
+      makeOutcome("failure", { alignment: 0.3, efficiency: 0.2, risk: 0.9 }),
+      makeOutcome("failure", { alignment: 0.4, efficiency: 0.3, risk: 0.85 }),
+      makeOutcome("failure", { alignment: 0.2, efficiency: 0.4, risk: 0.8 }),
+    ];
+    const result = calibrateRubric(outcomes);
+    expect(result).toContain("risk");
+    expect(result).toContain("3/3");
+  });
+
+  it("returns null when no single axis dominates", () => {
+    const outcomes: StrategyOutcome[] = [
+      makeOutcome("failure", { alignment: 0.9, efficiency: 0.3, risk: 0.2 }),
+      makeOutcome("failure", { alignment: 0.3, efficiency: 0.9, risk: 0.2 }),
+      makeOutcome("failure", { alignment: 0.2, efficiency: 0.3, risk: 0.9 }),
+    ];
+    // Each axis is dominant once — no single axis accounts for 60%+
+    expect(calibrateRubric(outcomes)).toBeNull();
+  });
+
+  it("ignores success outcomes in failure analysis", () => {
+    const outcomes: StrategyOutcome[] = [
+      makeOutcome("success", { alignment: 0.9, efficiency: 0.3, risk: 0.2 }),
+      makeOutcome("success", { alignment: 0.9, efficiency: 0.3, risk: 0.2 }),
+      makeOutcome("success", { alignment: 0.9, efficiency: 0.3, risk: 0.2 }),
+      makeOutcome("failure", { alignment: 0.9, efficiency: 0.3, risk: 0.2 }),
+      makeOutcome("failure", { alignment: 0.85, efficiency: 0.4, risk: 0.3 }),
+    ];
+    // Only 2 failures — below threshold
+    expect(calibrateRubric(outcomes)).toBeNull();
   });
 });
