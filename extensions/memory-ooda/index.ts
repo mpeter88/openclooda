@@ -146,6 +146,22 @@ async function buildSqliteEpisodicStore(dbPath: string): Promise<EpisodicStore> 
       const result = stmt.run(olderThanMs) as { changes: number };
       return result.changes ?? 0;
     },
+
+    async store(event: Omit<EpisodicEvent, "id" | "createdAt" | "archivistProcessed">) {
+      const { randomUUID } = await import("node:crypto");
+      db.prepare(
+        `INSERT INTO memories (id, text, importance, category, createdAt, source, actionId, archivistProcessed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+      ).run(
+        randomUUID(),
+        event.text,
+        event.importance,
+        event.category,
+        Date.now(),
+        event.source ?? null,
+        event.actionId ?? null,
+      );
+    },
   };
 }
 
@@ -211,6 +227,30 @@ async function buildEpisodicStore(api: OpenClawPluginApi): Promise<EpisodicStore
         if (rows.length === 0) return 0;
         await table.delete(filter);
         return rows.length;
+      },
+
+      async store(event: Omit<EpisodicEvent, "id" | "createdAt" | "archivistProcessed">) {
+        const { randomUUID } = await import("node:crypto");
+        // Determine vector dimension from an existing row
+        // eslint-disable-next-line -- lancedb Table typing lacks .filter()
+        const sample: Record<string, unknown>[] = await (table as any)
+          .filter("id IS NOT NULL")
+          .limit(1)
+          .toArray();
+        const dim = Array.isArray(sample[0]?.vector) ? (sample[0].vector as number[]).length : 384;
+        await table.add([
+          {
+            id: randomUUID(),
+            text: event.text,
+            vector: new Array(dim).fill(0),
+            importance: event.importance,
+            category: event.category,
+            createdAt: Date.now(),
+            source: event.source ?? "",
+            actionId: event.actionId ?? "",
+            archivistProcessed: false,
+          },
+        ]);
       },
     };
   } catch (_lanceErr) {
@@ -640,6 +680,102 @@ const oodaPlugin = {
           }
         })();
       });
+    });
+
+    // ========================================================================
+    // C3: Structural Event Capture via after_tool_call
+    // ========================================================================
+
+    // Noisy tools to skip — these fire constantly and add no structural signal
+    const NOISY_TOOLS = new Set(["read", "exec", "process", "web_search", "web_fetch", "image"]);
+
+    // Lazy-init episodic store for writing structural events
+    let structuralStore: EpisodicStore | null | undefined;
+    async function getStructuralStore(): Promise<EpisodicStore | null> {
+      if (structuralStore !== undefined) return structuralStore;
+      structuralStore = await buildEpisodicStore(api);
+      return structuralStore;
+    }
+
+    type StructuralEventType = {
+      category: string;
+      text: string;
+      importance: number;
+    };
+
+    function classifyToolCall(
+      toolName: string,
+      params: Record<string, unknown>,
+      error: string | undefined,
+    ): StructuralEventType | null {
+      // Tool errors at high importance
+      if (error) {
+        return {
+          category: "structural_event",
+          text: `tool_error: ${toolName} failed — ${String(error).slice(0, 200)}`,
+          importance: 0.8,
+        };
+      }
+
+      // Gateway config/restart actions
+      if (toolName === "gateway") {
+        const action = params.action as string | undefined;
+        if (action === "config.apply" || action === "config.patch" || action === "restart") {
+          return {
+            category: "structural_event",
+            text: `config_change: gateway ${action}${params.key ? ` key=${params.key}` : ""}`,
+            importance: 0.7,
+          };
+        }
+      }
+
+      // Writes to cr/ or docs/ paths
+      if (toolName === "write" || toolName === "edit") {
+        const filePath = (params.path ?? params.file_path ?? params.filePath ?? "") as string;
+        if (/^(cr|docs)\//.test(filePath) || /\/(cr|docs)\//.test(filePath)) {
+          return {
+            category: "structural_event",
+            text: `knowledge_write: ${toolName} ${filePath}`,
+            importance: 0.7,
+          };
+        }
+      }
+
+      // Cron add/remove
+      if (toolName === "cron") {
+        const action = params.action as string | undefined;
+        if (action === "add" || action === "remove" || action === "delete") {
+          const name = (params.name ?? params.id ?? "") as string;
+          return {
+            category: "structural_event",
+            text: `schedule_change: cron ${action}${name ? ` "${name}"` : ""}`,
+            importance: 0.7,
+          };
+        }
+      }
+
+      return null;
+    }
+
+    api.on("after_tool_call", async (event) => {
+      try {
+        if (NOISY_TOOLS.has(event.toolName)) return;
+
+        const classified = classifyToolCall(event.toolName, event.params, event.error);
+        if (!classified) return;
+
+        const store = await getStructuralStore();
+        if (!store?.store) return;
+
+        await store.store({
+          text: classified.text,
+          category: classified.category,
+          importance: classified.importance,
+          source: "structural",
+        });
+      } catch (err) {
+        api.logger.warn(`memory-ooda: structural capture failed: ${String(err)}`);
+      }
     });
 
     // ========================================================================

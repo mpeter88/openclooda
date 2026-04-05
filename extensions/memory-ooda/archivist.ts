@@ -35,6 +35,8 @@ export interface EpisodicStore {
   retrieveSince(sinceTimestamp: number, limit?: number): Promise<EpisodicEvent[]>;
   markProcessed(id: string): Promise<void>;
   prune(olderThanMs: number, onlyProcessed?: boolean): Promise<number>;
+  /** Optional write method — used by structural event capture (C3). */
+  store?(event: Omit<EpisodicEvent, "id" | "createdAt" | "archivistProcessed">): Promise<void>;
 }
 
 /** Abstraction over Tier 3 store for testability. */
