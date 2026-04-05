@@ -762,7 +762,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures root cause analysis", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "The root cause is that messages.stream() was replaced with messages.create().",
+        "The root cause is that messages.stream() was replaced with messages.create(), which breaks large outputs and causes silent truncation in the pipeline.",
       ),
     ).toBe(true);
   });
@@ -770,7 +770,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures decisions", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "We decided to use the HAL dual-backend pattern rather than hardcoding the Honeywell SDK.",
+        "We decided to use the HAL dual-backend pattern rather than hardcoding the Honeywell SDK, since the abstraction layer lets us swap providers without touching call sites.",
       ),
     ).toBe(true);
   });
@@ -779,7 +779,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures regression analysis", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "This is a regression — the streaming call was replaced with a blocking call.",
+        "This is a regression — the streaming call was replaced with a blocking call, which causes the client to hang on large model outputs exceeding the buffer size.",
       ),
     ).toBe(true);
   });
@@ -787,7 +787,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures recommendations", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "I recommend using the centralized model client pattern instead of direct SDK instantiation.",
+        "I recommend using the centralized model client pattern instead of direct SDK instantiation, because it centralizes retry logic and rate limiting in one place.",
       ),
     ).toBe(true);
   });
@@ -795,7 +795,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures 'the right approach' phrasing", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "The right approach here is to wire the AST extractor before the deterministic scanners run.",
+        "The right approach here is to wire the AST extractor before the deterministic scanners run, so that structural patterns are available for downstream matching passes.",
       ),
     ).toBe(true);
   });
@@ -803,7 +803,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures CR references", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "CR_MANIFEST_PEER_REVIEW_FIXES addresses the root cause — see the STATUS.md entry.",
+        "CR_MANIFEST_PEER_REVIEW_FIXES addresses the root cause of missing source classes — see the STATUS.md entry for the full list of affected manifests.",
       ),
     ).toBe(true);
   });
@@ -811,7 +811,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures parity signal", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "The parity score dropped from 74 to 52 — state machine phase failed.",
+        "The parity score dropped from 74 to 52 — the state machine phase failed because the transition table was regenerated without the new guard conditions.",
       ),
     ).toBe(true);
   });
@@ -819,7 +819,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures 'should never' lessons", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "You should never use bare except: — it catches SystemExit and KeyboardInterrupt.",
+        "You should never use bare except: — it catches SystemExit and KeyboardInterrupt, which masks legitimate shutdown signals and makes debugging impossible.",
       ),
     ).toBe(true);
   });
@@ -827,7 +827,7 @@ describe("isSubstantiveAssistantTurn", () => {
   test("captures trade-off analysis", () => {
     expect(
       isSubstantiveAssistantTurn(
-        "The trade-off here is cost vs precision — Opus at 3-8K tokens is ~$0.05.",
+        "The trade-off here is cost vs precision — Opus at 3-8K tokens is ~$0.05 per call, but the accuracy gain over Haiku justifies it for classification tasks.",
       ),
     ).toBe(true);
   });

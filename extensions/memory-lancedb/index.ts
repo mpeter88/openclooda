@@ -646,10 +646,10 @@ export function shouldCapture(text: string, options?: { maxChars?: number }): bo
  * Targets: insights, decisions, discrepancies, patterns, analytical conclusions.
  */
 export function isSubstantiveAssistantTurn(text: string): boolean {
-  if (text.length < 50) return false; // skip short acks ("Got it.", "Done.", "HEARTBEAT_OK")
+  if (text.length < 120) return false; // skip short acks ("Got it.", "Done.", "HEARTBEAT_OK")
 
   // Skip injected memory/system context (these appear in system prompt, not assistant replies)
-  if (text.includes("<relevant-memories>")) return false;
+  if (text.includes("<relevant-memories>") || text.includes("<ooda-notice>")) return false;
 
   // Long responses are substantive by definition — no need to pattern-match
   if (text.length > 600) return true;
@@ -961,6 +961,62 @@ const memoryPlugin = {
         },
       },
       { name: "memory_forget" },
+    );
+
+    api.registerTool(
+      {
+        name: "memory_backfill",
+        label: "Memory Backfill",
+        description:
+          "Backfill episodic memory from workspace daily markdown files. Safe to run multiple times — deduplication prevents double-insertion.",
+        parameters: Type.Object({
+          days: Type.Optional(
+            Type.Number({ description: "How many days back to scan (default: 30)" }),
+          ),
+          dryRun: Type.Optional(
+            Type.Boolean({
+              description: "Report what would be inserted without writing (default: false)",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          const { days = 30, dryRun = false } = params as { days?: number; dryRun?: boolean };
+
+          const { execFile } = await import("node:child_process");
+          const { promisify } = await import("node:util");
+          const { fileURLToPath } = await import("node:url");
+          const execFileAsync = promisify(execFile);
+
+          const scriptPath = path.join(
+            path.dirname(fileURLToPath(import.meta.url)),
+            "..",
+            "..",
+            "scripts",
+            "backfill-memory.ts",
+          );
+
+          const args = ["--days", String(days)];
+          if (dryRun) args.push("--dry-run");
+
+          try {
+            const { stdout, stderr } = await execFileAsync("npx", ["tsx", scriptPath, ...args], {
+              timeout: 120_000,
+            });
+            const output = (stdout + stderr).trim();
+            return {
+              content: [{ type: "text", text: output || "Backfill completed (no output)." }],
+              details: { success: true },
+            };
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return {
+              content: [{ type: "text", text: `Backfill failed: ${message}` }],
+              details: { success: false, error: message },
+            };
+          }
+        },
+      },
+      { name: "memory_backfill" },
     );
 
     // ========================================================================

@@ -814,3 +814,67 @@ describe("buildSqliteEpisodicStore (via node:sqlite, no LanceDB)", () => {
     sqliteDb.close();
   });
 });
+
+// ============================================================================
+// lessons_learned extraction (CR P4)
+// ============================================================================
+
+describe("lessons_learned extraction", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ooda-archivist-lessons-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("extracts lessons_learned from episodic events", async () => {
+    const events: EpisodicEvent[] = [
+      {
+        id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        text: "The messages.stream() call was replaced with messages.create() which breaks large outputs — reverted.",
+        category: "fact",
+        importance: 0.8,
+        createdAt: Date.now(),
+        source: "assistant",
+      },
+    ];
+
+    const mockCallModel: ModelCallFn = async () =>
+      JSON.stringify([
+        {
+          section: "lessons_learned",
+          key: "claude_streaming_required",
+          value: "Always use streaming for Claude calls.",
+          reason: "Bug found in worktree.",
+        },
+      ]);
+
+    const episodic = createMockEpisodicStore(events);
+    const semantic = createMockSemanticStore();
+    await runArchivist(tmpDir, 100, episodic, semantic, mockCallModel);
+
+    expect(semantic.upserts).toHaveLength(1);
+    expect(semantic.upserts[0]).toEqual({
+      section: "lessons_learned",
+      key: "claude_streaming_required",
+      value: "Always use streaming for Claude calls.",
+    });
+  });
+
+  it("validates lessons_learned values must be strings", () => {
+    const bad = [
+      {
+        section: "lessons_learned",
+        key: "test",
+        value: { nested: true },
+        reason: "test",
+      },
+    ];
+    expect(() => parsePatterns(JSON.stringify(bad))).toThrow(
+      'must be a string for section "lessons_learned"',
+    );
+  });
+});

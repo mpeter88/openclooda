@@ -267,6 +267,12 @@ export function formatFactsForContext(knowledge: KnowledgeFile): string {
     sections.push(`Commitments:\n${lines.join("\n")}`);
   }
 
+  // Lessons learned
+  const lessonEntries = Object.entries(knowledge.lessons_learned ?? {});
+  if (lessonEntries.length > 0) {
+    sections.push(`Lessons Learned:\n${lessonEntries.map(([k, v]) => `  ${k}: ${v}`).join("\n")}`);
+  }
+
   // Domain context
   const ctxEntries = Object.entries(knowledge.domain_context);
   if (ctxEntries.length > 0) {

@@ -491,3 +491,62 @@ describe("shouldRunFullOODA", () => {
     expect(shouldRunFullOODA(critical, strict, "medium")).toBe(false);
   });
 });
+
+// ============================================================================
+// SITREP attention field
+// ============================================================================
+
+describe("SITREP attention field", () => {
+  it("parseSITREP accepts attention when present", () => {
+    const raw = JSON.stringify({
+      priority: 8,
+      summary: "Debugging live run",
+      conflictsDetected: [],
+      relevantFacts: [],
+      recommendedDomains: ["engineering"],
+      attention: "Go straight to cause — user is debugging live.",
+    });
+    const sitrep = parseSITREP(raw);
+    expect(sitrep.attention).toBe("Go straight to cause — user is debugging live.");
+  });
+
+  it("parseSITREP accepts missing attention", () => {
+    const raw = JSON.stringify({
+      priority: 4,
+      summary: "Routine question",
+      conflictsDetected: [],
+      relevantFacts: [],
+      recommendedDomains: [],
+    });
+    const sitrep = parseSITREP(raw);
+    expect(sitrep.attention).toBeUndefined();
+  });
+
+  it("parseSITREP trims attention to 15 words", () => {
+    const raw = JSON.stringify({
+      priority: 7,
+      summary: "Test",
+      conflictsDetected: [],
+      relevantFacts: [],
+      recommendedDomains: [],
+      attention:
+        "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen",
+    });
+    const sitrep = parseSITREP(raw);
+    const words = sitrep.attention!.replace("…", "").trim().split(/\s+/);
+    expect(words.length).toBeLessThanOrEqual(15);
+  });
+
+  it("parseSITREP discards empty attention string", () => {
+    const raw = JSON.stringify({
+      priority: 7,
+      summary: "Test",
+      conflictsDetected: [],
+      relevantFacts: [],
+      recommendedDomains: [],
+      attention: "",
+    });
+    const sitrep = parseSITREP(raw);
+    expect(sitrep.attention).toBeUndefined();
+  });
+});

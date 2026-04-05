@@ -110,6 +110,21 @@ describe("semantic-memory", () => {
       expect(facts.stack.lang).toBe("TypeScript");
     });
 
+    it("upserts lessons_learned via upsertFact", () => {
+      getFacts(tmpDir);
+      upsertFact(
+        tmpDir,
+        "lessons_learned",
+        "claude_streaming_required",
+        "Always use streaming for Claude calls.",
+      );
+
+      const facts = getFacts(tmpDir);
+      expect(facts.lessons_learned["claude_streaming_required"]).toBe(
+        "Always use streaming for Claude calls.",
+      );
+    });
+
     it("rejects invalid section names", () => {
       getFacts(tmpDir);
       expect(() => upsertFact(tmpDir, "preferences", "key", "val")).toThrow(
@@ -212,6 +227,19 @@ describe("semantic-memory", () => {
       const result = formatFactsForContext(knowledge);
       expect(result).toContain("Commitments:");
       expect(result).toContain("standup: daily 09:00 (blocking)");
+    });
+
+    it("formats lessons_learned entries", () => {
+      const knowledge = createDefaultKnowledge();
+      knowledge.lessons_learned = {
+        claude_streaming_required: "Always use streaming for Claude calls.",
+        check_all_branches: "Check worktree branches too when auditing.",
+      };
+
+      const result = formatFactsForContext(knowledge);
+      expect(result).toContain("Lessons Learned:");
+      expect(result).toContain("claude_streaming_required: Always use streaming for Claude calls.");
+      expect(result).toContain("check_all_branches: Check worktree branches too when auditing.");
     });
 
     it("omits empty sections", () => {
