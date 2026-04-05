@@ -817,6 +817,45 @@ export async function runArchivist(
     }
   }
 
+  // Step 10 (K3): Export AMF-relevant lessons to shared knowledge file
+  if (patterns.length > 0) {
+    try {
+      const { exportOodaLessons } = await import("./cross-project.js");
+      const amfLessonsPath = path.join(
+        workspacePath,
+        "..",
+        "amf-platform",
+        "knowledge",
+        "ooda-lessons.json",
+      );
+      const outcomeEvents = await episodicStore.retrieveSince(0, 10_000);
+      const exported = exportOodaLessons(amfLessonsPath, patterns, outcomeEvents);
+      if (exported > 0) {
+        semanticStore.appendArchivistLog(
+          "amf_lessons_exported",
+          `Exported ${exported} AMF-relevant lesson(s) to ooda-lessons.json`,
+        );
+      }
+    } catch {
+      // Best-effort — cross-project export is supplementary
+    }
+  }
+
+  // Step 11 (K5): Promote high-importance AMF findings into KNOWLEDGE.json
+  try {
+    const { promoteAMFFindings } = await import("./cross-project.js");
+    const allRecent = await episodicStore.retrieveSince(0, 10_000);
+    const promoted = promoteAMFFindings(allRecent, semanticStore);
+    if (promoted > 0) {
+      semanticStore.appendArchivistLog(
+        "amf_findings_promoted",
+        `Promoted ${promoted} high-importance AMF finding(s) to KNOWLEDGE.json`,
+      );
+    }
+  } catch {
+    // Best-effort — AMF promotion is supplementary
+  }
+
   return {
     patternsExtracted: patterns,
     eventsProcessed: events.length,

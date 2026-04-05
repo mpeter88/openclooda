@@ -486,6 +486,35 @@ const oodaPlugin = {
         }
 
         // ==================================================================
+        // K4: Cross-project AMF-context recall
+        // ==================================================================
+
+        try {
+          const { isAMFContext } = await import("./cross-project.js");
+          if (isAMFContext(event.prompt)) {
+            const episodicStore = await buildEpisodicStore(api);
+            if (episodicStore) {
+              const amfMemories = await episodicStore.retrieveSince(0, 10_000);
+              const amfFiltered = amfMemories
+                .filter((e) => e.source === "amf_harvester")
+                .sort((a, b) => b.createdAt - a.createdAt)
+                .slice(0, 5);
+
+              if (amfFiltered.length > 0) {
+                const recallLines = amfFiltered.map(
+                  (e) => `- ${e.text} (importance: ${e.importance})`,
+                );
+                parts.push(
+                  `<ooda-amf-recall>Cross-project knowledge (AMF pipeline):\n${recallLines.join("\n")}</ooda-amf-recall>`,
+                );
+              }
+            }
+          }
+        } catch {
+          // Best-effort — cross-project recall is supplementary
+        }
+
+        // ==================================================================
         // OODA Triage + Strategy
         // ==================================================================
 
