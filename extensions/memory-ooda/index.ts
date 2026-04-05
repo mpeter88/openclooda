@@ -162,6 +162,37 @@ async function buildSqliteEpisodicStore(dbPath: string): Promise<EpisodicStore> 
         event.actionId ?? null,
       );
     },
+
+    async labelOutcome(
+      actionId: string,
+      label: { outcome: string; observedAt: number; signal: string; detail?: string },
+    ) {
+      db.prepare(
+        "UPDATE memories SET outcome = ?, outcomeSignal = ?, outcomeAt = ? WHERE actionId = ?",
+      ).run(label.outcome, label.signal, label.observedAt, actionId);
+    },
+
+    async findRecentWithActionId(limit = 5): Promise<EpisodicEvent[]> {
+      const rows = db
+        .prepare(
+          "SELECT id, text, category, importance, createdAt, source, actionId, archivistProcessed, outcome, outcomeSignal, outcomeAt FROM memories WHERE actionId IS NOT NULL AND actionId != '' ORDER BY createdAt DESC LIMIT ?",
+        )
+        .all(limit) as Array<Record<string, unknown>>;
+
+      return rows.map((row) => ({
+        id: row.id as string,
+        text: row.text as string,
+        category: row.category as string,
+        importance: row.importance as number,
+        createdAt: row.createdAt as number,
+        source: (row.source as string) || undefined,
+        actionId: (row.actionId as string) || undefined,
+        archivistProcessed: row.archivistProcessed === 1 || row.archivistProcessed === true,
+        outcome: (row.outcome as string) || undefined,
+        outcomeSignal: (row.outcomeSignal as string) || undefined,
+        outcomeAt: (row.outcomeAt as number) || undefined,
+      })) as EpisodicEvent[];
+    },
   };
 }
 
@@ -249,8 +280,58 @@ async function buildEpisodicStore(api: OpenClawPluginApi): Promise<EpisodicStore
             source: event.source ?? "",
             actionId: event.actionId ?? "",
             archivistProcessed: false,
+            outcome: "",
+            outcomeSignal: "",
+            outcomeAt: 0,
           },
         ]);
+      },
+
+      async labelOutcome(
+        actionId: string,
+        label: { outcome: string; observedAt: number; signal: string; detail?: string },
+      ) {
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!uuidRegex.test(actionId)) return;
+        // eslint-disable-next-line -- lancedb Table typing lacks .filter()
+        const rows: Record<string, unknown>[] = await (table as any)
+          .filter(`actionId = '${actionId}'`)
+          .toArray();
+        if (rows.length === 0) return;
+        const row = rows[0];
+        await table.delete(`actionId = '${actionId}'`);
+        await table.add([
+          {
+            ...row,
+            outcome: label.outcome,
+            outcomeSignal: label.signal,
+            outcomeAt: label.observedAt,
+          },
+        ]);
+      },
+
+      async findRecentWithActionId(limit = 5): Promise<EpisodicEvent[]> {
+        // eslint-disable-next-line -- lancedb Table typing lacks .filter()
+        const rows: Record<string, unknown>[] = await (table as any)
+          .filter("actionId != ''")
+          .limit(limit * 3)
+          .toArray();
+        return rows
+          .map((row) => ({
+            id: row.id as string,
+            text: row.text as string,
+            category: row.category as string,
+            importance: row.importance as number,
+            createdAt: row.createdAt as number,
+            source: (row.source as string) || undefined,
+            actionId: (row.actionId as string) || undefined,
+            archivistProcessed: (row.archivistProcessed as boolean) || false,
+            outcome: (row.outcome as string) || undefined,
+            outcomeSignal: (row.outcomeSignal as string) || undefined,
+            outcomeAt: (row.outcomeAt as number) || undefined,
+          }))
+          .sort((a: EpisodicEvent, b: EpisodicEvent) => b.createdAt - a.createdAt)
+          .slice(0, limit);
       },
     };
   } catch (_lanceErr) {
@@ -686,8 +767,85 @@ const oodaPlugin = {
     // C3: Structural Event Capture via after_tool_call
     // ========================================================================
 
-    // Noisy tools to skip — these fire constantly and add no structural signal
-    const NOISY_TOOLS = new Set(["read", "exec", "process", "web_search", "web_fetch", "image"]);
+    // Noisy tools to skip for structural capture — these fire constantly and add no structural signal
+    // Note: "exec" is handled specially for outcome signal detection (O2)
+    const NOISY_TOOLS = new Set(["read", "process", "web_search", "web_fetch", "image"]);
+
+    // O2: Outcome signal patterns
+    const POSITIVE_EXEC_SIGNALS = [
+      /tests? pass(ed|ing)?/i,
+      /BUILD SUCCESS/i,
+      /all \d+ tests/i,
+      /0 fail(ure|ed|ing)?s?\b/i,
+      /✓|✔|passed/i,
+    ];
+    const NEGATIVE_EXEC_SIGNALS = [
+      /FAIL(ED|URE|ING)?/i,
+      /ERR(OR)?[\s:]/i,
+      /exit code [1-9]/i,
+      /non-zero exit/i,
+      /command failed/i,
+    ];
+
+    function detectOutcomeSignal(
+      toolName: string,
+      params: Record<string, unknown>,
+      error: string | undefined,
+      result: string | undefined,
+    ): { outcome: "success" | "failure"; signal: string; detail: string } | null {
+      // exec tool: check output for test/build signals
+      if (toolName === "exec") {
+        const output = result ?? error ?? "";
+        if (!output) return null;
+
+        for (const pat of POSITIVE_EXEC_SIGNALS) {
+          if (pat.test(output)) {
+            return {
+              outcome: "success",
+              signal: /build/i.test(output) ? "build_passed" : "test_passed",
+              detail: output.slice(0, 200),
+            };
+          }
+        }
+        // Only count as failure if there's a non-zero exit or explicit FAIL
+        if (error) {
+          for (const pat of NEGATIVE_EXEC_SIGNALS) {
+            if (pat.test(output)) {
+              return {
+                outcome: "failure",
+                signal: /build/i.test(output) ? "build_failed" : "runtime_error",
+                detail: output.slice(0, 200),
+              };
+            }
+          }
+        }
+      }
+
+      // gateway tool: restart outcome
+      if (toolName === "gateway") {
+        const action = params.action as string | undefined;
+        if (action === "restart" || action === "config.apply") {
+          if (error) {
+            return { outcome: "failure", signal: "gateway_error", detail: error.slice(0, 200) };
+          }
+          return {
+            outcome: "success",
+            signal: "gateway_ok",
+            detail: `gateway ${action} succeeded`,
+          };
+        }
+      }
+
+      // cron completion
+      if (toolName === "cron") {
+        const action = params.action as string | undefined;
+        if (action === "complete" || action === "done") {
+          return { outcome: "success", signal: "cron_completed", detail: `cron task completed` };
+        }
+      }
+
+      return null;
+    }
 
     // Lazy-init episodic store for writing structural events
     let structuralStore: EpisodicStore | null | undefined;
@@ -759,12 +917,47 @@ const oodaPlugin = {
 
     api.on("after_tool_call", async (event) => {
       try {
-        if (NOISY_TOOLS.has(event.toolName)) return;
+        const store = await getStructuralStore();
+
+        // O2: Outcome signal detection — applies even to exec (which is noisy for structural)
+        const resultText =
+          typeof (event as Record<string, unknown>).result === "string"
+            ? ((event as Record<string, unknown>).result as string)
+            : typeof (event as Record<string, unknown>).output === "string"
+              ? ((event as Record<string, unknown>).output as string)
+              : undefined;
+
+        const outcomeSignal = detectOutcomeSignal(
+          event.toolName,
+          event.params,
+          event.error,
+          resultText,
+        );
+
+        if (outcomeSignal && store?.findRecentWithActionId && store.labelOutcome) {
+          try {
+            const recentDecisions = await store.findRecentWithActionId(1);
+            // Only label decisions that haven't already been labeled
+            const unlabeled = recentDecisions.find((d) => !d.outcome && d.actionId);
+            if (unlabeled?.actionId) {
+              await store.labelOutcome(unlabeled.actionId, {
+                outcome: outcomeSignal.outcome,
+                observedAt: Date.now(),
+                signal: outcomeSignal.signal,
+                detail: outcomeSignal.detail,
+              });
+            }
+          } catch (err) {
+            api.logger.warn(`memory-ooda: outcome labeling failed: ${String(err)}`);
+          }
+        }
+
+        // Structural capture — skip noisy tools (exec handled above for outcomes only)
+        if (NOISY_TOOLS.has(event.toolName) || event.toolName === "exec") return;
 
         const classified = classifyToolCall(event.toolName, event.params, event.error);
         if (!classified) return;
 
-        const store = await getStructuralStore();
         if (!store?.store) return;
 
         await store.store({

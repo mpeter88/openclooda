@@ -8,6 +8,7 @@
  * Purely async, outside the hot path. Feature-flagged off by default.
  */
 
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
@@ -28,6 +29,18 @@ export interface EpisodicEvent {
   source?: string;
   actionId?: string;
   archivistProcessed?: boolean;
+  // Outcome labeling (Tier 2 — O3)
+  outcome?: "success" | "failure" | "partial";
+  outcomeSignal?: string;
+  outcomeAt?: number;
+}
+
+/** Outcome label applied to a decision memory. */
+export interface OutcomeLabel {
+  outcome: "success" | "failure" | "partial";
+  observedAt: number;
+  signal: string;
+  detail?: string;
 }
 
 /** Abstraction over Tier 2 store for testability. */
@@ -37,6 +50,10 @@ export interface EpisodicStore {
   prune(olderThanMs: number, onlyProcessed?: boolean): Promise<number>;
   /** Optional write method — used by structural event capture (C3). */
   store?(event: Omit<EpisodicEvent, "id" | "createdAt" | "archivistProcessed">): Promise<void>;
+  /** O3: Label the outcome of a decision memory by its actionId. */
+  labelOutcome?(actionId: string, label: OutcomeLabel): Promise<void>;
+  /** O2: Find recent memories with an actionId for outcome labeling. */
+  findRecentWithActionId?(limit?: number): Promise<EpisodicEvent[]>;
 }
 
 /** Abstraction over Tier 3 store for testability. */
@@ -348,6 +365,22 @@ export function parsePatterns(raw: string): PatternExtraction[] {
 // Main Entry Point
 // ============================================================================
 
+// ============================================================================
+// O1: Decision Detection
+// ============================================================================
+
+const DECISION_KEYWORDS = /\b(decided|chose|implemented|fixed|applied|switched)\b/i;
+
+/**
+ * Heuristic: is this pattern a decision or action worth tracking for outcomes?
+ * True for lessons_learned (always), or patterns whose value contains decision verbs.
+ */
+export function isDecision(pattern: PatternExtraction): boolean {
+  if (pattern.section === "lessons_learned") return true;
+  if (typeof pattern.value === "string" && DECISION_KEYWORDS.test(pattern.value)) return true;
+  return false;
+}
+
 const DEFAULT_CONFIG: ArchivistConfig = {
   turnInterval: 100,
   pruneAfterDays: 90,
@@ -494,6 +527,62 @@ export async function runArchivist(
   // Step 3: Upsert patterns into Tier 3 (all upserts before any marking — C1)
   for (const pattern of patterns) {
     semanticStore.upsertFact(pattern.section, pattern.key, pattern.value);
+  }
+
+  // Step 3b (O1): Tag decision patterns with actionId and store into episodic backend
+  if (episodicStore.store) {
+    for (const pattern of patterns) {
+      if (isDecision(pattern)) {
+        const actionId = randomUUID();
+        try {
+          await episodicStore.store({
+            text: typeof pattern.value === "string" ? pattern.value : JSON.stringify(pattern.value),
+            importance: 0.75,
+            category: "decision",
+            source: "archivist",
+            actionId,
+          });
+        } catch {
+          // Best-effort — don't block archivist on decision tagging
+        }
+      }
+    }
+  }
+
+  // Step 3c (O5): Outcome stats — summarize outcome data into KNOWLEDGE.json
+  try {
+    const allRecent = await episodicStore.retrieveSince(0, 10_000);
+    const withOutcome = allRecent.filter((e) => e.outcome);
+    if (withOutcome.length > 0) {
+      const outcomeStats: Record<string, string> = {};
+      const successCount = withOutcome.filter((e) => e.outcome === "success").length;
+      const failureCount = withOutcome.filter((e) => e.outcome === "failure").length;
+      const partialCount = withOutcome.filter((e) => e.outcome === "partial").length;
+      const total = withOutcome.length;
+
+      if (total > 0) {
+        outcomeStats.overall_fix_rate = `${successCount}/${total} decisions succeeded (${failureCount} failed, ${partialCount} partial)`;
+      }
+
+      // Group failures by signal for recurring pattern detection
+      const failuresBySignal = new Map<string, number>();
+      for (const e of withOutcome.filter((x) => x.outcome === "failure")) {
+        const sig = e.outcomeSignal ?? "unknown";
+        failuresBySignal.set(sig, (failuresBySignal.get(sig) ?? 0) + 1);
+      }
+      for (const [signal, count] of failuresBySignal) {
+        if (count >= 2) {
+          outcomeStats[`recurring_failure_${signal}`] =
+            `${signal} failures recurred ${count} times — investigate root cause`;
+        }
+      }
+
+      for (const [key, value] of Object.entries(outcomeStats)) {
+        semanticStore.upsertFact("lessons_learned", `outcome_${key}`, value);
+      }
+    }
+  } catch {
+    // Best-effort — outcome stats are supplementary
   }
 
   // Step 4: Mark all events as processed (only after upserts succeed — C1)

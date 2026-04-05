@@ -67,6 +67,17 @@ type MemoryEntry = {
   source?: string; // "github" | "email" | "chat" | "tool_output" | "user"
   actionId?: string; // links to ExpectedOutcome for outcome tracking
   archivistProcessed?: boolean; // has the Archivist distilled this event?
+  // Outcome labeling (Tier 2 — O3)
+  outcome?: "success" | "failure" | "partial";
+  outcomeSignal?: string;
+  outcomeAt?: number;
+};
+
+type OutcomeLabel = {
+  outcome: "success" | "failure" | "partial";
+  observedAt: number;
+  signal: string;
+  detail?: string;
 };
 
 type MemorySearchResult = {
@@ -121,6 +132,9 @@ class MemoryDB {
           source: "",
           actionId: "",
           archivistProcessed: false,
+          outcome: "",
+          outcomeSignal: "",
+          outcomeAt: 0,
         },
       ]);
       await this.table.delete('id = "__schema__"');
@@ -149,7 +163,13 @@ class MemoryDB {
     const mapped = results.map((row) => {
       const distance = row._distance ?? 0;
       // Use inverse for a 0-1 range: sim = 1 / (1 + d)
-      const score = 1 / (1 + distance);
+      let score = 1 / (1 + distance);
+
+      // O4: Outcome-weighted retrieval — boost successes, suppress failures
+      const outcome = (row.outcome as string) || undefined;
+      if (outcome === "success") score *= 1.3;
+      if (outcome === "failure") score *= 0.6;
+
       return {
         entry: {
           id: row.id as string,
@@ -161,6 +181,9 @@ class MemoryDB {
           source: (row.source as string) || undefined,
           actionId: (row.actionId as string) || undefined,
           archivistProcessed: (row.archivistProcessed as boolean) || false,
+          outcome: outcome as MemoryEntry["outcome"],
+          outcomeSignal: (row.outcomeSignal as string) || undefined,
+          outcomeAt: (row.outcomeAt as number) || undefined,
         },
         score,
       };
@@ -211,8 +234,63 @@ class MemoryDB {
         source: (row.source as string) || undefined,
         actionId: (row.actionId as string) || undefined,
         archivistProcessed: (row.archivistProcessed as boolean) || false,
+        outcome: (row.outcome as string) || undefined,
+        outcomeSignal: (row.outcomeSignal as string) || undefined,
+        outcomeAt: (row.outcomeAt as number) || undefined,
       }))
-      .sort((a, b) => a.createdAt - b.createdAt);
+      .sort((a, b) => a.createdAt - b.createdAt) as MemoryEntry[];
+  }
+
+  /**
+   * O3: Label the outcome of a decision memory identified by actionId.
+   */
+  async labelOutcome(actionId: string, label: OutcomeLabel): Promise<void> {
+    await this.ensureInitialized();
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actionId)) {
+      throw new Error(`Invalid actionId format: ${actionId}`);
+    }
+    const rows = await this.table!.filter(`actionId = '${actionId}'`).toArray();
+    if (rows.length === 0) return;
+
+    const row = rows[0];
+    await this.table!.delete(`actionId = '${actionId}'`);
+    await this.table!.add([
+      {
+        ...row,
+        outcome: label.outcome,
+        outcomeSignal: label.signal,
+        outcomeAt: label.observedAt,
+      },
+    ]);
+  }
+
+  /**
+   * O2: Find recent memories that have an actionId (decision tracking).
+   */
+  async findRecentWithActionId(limit = 5): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    const rows = await this.table!.filter("actionId != ''")
+      .limit(limit * 3) // over-fetch to sort client-side
+      .toArray();
+
+    return rows
+      .map((row) => ({
+        id: row.id as string,
+        text: row.text as string,
+        vector: row.vector as number[],
+        importance: row.importance as number,
+        category: row.category as MemoryEntry["category"],
+        createdAt: row.createdAt as number,
+        source: (row.source as string) || undefined,
+        actionId: (row.actionId as string) || undefined,
+        archivistProcessed: (row.archivistProcessed as boolean) || false,
+        outcome: (row.outcome as string) || undefined,
+        outcomeSignal: (row.outcomeSignal as string) || undefined,
+        outcomeAt: (row.outcomeAt as number) || undefined,
+      }))
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, limit) as MemoryEntry[];
   }
 
   /**
@@ -225,7 +303,6 @@ class MemoryDB {
     if (!uuidRegex.test(id)) {
       throw new Error(`Invalid memory ID format: ${id}`);
     }
-    // LanceDB update: delete + re-add with updated field
     const rows = await this.table!.filter(`id = '${id}'`).toArray();
     if (rows.length === 0) return;
 
@@ -309,6 +386,19 @@ class SqliteVecMemoryDB {
       )
     `);
 
+    // O3: Schema migration — add outcome columns if not present
+    const columns = db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>;
+    const colNames = new Set(columns.map((c) => c.name));
+    if (!colNames.has("outcome")) {
+      db.exec("ALTER TABLE memories ADD COLUMN outcome TEXT");
+    }
+    if (!colNames.has("outcomeSignal")) {
+      db.exec("ALTER TABLE memories ADD COLUMN outcomeSignal TEXT");
+    }
+    if (!colNames.has("outcomeAt")) {
+      db.exec("ALTER TABLE memories ADD COLUMN outcomeAt INTEGER");
+    }
+
     db.exec(
       `CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(vector float[${this.vectorDim}])`,
     );
@@ -376,7 +466,13 @@ class SqliteVecMemoryDB {
     return rows
       .map((row) => {
         const distance = row.distance ?? 0;
-        const score = 1 / (1 + distance);
+        let score = 1 / (1 + distance);
+
+        // O4: Outcome-weighted retrieval — boost successes, suppress failures
+        const outcome = (row.outcome as string) || undefined;
+        if (outcome === "success") score *= 1.3;
+        if (outcome === "failure") score *= 0.6;
+
         return {
           entry: {
             id: row.id as string,
@@ -388,6 +484,9 @@ class SqliteVecMemoryDB {
             source: (row.source as string) || undefined,
             actionId: (row.actionId as string) || undefined,
             archivistProcessed: row.archivistProcessed === 1,
+            outcome: outcome as MemoryEntry["outcome"],
+            outcomeSignal: (row.outcomeSignal as string) || undefined,
+            outcomeAt: (row.outcomeAt as number) || undefined,
           },
           score,
         };
@@ -443,6 +542,51 @@ class SqliteVecMemoryDB {
       source: (row.source as string) || undefined,
       actionId: (row.actionId as string) || undefined,
       archivistProcessed: row.archivistProcessed === 1,
+      outcome: (row.outcome as string) || undefined,
+      outcomeSignal: (row.outcomeSignal as string) || undefined,
+      outcomeAt: (row.outcomeAt as number) || undefined,
+    }));
+  }
+
+  /**
+   * O3: Label the outcome of a decision memory identified by actionId.
+   */
+  async labelOutcome(actionId: string, label: OutcomeLabel): Promise<void> {
+    const db = await this.ensureInitialized();
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actionId)) {
+      throw new Error(`Invalid actionId format: ${actionId}`);
+    }
+    db.prepare(
+      "UPDATE memories SET outcome = ?, outcomeSignal = ?, outcomeAt = ? WHERE actionId = ?",
+    ).run(label.outcome, label.signal, label.observedAt, actionId);
+  }
+
+  /**
+   * O2: Find recent memories that have an actionId (decision tracking).
+   */
+  async findRecentWithActionId(limit = 5): Promise<MemoryEntry[]> {
+    const db = await this.ensureInitialized();
+
+    const rows = db
+      .prepare(
+        "SELECT * FROM memories WHERE actionId IS NOT NULL AND actionId != '' ORDER BY createdAt DESC LIMIT ?",
+      )
+      .all(limit) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      id: row.id as string,
+      text: row.text as string,
+      vector: [],
+      importance: row.importance as number,
+      category: row.category as MemoryCategory,
+      createdAt: row.createdAt as number,
+      source: (row.source as string) || undefined,
+      actionId: (row.actionId as string) || undefined,
+      archivistProcessed: row.archivistProcessed === 1,
+      outcome: (row.outcome as string) || undefined,
+      outcomeSignal: (row.outcomeSignal as string) || undefined,
+      outcomeAt: (row.outcomeAt as number) || undefined,
     }));
   }
 
