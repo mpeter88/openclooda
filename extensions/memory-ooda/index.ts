@@ -919,6 +919,19 @@ const oodaPlugin = {
       // Writes to cr/ or docs/ paths
       if (toolName === "write" || toolName === "edit") {
         const filePath = (params.path ?? params.file_path ?? params.filePath ?? "") as string;
+
+        // M5: Prompt mutation tracking — write/edit touching memory-ooda/*.ts
+        if (
+          /extensions\/memory-ooda\/[^/]+\.ts$/.test(filePath) ||
+          /extensions[/\\]memory-ooda[/\\][^/\\]+\.ts$/.test(filePath)
+        ) {
+          return {
+            category: "structural_event",
+            text: `prompt_mutation: ${toolName} ${filePath}`,
+            importance: 0.8,
+          };
+        }
+
         if (/^(cr|docs)\//.test(filePath) || /\/(cr|docs)\//.test(filePath)) {
           return {
             category: "structural_event",

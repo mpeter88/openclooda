@@ -1,21 +1,35 @@
-import { describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EpisodicEvent, EpisodicStore } from "./archivist.js";
 import {
   adjustWeights,
+  auditDomainOutcomes,
   buildPolicyReviewPrompt,
   calculateWeightAdjustment,
   classifyFailureSeverity,
+  convertActionsToProposals,
+  countPromptMutations,
+  detectKnowledgeGaps,
+  analyzeProposalEffectiveness,
+  generateReport,
   parseProposals,
   runMetaReviewer,
+  runWeeklyMetaReview,
   shouldTriggerPolicyReview,
-  type PrioritiesStore,
   type ProposalStore,
+  type PrioritiesStore,
+  type WeeklyAnalysisResult,
 } from "./meta-reviewer.js";
+import { createDefaultKnowledge } from "./semantic-memory.js";
 import type { ModelCallFn } from "./triage.js";
 import type {
   ActualOutcome,
   CriticalFailureEvent,
   DomainEntry,
   ExpectedOutcome,
+  KnowledgeFile,
   PolicyProposal,
   PrioritiesFile,
 } from "./types.js";
@@ -685,5 +699,425 @@ describe("runMetaReviewer", () => {
     expect(result.proposalsCreated).toHaveLength(0);
     expect(result.fromFallback).toBe(false);
     expect(callModel).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// M2: auditDomainOutcomes
+// ============================================================================
+
+function createTestEvent(overrides?: Partial<EpisodicEvent>): EpisodicEvent {
+  return {
+    id: `evt-${Math.random().toString(36).slice(2, 8)}`,
+    text: "test event about ooda archivist",
+    category: "decision",
+    importance: 0.7,
+    createdAt: Date.now() - 1000,
+    outcome: "success",
+    ...overrides,
+  };
+}
+
+describe("auditDomainOutcomes", () => {
+  it("calculates per-domain success rates", () => {
+    const events: EpisodicEvent[] = [
+      createTestEvent({ text: "amf pipeline deploy", outcome: "success" }),
+      createTestEvent({
+        text: "amf pipeline test",
+        outcome: "failure",
+        outcomeSignal: "test_fail",
+      }),
+      createTestEvent({ text: "amf pipeline build", outcome: "success" }),
+      createTestEvent({ text: "ooda triage fix", outcome: "success" }),
+    ];
+
+    const audits = auditDomainOutcomes(events);
+    const amf = audits.find((a) => a.domain === "amf_pipeline");
+    expect(amf).toBeDefined();
+    expect(amf!.decisions).toBe(3);
+    expect(amf!.successRate).toBeCloseTo(2 / 3);
+  });
+
+  it("returns top failure modes sorted by count", () => {
+    const events: EpisodicEvent[] = [
+      createTestEvent({ text: "amf pipeline", outcome: "failure", outcomeSignal: "timeout" }),
+      createTestEvent({ text: "amf pipeline", outcome: "failure", outcomeSignal: "timeout" }),
+      createTestEvent({ text: "amf pipeline", outcome: "failure", outcomeSignal: "oom" }),
+    ];
+
+    const audits = auditDomainOutcomes(events);
+    const amf = audits.find((a) => a.domain === "amf_pipeline");
+    expect(amf!.topFailureModes[0].signal).toBe("timeout");
+    expect(amf!.topFailureModes[0].count).toBe(2);
+  });
+
+  it("returns empty array for events with no outcomes", () => {
+    const events: EpisodicEvent[] = [createTestEvent({ outcome: undefined })];
+    expect(auditDomainOutcomes(events)).toHaveLength(0);
+  });
+
+  it("recommends review for low success rate with enough data", () => {
+    const events: EpisodicEvent[] = Array.from({ length: 6 }, () =>
+      createTestEvent({ text: "amf pipeline", outcome: "failure" }),
+    );
+    const audits = auditDomainOutcomes(events);
+    expect(audits[0].recommendation).toContain("review strategy");
+  });
+});
+
+// ============================================================================
+// M2: detectKnowledgeGaps
+// ============================================================================
+
+describe("detectKnowledgeGaps", () => {
+  it("finds domains with many episodic events but few KNOWLEDGE entries", () => {
+    const knowledge = createDefaultKnowledge();
+    // No amf-related entries in KNOWLEDGE.json
+    const events: EpisodicEvent[] = Array.from({ length: 5 }, (_, i) =>
+      createTestEvent({ text: `amf pipeline task ${i}` }),
+    );
+
+    const gaps = detectKnowledgeGaps(knowledge, events, 3);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].domain).toBe("amf_pipeline");
+    expect(gaps[0].knowledgeEntries).toBe(0);
+    expect(gaps[0].recentEpisodicCount).toBe(5);
+  });
+
+  it("does not flag domains with sufficient KNOWLEDGE entries", () => {
+    const knowledge = createDefaultKnowledge();
+    knowledge.domain_context = {
+      amf_pipeline_arch: "module-based",
+      amf_deploy_pattern: "blue-green",
+      amf_test_strategy: "integration-heavy",
+    };
+    const events: EpisodicEvent[] = Array.from({ length: 5 }, (_, i) =>
+      createTestEvent({ text: `amf pipeline task ${i}` }),
+    );
+
+    const gaps = detectKnowledgeGaps(knowledge, events, 3);
+    expect(gaps).toHaveLength(0);
+  });
+
+  it("ignores unknown-domain events", () => {
+    const knowledge = createDefaultKnowledge();
+    const events: EpisodicEvent[] = Array.from({ length: 10 }, () =>
+      createTestEvent({ text: "generic task with no domain keywords" }),
+    );
+
+    const gaps = detectKnowledgeGaps(knowledge, events, 3);
+    expect(gaps).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// M2: analyzeProposalEffectiveness
+// ============================================================================
+
+describe("analyzeProposalEffectiveness", () => {
+  it("counts proposal statuses correctly", () => {
+    const proposals: PolicyProposal[] = [
+      {
+        id: "1",
+        timestamp: "",
+        rule: "",
+        proposal: "",
+        reasoning: "",
+        evidence: ["a", "b"],
+        status: "approved",
+        category: "policy",
+        confidence: 1,
+        autoGenerated: false,
+      },
+      {
+        id: "2",
+        timestamp: "",
+        rule: "",
+        proposal: "",
+        reasoning: "",
+        evidence: ["a"],
+        status: "rejected",
+        category: "policy",
+        confidence: 1,
+        autoGenerated: false,
+      },
+      {
+        id: "3",
+        timestamp: "",
+        rule: "",
+        proposal: "",
+        reasoning: "",
+        evidence: [],
+        status: "pending",
+        category: "policy",
+        confidence: 1,
+        autoGenerated: false,
+      },
+    ];
+
+    const result = analyzeProposalEffectiveness(proposals);
+    expect(result.total).toBe(3);
+    expect(result.approved).toBe(1);
+    expect(result.rejected).toBe(1);
+    expect(result.pending).toBe(1);
+    expect(result.approvedWithOutcomeData).toBe(1);
+  });
+
+  it("handles empty proposal list", () => {
+    const result = analyzeProposalEffectiveness([]);
+    expect(result.total).toBe(0);
+    expect(result.approved).toBe(0);
+  });
+});
+
+// ============================================================================
+// M5: countPromptMutations
+// ============================================================================
+
+describe("countPromptMutations", () => {
+  it("counts prompt_mutation structural events", () => {
+    const events: EpisodicEvent[] = [
+      createTestEvent({
+        category: "structural_event",
+        text: "prompt_mutation: edit extensions/memory-ooda/triage.ts",
+      }),
+      createTestEvent({
+        category: "structural_event",
+        text: "prompt_mutation: write extensions/memory-ooda/strategy.ts",
+      }),
+      createTestEvent({ category: "structural_event", text: "knowledge_write: edit cr/STATUS.md" }),
+      createTestEvent({ category: "decision", text: "some decision" }),
+    ];
+
+    expect(countPromptMutations(events)).toBe(2);
+  });
+
+  it("returns 0 when no prompt mutations exist", () => {
+    const events: EpisodicEvent[] = [
+      createTestEvent({ category: "structural_event", text: "knowledge_write: edit cr/STATUS.md" }),
+    ];
+    expect(countPromptMutations(events)).toBe(0);
+  });
+});
+
+// ============================================================================
+// M3: generateReport
+// ============================================================================
+
+describe("generateReport", () => {
+  it("generates valid markdown with all sections", () => {
+    const analysis: WeeklyAnalysisResult = {
+      date: "2026-04-05",
+      domainAudits: [
+        {
+          domain: "amf_pipeline",
+          decisions: 10,
+          successRate: 0.7,
+          topFailureModes: [{ signal: "timeout", count: 2 }],
+          recommendation: "monitor — moderate success rate",
+        },
+      ],
+      knowledgeGaps: [
+        {
+          domain: "testing",
+          knowledgeEntries: 1,
+          recentEpisodicCount: 8,
+          recommendation: "Promote testing episodic memories",
+        },
+      ],
+      proposalEffectiveness: {
+        total: 5,
+        approved: 3,
+        rejected: 1,
+        pending: 1,
+        approvedWithOutcomeData: 2,
+      },
+      promptMutations: 1,
+      recommendedActions: ["Review testing strategy", "Check prompt mutation correlation"],
+      reportPath: "/tmp/test-report.md",
+    };
+
+    const report = generateReport(analysis);
+    expect(report).toContain("# Meta-Review 2026-04-05");
+    expect(report).toContain("## Outcome Audit");
+    expect(report).toContain("### amf_pipeline");
+    expect(report).toContain("70% success rate");
+    expect(report).toContain("## Knowledge Gaps");
+    expect(report).toContain("testing");
+    expect(report).toContain("## Proposal Effectiveness");
+    expect(report).toContain("3 approved");
+    expect(report).toContain("## Prompt Mutations");
+    expect(report).toContain("## Recommended Actions");
+    expect(report).toContain("1. [ ]");
+  });
+
+  it("handles empty analysis gracefully", () => {
+    const analysis: WeeklyAnalysisResult = {
+      date: "2026-04-05",
+      domainAudits: [],
+      knowledgeGaps: [],
+      proposalEffectiveness: {
+        total: 0,
+        approved: 0,
+        rejected: 0,
+        pending: 0,
+        approvedWithOutcomeData: 0,
+      },
+      promptMutations: 0,
+      recommendedActions: [],
+      reportPath: "/tmp/test-report.md",
+    };
+
+    const report = generateReport(analysis);
+    expect(report).toContain("No outcome data available.");
+    expect(report).toContain("No significant knowledge gaps detected.");
+    expect(report).toContain("No actions recommended");
+    expect(report).not.toContain("## Prompt Mutations");
+  });
+});
+
+// ============================================================================
+// M4: convertActionsToProposals
+// ============================================================================
+
+describe("convertActionsToProposals", () => {
+  it("creates proposals from recommended actions", () => {
+    const store = createMockProposalStore();
+    const actions = ["Fix triage scoring", "Add domain context for testing"];
+
+    const created = convertActionsToProposals("/tmp/test", actions, store);
+
+    expect(created).toHaveLength(2);
+    expect(created[0].status).toBe("pending");
+    expect(created[0].category).toBe("workflow");
+    expect(created[0].autoGenerated).toBe(true);
+    expect(store.proposals).toHaveLength(2);
+  });
+
+  it("handles empty actions list", () => {
+    const store = createMockProposalStore();
+    const created = convertActionsToProposals("/tmp/test", [], store);
+    expect(created).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// M1: runWeeklyMetaReview
+// ============================================================================
+
+describe("runWeeklyMetaReview", () => {
+  let testDir: string;
+
+  beforeEach(() => {
+    testDir = join(tmpdir(), `meta-review-test-${Date.now()}`);
+    mkdirSync(testDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    if (existsSync(testDir)) {
+      rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
+  function createMockEpisodicStore(events: EpisodicEvent[]): EpisodicStore {
+    return {
+      async retrieveSince() {
+        return events;
+      },
+      async markProcessed() {},
+      async prune() {
+        return 0;
+      },
+    };
+  }
+
+  it("runs full analysis and writes report to disk", async () => {
+    const events: EpisodicEvent[] = [
+      createTestEvent({ text: "amf pipeline deploy", outcome: "success" }),
+      createTestEvent({
+        text: "amf pipeline test",
+        outcome: "failure",
+        outcomeSignal: "test_fail",
+      }),
+      createTestEvent({ text: "ooda triage run", outcome: "success" }),
+    ];
+    const store = createMockEpisodicStore(events);
+    const knowledge = createDefaultKnowledge();
+    const proposals: PolicyProposal[] = [];
+
+    const result = await runWeeklyMetaReview(testDir, store, knowledge, proposals, null);
+
+    expect(result.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(result.domainAudits.length).toBeGreaterThan(0);
+    expect(result.reportPath).toContain("meta-review/");
+    expect(existsSync(result.reportPath)).toBe(true);
+
+    const report = readFileSync(result.reportPath, "utf-8");
+    expect(report).toContain("# Meta-Review");
+    expect(report).toContain("## Outcome Audit");
+  });
+
+  it("correctly calculates domain success rates from episodic data", async () => {
+    const events: EpisodicEvent[] = [
+      createTestEvent({ text: "amf pipeline task 1", outcome: "success" }),
+      createTestEvent({ text: "amf pipeline task 2", outcome: "success" }),
+      createTestEvent({ text: "amf pipeline task 3", outcome: "failure" }),
+    ];
+    const store = createMockEpisodicStore(events);
+
+    const result = await runWeeklyMetaReview(testDir, store, createDefaultKnowledge(), [], null);
+
+    const amf = result.domainAudits.find((a) => a.domain === "amf_pipeline");
+    expect(amf).toBeDefined();
+    expect(amf!.successRate).toBeCloseTo(2 / 3);
+  });
+
+  it("detects knowledge gaps", async () => {
+    const events: EpisodicEvent[] = Array.from({ length: 5 }, (_, i) =>
+      createTestEvent({ text: `amf pipeline task ${i}` }),
+    );
+    const store = createMockEpisodicStore(events);
+    const knowledge = createDefaultKnowledge();
+
+    const result = await runWeeklyMetaReview(testDir, store, knowledge, [], null);
+
+    expect(result.knowledgeGaps.length).toBeGreaterThan(0);
+    expect(result.knowledgeGaps[0].domain).toBe("amf_pipeline");
+  });
+
+  it("writes recommended actions from gaps and low success rates", async () => {
+    const events: EpisodicEvent[] = [
+      ...Array.from({ length: 5 }, (_, i) => createTestEvent({ text: `amf pipeline task ${i}` })),
+      ...Array.from({ length: 5 }, () =>
+        createTestEvent({ text: "amf pipeline failure", outcome: "failure" }),
+      ),
+    ];
+    const store = createMockEpisodicStore(events);
+
+    const result = await runWeeklyMetaReview(testDir, store, createDefaultKnowledge(), [], null);
+
+    expect(result.recommendedActions.length).toBeGreaterThan(0);
+  });
+
+  it("generates proposals from recommended actions when createProposals is true", async () => {
+    const events: EpisodicEvent[] = Array.from({ length: 5 }, (_, i) =>
+      createTestEvent({ text: `amf pipeline task ${i}` }),
+    );
+    const store = createMockEpisodicStore(events);
+    const propStore = createMockProposalStore();
+
+    const result = await runWeeklyMetaReview(
+      testDir,
+      store,
+      createDefaultKnowledge(),
+      [],
+      propStore,
+      { createProposals: true },
+    );
+
+    // Should have created proposals for the knowledge gap recommendation
+    if (result.recommendedActions.length > 0) {
+      expect(propStore.proposals.length).toBe(result.recommendedActions.length);
+    }
   });
 });

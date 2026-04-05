@@ -16,12 +16,22 @@
  */
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import {
+  aggregateDomainOutcomes,
+  inferDomain,
+  type EpisodicEvent,
+  type EpisodicStore,
+} from "./archivist.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import type { ModelCallFn } from "./triage.js";
 import type {
   ActualOutcome,
   CriticalFailureEvent,
   DomainEntry,
+  DomainOutcomeStats,
+  KnowledgeFile,
   PolicyProposal,
   PrioritiesFile,
 } from "./types.js";
@@ -368,4 +378,412 @@ export async function runMetaReviewer(
     fromFallback,
     lastError: lastError ? errorMessage(lastError) : undefined,
   };
+}
+
+// ============================================================================
+// M2: Weekly Analysis Passes
+// ============================================================================
+
+/** Result of Pass 1: per-domain outcome audit. */
+export interface DomainAudit {
+  domain: string;
+  decisions: number;
+  successRate: number;
+  topFailureModes: Array<{ signal: string; count: number }>;
+  recommendation: string;
+}
+
+/** Result of Pass 3: knowledge gap. */
+export interface KnowledgeGap {
+  domain: string;
+  knowledgeEntries: number;
+  recentEpisodicCount: number;
+  recommendation: string;
+}
+
+/** Result of Pass 4: proposal effectiveness. */
+export interface ProposalEffectiveness {
+  total: number;
+  approved: number;
+  rejected: number;
+  pending: number;
+  /** Approved proposals that had subsequent outcome data. */
+  approvedWithOutcomeData: number;
+}
+
+/** Full weekly analysis result (M2 + M3). */
+export interface WeeklyAnalysisResult {
+  date: string;
+  domainAudits: DomainAudit[];
+  knowledgeGaps: KnowledgeGap[];
+  proposalEffectiveness: ProposalEffectiveness;
+  promptMutations: number;
+  recommendedActions: string[];
+  reportPath: string;
+}
+
+/**
+ * Pass 1 — Outcome audit: per-domain success rates and failure modes.
+ */
+export function auditDomainOutcomes(events: EpisodicEvent[]): DomainAudit[] {
+  const stats = aggregateDomainOutcomes(events);
+  const audits: DomainAudit[] = [];
+
+  for (const s of stats) {
+    // Collect failure signals for this domain
+    const domainEvents = events.filter(
+      (e) => e.outcome === "failure" && inferDomain(e.text) === s.domain,
+    );
+    const signalCounts = new Map<string, number>();
+    for (const e of domainEvents) {
+      const sig = e.outcomeSignal ?? "unknown";
+      signalCounts.set(sig, (signalCounts.get(sig) ?? 0) + 1);
+    }
+    const topFailureModes = [...signalCounts.entries()]
+      .map(([signal, count]) => ({ signal, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 3);
+
+    let recommendation: string;
+    if (s.decisions < 3) {
+      recommendation = "insufficient data";
+    } else if (s.successRate >= 0.8) {
+      recommendation = "no change";
+    } else if (s.successRate >= 0.5) {
+      recommendation = "monitor — moderate success rate";
+    } else {
+      recommendation = "review strategy — low success rate";
+    }
+
+    audits.push({
+      domain: s.domain,
+      decisions: s.decisions,
+      successRate: s.successRate,
+      topFailureModes,
+      recommendation,
+    });
+  }
+
+  return audits;
+}
+
+/**
+ * Pass 3 — Knowledge gap detection: domains with < threshold KNOWLEDGE.json entries
+ * but many episodic memories.
+ */
+export function detectKnowledgeGaps(
+  knowledge: KnowledgeFile,
+  events: EpisodicEvent[],
+  minEntries: number = 3,
+): KnowledgeGap[] {
+  // Count episodic events per domain
+  const domainEventCounts = new Map<string, number>();
+  for (const e of events) {
+    const domain = inferDomain(e.text);
+    if (domain === "unknown") continue;
+    domainEventCounts.set(domain, (domainEventCounts.get(domain) ?? 0) + 1);
+  }
+
+  // Count KNOWLEDGE.json entries per domain by scanning projects + domain_context + lessons_learned
+  const domainKnowledgeCounts = new Map<string, number>();
+  for (const [key] of Object.entries(knowledge.projects ?? {})) {
+    const domain = inferDomain(key);
+    if (domain !== "unknown") {
+      domainKnowledgeCounts.set(domain, (domainKnowledgeCounts.get(domain) ?? 0) + 1);
+    }
+  }
+  for (const [key] of Object.entries(knowledge.domain_context ?? {})) {
+    const domain = inferDomain(key);
+    if (domain !== "unknown") {
+      domainKnowledgeCounts.set(domain, (domainKnowledgeCounts.get(domain) ?? 0) + 1);
+    }
+  }
+  for (const [key] of Object.entries(knowledge.lessons_learned ?? {})) {
+    const domain = inferDomain(key);
+    if (domain !== "unknown") {
+      domainKnowledgeCounts.set(domain, (domainKnowledgeCounts.get(domain) ?? 0) + 1);
+    }
+  }
+
+  const gaps: KnowledgeGap[] = [];
+  for (const [domain, episodicCount] of domainEventCounts) {
+    const knowledgeCount = domainKnowledgeCounts.get(domain) ?? 0;
+    if (knowledgeCount < minEntries && episodicCount >= minEntries) {
+      gaps.push({
+        domain,
+        knowledgeEntries: knowledgeCount,
+        recentEpisodicCount: episodicCount,
+        recommendation: `Promote ${domain} episodic memories to KNOWLEDGE.json (${knowledgeCount} entries, ${episodicCount} recent memories)`,
+      });
+    }
+  }
+
+  return gaps.sort((a, b) => b.recentEpisodicCount - a.recentEpisodicCount);
+}
+
+/**
+ * Pass 4 — Proposal effectiveness: analyze approval/rejection rates.
+ */
+export function analyzeProposalEffectiveness(proposals: PolicyProposal[]): ProposalEffectiveness {
+  const approved = proposals.filter((p) => p.status === "approved").length;
+  const rejected = proposals.filter((p) => p.status === "rejected").length;
+  const pending = proposals.filter((p) => p.status === "pending").length;
+
+  // Count approved proposals that have some outcome correlation
+  // (presence of evidence array with 2+ items as a proxy)
+  const approvedWithOutcomeData = proposals.filter(
+    (p) => p.status === "approved" && p.evidence.length >= 2,
+  ).length;
+
+  return {
+    total: proposals.length,
+    approved,
+    rejected,
+    pending,
+    approvedWithOutcomeData,
+  };
+}
+
+/**
+ * Count prompt mutation events in episodic history.
+ * Prompt mutations are structural events where write/edit touched memory-ooda/*.ts files.
+ */
+export function countPromptMutations(events: EpisodicEvent[]): number {
+  return events.filter(
+    (e) => e.category === "structural_event" && e.text.includes("prompt_mutation:"),
+  ).length;
+}
+
+// ============================================================================
+// M3: Report Generation
+// ============================================================================
+
+/**
+ * Format a domain audit into markdown.
+ */
+function formatDomainAudit(audit: DomainAudit): string {
+  const successPct = (audit.successRate * 100).toFixed(0);
+  const lines = [
+    `### ${audit.domain}`,
+    ``,
+    `- ${audit.decisions} decisions, ${successPct}% success rate`,
+  ];
+  if (audit.topFailureModes.length > 0) {
+    const modes = audit.topFailureModes.map((m) => `${m.signal} (${m.count})`).join(", ");
+    lines.push(`- Top failure modes: ${modes}`);
+  }
+  lines.push(`- Recommendation: ${audit.recommendation}`);
+  return lines.join("\n");
+}
+
+/**
+ * Generate the full meta-review markdown report (M3).
+ */
+export function generateReport(analysis: WeeklyAnalysisResult): string {
+  const lines: string[] = [];
+
+  lines.push(`# Meta-Review ${analysis.date}`);
+  lines.push("");
+
+  // Outcome Audit
+  lines.push("## Outcome Audit");
+  lines.push("");
+  if (analysis.domainAudits.length === 0) {
+    lines.push("No outcome data available.");
+  } else {
+    for (const audit of analysis.domainAudits) {
+      lines.push(formatDomainAudit(audit));
+      lines.push("");
+    }
+  }
+
+  // Knowledge Gaps
+  lines.push("## Knowledge Gaps");
+  lines.push("");
+  if (analysis.knowledgeGaps.length === 0) {
+    lines.push("No significant knowledge gaps detected.");
+  } else {
+    for (const gap of analysis.knowledgeGaps) {
+      lines.push(
+        `- ${gap.domain}: ${gap.knowledgeEntries} KNOWLEDGE.json entries, ${gap.recentEpisodicCount} recent episodic memories — should promote`,
+      );
+    }
+  }
+  lines.push("");
+
+  // Proposal Effectiveness
+  lines.push("## Proposal Effectiveness");
+  lines.push("");
+  const pe = analysis.proposalEffectiveness;
+  lines.push(
+    `- ${pe.total} proposals total: ${pe.approved} approved, ${pe.rejected} rejected, ${pe.pending} pending`,
+  );
+  if (pe.approved > 0) {
+    lines.push(
+      `- ${pe.approvedWithOutcomeData}/${pe.approved} approved proposals have outcome correlation data`,
+    );
+  }
+  lines.push(`- No outcome data for rejected proposals (M6 gap)`);
+  lines.push("");
+
+  // Prompt Mutations
+  if (analysis.promptMutations > 0) {
+    lines.push("## Prompt Mutations");
+    lines.push("");
+    lines.push(`- ${analysis.promptMutations} prompt mutation event(s) detected in review window`);
+    lines.push("");
+  }
+
+  // Recommended Actions
+  lines.push("## Recommended Actions");
+  lines.push("");
+  if (analysis.recommendedActions.length === 0) {
+    lines.push("No actions recommended at this time.");
+  } else {
+    for (let i = 0; i < analysis.recommendedActions.length; i++) {
+      lines.push(`${i + 1}. [ ] ${analysis.recommendedActions[i]}`);
+    }
+  }
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+// ============================================================================
+// M4: Convert Recommended Actions to Proposals
+// ============================================================================
+
+/**
+ * Convert meta-review recommended actions into PolicyProposals.
+ * Returns the number of proposals created.
+ */
+export function convertActionsToProposals(
+  workspacePath: string,
+  actions: string[],
+  proposalStore: ProposalStore,
+): PolicyProposal[] {
+  const created: PolicyProposal[] = [];
+  const now = new Date().toISOString();
+
+  for (let i = 0; i < actions.length; i++) {
+    const proposal = proposalStore.addProposal({
+      id: `meta-review-${Date.now()}-${i}`,
+      timestamp: now,
+      rule: "meta_review",
+      proposal: actions[i],
+      reasoning: "Generated by weekly meta-review analysis",
+      evidence: [`meta-review-${now}`],
+      category: "workflow",
+      confidence: 0.7,
+      autoGenerated: true,
+    });
+    created.push(proposal);
+  }
+
+  return created;
+}
+
+// ============================================================================
+// M1: Weekly Meta-Review Entry Point
+// ============================================================================
+
+/** Configuration for a weekly meta-review run. */
+export interface WeeklyMetaReviewConfig {
+  /** Days of episodic history to analyze. Default: 30 */
+  windowDays: number;
+  /** Minimum KNOWLEDGE.json entries before a domain is flagged as a gap. Default: 3 */
+  minKnowledgeEntries: number;
+  /** Whether to convert recommended actions to proposals. Default: false */
+  createProposals: boolean;
+}
+
+const DEFAULT_WEEKLY_CONFIG: WeeklyMetaReviewConfig = {
+  windowDays: 30,
+  minKnowledgeEntries: 3,
+  createProposals: false,
+};
+
+/**
+ * Run the full weekly meta-review analysis (M1-M4).
+ *
+ * Inputs:
+ * - Episodic events from the last N days (Tier 2)
+ * - KNOWLEDGE.json current state
+ * - Proposal history
+ *
+ * Outputs:
+ * - `meta-review/YYYY-MM-DD.md` report
+ * - Optionally converts actions to proposals (M4)
+ */
+export async function runWeeklyMetaReview(
+  workspacePath: string,
+  episodicStore: EpisodicStore,
+  knowledge: KnowledgeFile,
+  proposals: PolicyProposal[],
+  proposalStore: ProposalStore | null,
+  config?: Partial<WeeklyMetaReviewConfig>,
+): Promise<WeeklyAnalysisResult> {
+  const cfg = { ...DEFAULT_WEEKLY_CONFIG, ...config };
+  const windowMs = cfg.windowDays * 24 * 60 * 60 * 1000;
+  const sinceTimestamp = Date.now() - windowMs;
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Retrieve episodic events from the window
+  const events = await episodicStore.retrieveSince(sinceTimestamp, 10_000);
+
+  // Pass 1: Outcome audit
+  const domainAudits = auditDomainOutcomes(events);
+
+  // Pass 3: Knowledge gaps
+  const knowledgeGaps = detectKnowledgeGaps(knowledge, events, cfg.minKnowledgeEntries);
+
+  // Pass 4: Proposal effectiveness
+  const proposalEffectiveness = analyzeProposalEffectiveness(proposals);
+
+  // M5: Count prompt mutations
+  const promptMutations = countPromptMutations(events);
+
+  // Build recommended actions from analysis
+  const recommendedActions: string[] = [];
+
+  for (const gap of knowledgeGaps) {
+    recommendedActions.push(gap.recommendation);
+  }
+
+  for (const audit of domainAudits) {
+    if (audit.successRate < 0.5 && audit.decisions >= 5) {
+      recommendedActions.push(
+        `Review ${audit.domain} strategy — ${(audit.successRate * 100).toFixed(0)}% success rate across ${audit.decisions} decisions`,
+      );
+    }
+  }
+
+  if (promptMutations > 0) {
+    recommendedActions.push(`Review ${promptMutations} prompt mutation(s) for outcome correlation`);
+  }
+
+  // Write report to meta-review/YYYY-MM-DD.md
+  const reportDir = path.join(workspacePath, "meta-review");
+  fs.mkdirSync(reportDir, { recursive: true });
+  const reportPath = path.join(reportDir, `${today}.md`);
+
+  const result: WeeklyAnalysisResult = {
+    date: today,
+    domainAudits,
+    knowledgeGaps,
+    proposalEffectiveness,
+    promptMutations,
+    recommendedActions,
+    reportPath,
+  };
+
+  const reportContent = generateReport(result);
+  fs.writeFileSync(reportPath, reportContent, "utf-8");
+
+  // M4: Optionally convert actions to proposals
+  if (cfg.createProposals && proposalStore && recommendedActions.length > 0) {
+    convertActionsToProposals(workspacePath, recommendedActions, proposalStore);
+  }
+
+  return result;
 }
