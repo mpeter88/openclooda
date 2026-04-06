@@ -137,6 +137,7 @@ async function main() {
   console.log(`  Domain audits: ${result.domainAudits.length}`);
   console.log(`  Knowledge gaps: ${result.knowledgeGaps.length}`);
   console.log(`  Prompt mutations: ${result.promptMutations}`);
+  console.log(`  SITREP drift days: ${result.sitrepDrift.length}`);
   console.log(`  Recommended actions: ${result.recommendedActions.length}`);
 
   if (result.recommendedActions.length > 0) {

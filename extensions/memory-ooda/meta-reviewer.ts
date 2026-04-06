@@ -25,6 +25,7 @@ import {
   type EpisodicStore,
 } from "./archivist.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
+import { readSitrepLog, type SitrepLogEntry } from "./sitrep-log.js";
 import type { ModelCallFn } from "./triage.js";
 import type {
   ActualOutcome,
@@ -420,6 +421,22 @@ export interface ProposalEffectiveness {
   rejectionReasonGroups: RejectionReasonGroup[];
 }
 
+/** SITREP drift summary for a session or day. */
+export interface SitrepDriftSummary {
+  /** Date of the log entries */
+  date: string;
+  /** Total SITREP entries analyzed */
+  entryCount: number;
+  /** Priority range: [min, max] */
+  priorityRange: [number, number];
+  /** Average priority across entries */
+  avgPriority: number;
+  /** Number of entries with an attention directive */
+  attentionCount: number;
+  /** Distinct attention directives issued */
+  attentionDirectives: string[];
+}
+
 /** Full weekly analysis result (M2 + M3). */
 export interface WeeklyAnalysisResult {
   date: string;
@@ -427,6 +444,7 @@ export interface WeeklyAnalysisResult {
   knowledgeGaps: KnowledgeGap[];
   proposalEffectiveness: ProposalEffectiveness;
   promptMutations: number;
+  sitrepDrift: SitrepDriftSummary[];
   recommendedActions: string[];
   reportPath: string;
 }
@@ -577,6 +595,50 @@ export function countPromptMutations(events: EpisodicEvent[]): number {
 }
 
 // ============================================================================
+// S3: SITREP Drift Analysis
+// ============================================================================
+
+/**
+ * Analyze SITREP log entries for a time window to detect priority drift
+ * and attention directive patterns.
+ */
+export function analyzeSitrepDrift(
+  workspacePath: string,
+  windowDays: number,
+): SitrepDriftSummary[] {
+  const summaries: SitrepDriftSummary[] = [];
+  const today = new Date();
+
+  for (let i = 0; i < windowDays; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().slice(0, 10);
+    const entries = readSitrepLog(workspacePath, dateStr);
+
+    if (entries.length === 0) continue;
+
+    const priorities = entries.map((e) => e.priority);
+    const minP = Math.min(...priorities);
+    const maxP = Math.max(...priorities);
+    const avgP = priorities.reduce((a, b) => a + b, 0) / priorities.length;
+
+    const withAttention = entries.filter((e) => e.attention !== null);
+    const directives = [...new Set(withAttention.map((e) => e.attention!))];
+
+    summaries.push({
+      date: dateStr,
+      entryCount: entries.length,
+      priorityRange: [minP, maxP],
+      avgPriority: Math.round(avgP * 10) / 10,
+      attentionCount: withAttention.length,
+      attentionDirectives: directives,
+    });
+  }
+
+  return summaries;
+}
+
+// ============================================================================
 // M3: Report Generation
 // ============================================================================
 
@@ -660,6 +722,21 @@ export function generateReport(analysis: WeeklyAnalysisResult): string {
     lines.push("## Prompt Mutations");
     lines.push("");
     lines.push(`- ${analysis.promptMutations} prompt mutation event(s) detected in review window`);
+    lines.push("");
+  }
+
+  // SITREP Drift (S3)
+  if (analysis.sitrepDrift.length > 0) {
+    lines.push("## SITREP Drift Analysis");
+    lines.push("");
+    for (const day of analysis.sitrepDrift) {
+      lines.push(
+        `- **${day.date}**: ${day.entryCount} SITREPs, priority ${day.priorityRange[0]}-${day.priorityRange[1]} (avg ${day.avgPriority}), ${day.attentionCount} attention directive(s)`,
+      );
+      for (const dir of day.attentionDirectives) {
+        lines.push(`  - "${dir}"`);
+      }
+    }
     lines.push("");
   }
 
@@ -772,6 +849,9 @@ export async function runWeeklyMetaReview(
   // M5: Count prompt mutations
   const promptMutations = countPromptMutations(events);
 
+  // S3: SITREP drift analysis
+  const sitrepDrift = analyzeSitrepDrift(workspacePath, cfg.windowDays);
+
   // Build recommended actions from analysis
   const recommendedActions: string[] = [];
 
@@ -791,6 +871,15 @@ export async function runWeeklyMetaReview(
     recommendedActions.push(`Review ${promptMutations} prompt mutation(s) for outcome correlation`);
   }
 
+  // S3: Flag SITREP drift patterns
+  for (const day of sitrepDrift) {
+    if (day.priorityRange[1] - day.priorityRange[0] >= 5 && day.entryCount >= 3) {
+      recommendedActions.push(
+        `SITREP priority swung ${day.priorityRange[0]}-${day.priorityRange[1]} on ${day.date} (${day.entryCount} entries) — review triage calibration`,
+      );
+    }
+  }
+
   // Write report to meta-review/YYYY-MM-DD.md
   const reportDir = path.join(workspacePath, "meta-review");
   fs.mkdirSync(reportDir, { recursive: true });
@@ -802,6 +891,7 @@ export async function runWeeklyMetaReview(
     knowledgeGaps,
     proposalEffectiveness,
     promptMutations,
+    sitrepDrift,
     recommendedActions,
     reportPath,
   };

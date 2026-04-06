@@ -40,6 +40,7 @@ import {
   wakeSync,
   evaluateDispatch,
 } from "./task-bridge.js";
+import { appendSitrepLog } from "./sitrep-log.js";
 import { runTriage, shouldRunFullOODA, type ModelCallFn } from "./triage.js";
 
 // ============================================================================
@@ -548,6 +549,18 @@ const oodaPlugin = {
           );
 
           const sitrep = triageResult.sitrep;
+
+          // S1: Persist SITREP to daily JSONL log
+          try {
+            appendSitrepLog(
+              workspacePath,
+              sitrep,
+              ctx?.sessionKey ?? `anon-${Date.now()}`,
+              thinkingLevel,
+            );
+          } catch (logErr) {
+            api.logger.warn(`memory-ooda: failed to write sitrep log: ${String(logErr)}`);
+          }
 
           // Format SITREP — attention field bolded at top when present
           const sitrepLines: string[] = [];

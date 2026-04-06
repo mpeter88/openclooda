@@ -934,6 +934,16 @@ describe("generateReport", () => {
         rejectionReasonGroups: [{ reason: "too broad", count: 1, proposalIds: ["p1"] }],
       },
       promptMutations: 1,
+      sitrepDrift: [
+        {
+          date: "2026-04-05",
+          entryCount: 4,
+          priorityRange: [3, 8] as [number, number],
+          avgPriority: 5.5,
+          attentionCount: 2,
+          attentionDirectives: ["Focus on blockers", "Skip theory, go to cause"],
+        },
+      ],
       recommendedActions: ["Review testing strategy", "Check prompt mutation correlation"],
       reportPath: "/tmp/test-report.md",
     };
@@ -948,6 +958,9 @@ describe("generateReport", () => {
     expect(report).toContain("## Proposal Effectiveness");
     expect(report).toContain("3 approved");
     expect(report).toContain("## Prompt Mutations");
+    expect(report).toContain("## SITREP Drift Analysis");
+    expect(report).toContain("priority 3-8");
+    expect(report).toContain("Focus on blockers");
     expect(report).toContain("## Recommended Actions");
     expect(report).toContain("1. [ ]");
   });
@@ -966,6 +979,7 @@ describe("generateReport", () => {
         rejectionReasonGroups: [],
       },
       promptMutations: 0,
+      sitrepDrift: [],
       recommendedActions: [],
       reportPath: "/tmp/test-report.md",
     };
@@ -975,6 +989,7 @@ describe("generateReport", () => {
     expect(report).toContain("No significant knowledge gaps detected.");
     expect(report).toContain("No actions recommended");
     expect(report).not.toContain("## Prompt Mutations");
+    expect(report).not.toContain("## SITREP Drift Analysis");
   });
 });
 
