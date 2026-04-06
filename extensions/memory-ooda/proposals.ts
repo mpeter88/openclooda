@@ -112,6 +112,34 @@ export function updateProposalStatus(
 }
 
 /**
+ * Dismiss (reject) a proposal with a reason.
+ * Returns the updated proposal or null if not found.
+ */
+export function dismissProposal(
+  workspacePath: string,
+  id: string,
+  reason: string,
+): PolicyProposal | null {
+  const proposals = getProposals(workspacePath);
+  const proposal = proposals.find((p) => p.id === id);
+
+  if (!proposal) return null;
+
+  proposal.status = "rejected";
+  proposal.rejectionReason = reason;
+  proposal.rejectedAt = new Date().toISOString();
+  writeProposals(workspacePath, proposals);
+  return proposal;
+}
+
+/**
+ * Get all rejected proposals.
+ */
+export function getRejectedProposals(workspacePath: string): PolicyProposal[] {
+  return getProposals(workspacePath).filter((p) => p.status === "rejected");
+}
+
+/**
  * Count pending proposals (for preamble notification).
  */
 export function countPending(workspacePath: string): number {

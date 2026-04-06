@@ -401,6 +401,13 @@ export interface KnowledgeGap {
   recommendation: string;
 }
 
+/** Rejection reason grouped by frequency. */
+export interface RejectionReasonGroup {
+  reason: string;
+  count: number;
+  proposalIds: string[];
+}
+
 /** Result of Pass 4: proposal effectiveness. */
 export interface ProposalEffectiveness {
   total: number;
@@ -409,6 +416,8 @@ export interface ProposalEffectiveness {
   pending: number;
   /** Approved proposals that had subsequent outcome data. */
   approvedWithOutcomeData: number;
+  /** Rejected proposals grouped by rejection reason. */
+  rejectionReasonGroups: RejectionReasonGroup[];
 }
 
 /** Full weekly analysis result (M2 + M3). */
@@ -535,12 +544,25 @@ export function analyzeProposalEffectiveness(proposals: PolicyProposal[]): Propo
     (p) => p.status === "approved" && p.evidence.length >= 2,
   ).length;
 
+  // Group rejected proposals by rejection reason
+  const reasonMap = new Map<string, string[]>();
+  for (const p of proposals.filter((p) => p.status === "rejected")) {
+    const reason = p.rejectionReason ?? "no reason given";
+    const ids = reasonMap.get(reason) ?? [];
+    ids.push(p.id);
+    reasonMap.set(reason, ids);
+  }
+  const rejectionReasonGroups: RejectionReasonGroup[] = [...reasonMap.entries()]
+    .map(([reason, proposalIds]) => ({ reason, count: proposalIds.length, proposalIds }))
+    .sort((a, b) => b.count - a.count);
+
   return {
     total: proposals.length,
     approved,
     rejected,
     pending,
     approvedWithOutcomeData,
+    rejectionReasonGroups,
   };
 }
 
@@ -623,7 +645,14 @@ export function generateReport(analysis: WeeklyAnalysisResult): string {
       `- ${pe.approvedWithOutcomeData}/${pe.approved} approved proposals have outcome correlation data`,
     );
   }
-  lines.push(`- No outcome data for rejected proposals (M6 gap)`);
+  if (pe.rejectionReasonGroups.length > 0) {
+    lines.push("- Rejection reasons:");
+    for (const group of pe.rejectionReasonGroups) {
+      lines.push(`  - "${group.reason}" (${group.count}×)`);
+    }
+  } else if (pe.rejected > 0) {
+    lines.push("- No rejection reasons recorded for rejected proposals");
+  }
   lines.push("");
 
   // Prompt Mutations
