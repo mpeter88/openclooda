@@ -48,3 +48,4 @@ At session start:
 - [ ] `pnpm test -- extensions/memory-lancedb/` — all 34/35 tests pass (1 skip: LanceDB native on Intel)
 - [ ] `git log --oneline` — verify latest commits on `master`
 - [ ] Review `STATUS.md` for outstanding items
+      | `CR_OODA_SITREP_PERSISTENCE` | 2026-04-05 | `WRITTEN` | S1-S3 | **HIGH.** S1: On each `before_agent_start`, write SITREP to `sitrep-log/YYYY-MM-DD.jsonl` as a timestamped entry (sessionKey, timestamp, priority, domains, attention, thinkingLevel). S2: Meta-Reviewer pass 2 reads SITREP log to analyze prompt effectiveness — does Triage priority correlate with actual urgency over time? Did attention directives match what happened? S3: SITREP log included in `import-amf-knowledge.ts` scope if relevant sessions exist. Enables longitudinal drift analysis. |
