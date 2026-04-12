@@ -64,7 +64,6 @@ export type PluginLoadOptions = {
 
 const MAX_PLUGIN_REGISTRY_CACHE_ENTRIES = 128;
 const registryCache = new Map<string, PluginRegistry>();
-const registeredPluginIds = new Set<string>();
 const openAllowlistWarningCache = new Set<string>();
 const LAZY_RUNTIME_REFLECTION_KEYS = [
   "version",
@@ -84,7 +83,6 @@ const LAZY_RUNTIME_REFLECTION_KEYS = [
 
 export function clearPluginLoaderCache(): void {
   registryCache.clear();
-  registeredPluginIds.clear();
   openAllowlistWarningCache.clear();
 }
 
@@ -1004,6 +1002,14 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
     });
   });
 
+  // Track plugin IDs registered within this build pass only.
+  // This prevents double-registration when the same plugin appears via multiple
+  // discovery paths in a single loadOpenClawPlugins() call, while allowing
+  // register() to be called again when a new registry is built (e.g. on each
+  // agent run). The previous module-level Set caused register() to be skipped
+  // on subsequent builds, leaving new registries with zero typed hooks and
+  // silently breaking all plugin hooks (e.g. agent_end never fired).
+  const registeredPluginIds = new Set<string>();
   const seenIds = new Map<string, PluginRecord["origin"]>();
   const memorySlot = normalized.slots.memory;
   let selectedMemoryPluginId: string | null = null;
@@ -1308,8 +1314,10 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
     });
 
     try {
-      // Only call register() once per plugin ID across all load cycles.
-      // Subsequent loads reuse the cached side effects (event listeners, state).
+      // Only call register() once per plugin ID within this registry build pass.
+      // Plugins may be discovered via multiple paths; this prevents double-registration
+      // within a single loadOpenClawPlugins() call. register() IS called again on each
+      // new build so typed hooks (api.on) are present in every activated registry.
       if (!registeredPluginIds.has(pluginId)) {
         const result = register(api);
         if (result && typeof result.then === "function") {

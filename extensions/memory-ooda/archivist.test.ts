@@ -563,7 +563,7 @@ describe("runArchivist", () => {
     expect(callModel).toHaveBeenCalledTimes(2);
   });
 
-  it("falls back after all retries fail", async () => {
+  it("falls back after all retries fail — does NOT mark events processed", async () => {
     const callModel: ModelCallFn = vi.fn(async () => "garbage");
     const events = createTestEvents(3);
     const episodic = createMockEpisodicStore(events);
@@ -573,10 +573,13 @@ describe("runArchivist", () => {
 
     expect(result.fromFallback).toBe(true);
     expect(result.patternsExtracted).toHaveLength(0);
-    expect(result.eventsProcessed).toBe(3);
-    // Events should still be marked processed
-    expect(episodic.processedIds).toHaveLength(3);
+    // eventsProcessed=0 because LLM failed — events left unprocessed for retry
+    expect(result.eventsProcessed).toBe(0);
+    // Events must NOT be marked processed — they need to be retried next run
+    expect(episodic.processedIds).toHaveLength(0);
     expect(callModel).toHaveBeenCalledTimes(2); // initial + 1 retry
+    // Log entry must record the failure
+    expect(semantic.logEntries[0].action).toBe("distill_failed");
   });
 
   it("falls back on model throwing", async () => {

@@ -1,6 +1,6 @@
 # CR Status Log
 
-**Last updated:** 2026-04-05 (Tier 5 Meta-Reviewer weekly analysis implemented: M1-M5)
+**Last updated:** 2026-04-08 (OpenCLOODA Phase 1-5 + SITREP persistence implemented)
 **Branch:** `master`
 
 ## Status Key
@@ -48,4 +48,9 @@ At session start:
 - [ ] `pnpm test -- extensions/memory-lancedb/` — all 34/35 tests pass (1 skip: LanceDB native on Intel)
 - [ ] `git log --oneline` — verify latest commits on `master`
 - [ ] Review `STATUS.md` for outstanding items
-      | `CR_OODA_SITREP_PERSISTENCE` | 2026-04-05 | `WRITTEN` | S1-S3 | **HIGH.** S1: On each `before_agent_start`, write SITREP to `sitrep-log/YYYY-MM-DD.jsonl` as a timestamped entry (sessionKey, timestamp, priority, domains, attention, thinkingLevel). S2: Meta-Reviewer pass 2 reads SITREP log to analyze prompt effectiveness — does Triage priority correlate with actual urgency over time? Did attention directives match what happened? S3: SITREP log included in `import-amf-knowledge.ts` scope if relevant sessions exist. Enables longitudinal drift analysis. |
+      | `CR_OPENCLOODA_PHASE1_INBOX_FAST_CLARIFY` | 2026-04-08 | `IMPLEMENTED` | Phase 1 | `7c0a83a` — inbox + fast clarify + topic tracker + suggestion detection. |
+      | `CR_OPENCLOODA_PHASE2_WORLD_MODEL` | 2026-04-08 | `IMPLEMENTED` | Phase 2 | `b2c3a38` — WorldModelStore, bootstrap, Orient reads world model. |
+      | `CR_OPENCLOODA_PHASE3_SLOW_CLARIFY` | 2026-04-08 | `IMPLEMENTED` | Phase 3 | `df91422` — slow clarify, background inbox drain, world model patches, milestone detection. |
+      | `CR_OPENCLOODA_PHASE4_ORIENT_WORLD_MODEL` | 2026-04-08 | `IMPLEMENTED` | Phase 4 | `df91422` — Orient wired to world model in `index.ts`. |
+      | `CR_OPENCLOODA_PHASE5_REFLECT` | 2026-04-08 | `IMPLEMENTED` | Phase 5 | `df91422` — reflect loop (`reflect.ts`). |
+      | `CR_OODA_SITREP_PERSISTENCE` | 2026-04-08 | `IMPLEMENTED` | S1-S3 | `df91422` — `sitrep-log.ts` writes timestamped SITREP entries to `sitrep-log/YYYY-MM-DD.jsonl`. Meta-Reviewer drift analysis wired. |

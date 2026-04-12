@@ -16,6 +16,8 @@ export type MemoryConfig = {
   autoCapture?: boolean;
   autoRecall?: boolean;
   captureMaxChars?: number;
+  /** Model to use for fast Clarify LLM calls (default: cheapest available). */
+  fastClarifyModel?: string;
 };
 
 export const MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
@@ -99,7 +101,15 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "dbPath", "backend", "autoCapture", "autoRecall", "captureMaxChars"],
+      [
+        "embedding",
+        "dbPath",
+        "backend",
+        "autoCapture",
+        "autoRecall",
+        "captureMaxChars",
+        "fastClarifyModel",
+      ],
       "memory config",
     );
 
@@ -136,6 +146,7 @@ export const memoryConfigSchema = {
       autoCapture: cfg.autoCapture === true,
       autoRecall: cfg.autoRecall !== false,
       captureMaxChars: captureMaxChars ?? DEFAULT_CAPTURE_MAX_CHARS,
+      fastClarifyModel: typeof cfg.fastClarifyModel === "string" ? cfg.fastClarifyModel : undefined,
     };
   },
   uiHints: {
@@ -180,6 +191,12 @@ export const memoryConfigSchema = {
       help: "Maximum message length eligible for auto-capture",
       advanced: true,
       placeholder: String(DEFAULT_CAPTURE_MAX_CHARS),
+    },
+    fastClarifyModel: {
+      label: "Fast Clarify Model",
+      help: "Model for inbox classification (default: cheapest available, e.g. haiku/flash)",
+      advanced: true,
+      placeholder: "claude-haiku-4-5-20251001",
     },
   },
 };

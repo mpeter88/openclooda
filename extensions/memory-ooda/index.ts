@@ -12,6 +12,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/memory-ooda";
 import {
+  WorldModelStore,
+  BOOTSTRAP_PROMPT,
+  renderWorldModelSection,
+  renderSuggestions,
+  type ProjectState,
+  type AreaState,
+} from "../memory-lancedb/world-model-store.js";
+import {
   readState,
   writeState,
   shouldRunArchivist,
@@ -22,15 +30,27 @@ import {
 } from "./archivist.js";
 import { registerWorkspaceCli } from "./cli.js";
 import { runCouncil, type CouncilMode } from "./council.js";
+import {
+  pingHealth,
+  pingHealthError,
+  buildDoctorReport,
+  renderDoctorReport,
+  buildHealthAlert,
+  isHealthy,
+  healthPath,
+} from "./health.js";
 import { runMetaReviewer, type PrioritiesStore, type ProposalStore } from "./meta-reviewer.js";
 import { getPriorities, updateDomainWeight } from "./priorities.js";
 import { countPending, getProposals, addProposal } from "./proposals.js";
+import { Reflect, renderReflectNotification } from "./reflect.js";
 import {
   getFacts,
   formatFactsForContext,
   upsertFact,
   appendArchivistLog,
 } from "./semantic-memory.js";
+import { appendSitrepLog } from "./sitrep-log.js";
+import { SlowClarify, type InboxDb, type InboxItem } from "./slow-clarify.js";
 import { runStrategy } from "./strategy.js";
 import {
   dispatchTask,
@@ -40,7 +60,6 @@ import {
   wakeSync,
   evaluateDispatch,
 } from "./task-bridge.js";
-import { appendSitrepLog } from "./sitrep-log.js";
 import { runTriage, shouldRunFullOODA, type ModelCallFn } from "./triage.js";
 
 // ============================================================================
@@ -114,7 +133,7 @@ async function buildSqliteEpisodicStore(dbPath: string): Promise<EpisodicStore> 
         .prepare(
           `SELECT id, text, category, importance, createdAt, source, actionId, archivistProcessed
            FROM memories
-           WHERE createdAt > ?
+           WHERE createdAt > ? AND archivistProcessed = 0
            ORDER BY createdAt ASC
            LIMIT ?`,
         )
@@ -368,8 +387,6 @@ async function buildEpisodicStore(api: OpenClawPluginApi): Promise<EpisodicStore
 // Plugin
 // ============================================================================
 
-let registered = false;
-
 const oodaPlugin = {
   id: "memory-ooda",
   name: "Memory (OODA)",
@@ -378,8 +395,6 @@ const oodaPlugin = {
   // memory-ooda runs alongside as a cognitive layer (Tier 3 distillation + context injection).
 
   register(api: OpenClawPluginApi) {
-    if (registered) return;
-
     const cfg = (api.pluginConfig ?? {}) as OodaConfig;
     const enabled = cfg.enabled !== false; // enabled by default
     const workspacePath = resolveWorkspacePath(cfg);
@@ -391,64 +406,106 @@ const oodaPlugin = {
       return;
     }
 
-    registered = true;
     api.logger.info(`memory-ooda: registered (workspace: ${workspacePath})`);
+
+    // ========================================================================
+    // Shared EpisodicStore — single connection per plugin registration.
+    // buildEpisodicStore opens a DatabaseSync (sqlite) connection. Opening
+    // multiple connections from the same process against a non-WAL database
+    // causes concurrent readers to see empty results. Cache the store after
+    // first build so the same connection is reused across all hooks/calls.
+    // ========================================================================
+
+    let sharedEpisodicStore: EpisodicStore | null | undefined = undefined; // undefined = not yet built
+
+    async function getEpisodicStore(): Promise<EpisodicStore | null> {
+      if (sharedEpisodicStore !== undefined) return sharedEpisodicStore;
+      sharedEpisodicStore = await buildEpisodicStore(api);
+      // Enable WAL mode on first open so concurrent readers don't block
+      if (sharedEpisodicStore) {
+        try {
+          const dbPath = resolveLanceDbPath(api);
+          const { join: pathJoin } = await import("node:path");
+          const { DatabaseSync } = await import("node:sqlite");
+          const db = new DatabaseSync(pathJoin(dbPath, "memories.sqlite"));
+          db.prepare("PRAGMA journal_mode=WAL").run();
+          db.close();
+          api.logger.info("memory-ooda: sqlite WAL mode enabled");
+        } catch {
+          /* best-effort */
+        }
+      }
+      return sharedEpisodicStore;
+    }
 
     // ========================================================================
     // Shared callModel helper (subagent pattern)
     // ========================================================================
 
+    // callModel: direct Anthropic HTTP call.
+    // Subagent methods are only available during a gateway request context,
+    // but the archivist fires in setImmediate after agent_end (outside that
+    // context). Direct HTTP avoids all request-scope constraints.
     const callModel: ModelCallFn = async (prompt: string): Promise<string> => {
-      const sessionKey = `ooda-${Date.now()}`;
-      try {
-        const { runId } = await api.runtime.subagent.run({
-          sessionKey,
-          message: prompt,
-          extraSystemPrompt:
-            "You are an OODA reasoning agent. Respond with raw JSON only. No explanation.",
-          deliver: false,
-        });
-
-        const waitResult = await api.runtime.subagent.waitForRun({
-          runId,
-          timeoutMs: 120_000,
-        });
-
-        if (waitResult.status !== "ok") {
-          throw new Error(`subagent run failed: ${waitResult.status} ${waitResult.error ?? ""}`);
-        }
-
-        const { messages } = await api.runtime.subagent.getSessionMessages({
-          sessionKey,
-          limit: 10,
-        });
-
-        // Extract last assistant message text
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msg = messages[i] as Record<string, unknown>;
-          if (msg.role === "assistant" && typeof msg.content === "string") {
-            return msg.content;
-          }
-          // Handle array content (tool_use / text blocks)
-          if (msg.role === "assistant" && Array.isArray(msg.content)) {
-            for (let j = (msg.content as unknown[]).length - 1; j >= 0; j--) {
-              const block = (msg.content as Record<string, unknown>[])[j];
-              if (block.type === "text" && typeof block.text === "string") {
-                return block.text;
-              }
-            }
-          }
-        }
-
-        throw new Error("No assistant reply found in subagent session");
-      } finally {
-        // Clean up isolated session
+      // Resolve key: env var first, then auth-profiles.json (where the gateway stores it)
+      let apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) {
         try {
-          await api.runtime.subagent.deleteSession({ sessionKey });
+          const { join: pjoin } = await import("node:path");
+          const { homedir: phome } = await import("node:os");
+          const { readFileSync: pread } = await import("node:fs");
+          const profilesPath = pjoin(
+            phome(),
+            ".openclaw",
+            "agents",
+            "main",
+            "agent",
+            "auth-profiles.json",
+          );
+          const profiles = JSON.parse(pread(profilesPath, "utf-8")) as Record<string, unknown>;
+          const p = profiles as Record<string, Record<string, Record<string, string>>>;
+          const key = p?.profiles?.["anthropic:default"]?.key;
+          if (key && key.startsWith("sk-")) apiKey = key;
         } catch {
-          // best-effort cleanup
+          /* fallthrough */
         }
       }
+      if (!apiKey) {
+        throw new Error(
+          "No Anthropic API key found (checked ANTHROPIC_API_KEY env + auth-profiles.json)",
+        );
+      }
+      const model = "claude-3-haiku-20240307";
+
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          system:
+            "You are an OODA reasoning agent. Respond with raw JSON only. No explanation, no code fences.",
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "(unreadable)");
+        throw new Error(`Anthropic API error ${response.status}: ${errText.slice(0, 200)}`);
+      }
+
+      const data = (await response.json()) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      const textBlock = data.content?.find((b) => b.type === "text");
+      if (!textBlock?.text) {
+        throw new Error("No text block in Anthropic response");
+      }
+      return textBlock.text;
     };
 
     // ========================================================================
@@ -493,7 +550,7 @@ const oodaPlugin = {
         try {
           const { isAMFContext } = await import("./cross-project.js");
           if (isAMFContext(event.prompt)) {
-            const episodicStore = await buildEpisodicStore(api);
+            const episodicStore = await getEpisodicStore();
             if (episodicStore) {
               const amfMemories = await episodicStore.retrieveSince(0, 10_000);
               const amfFiltered = amfMemories
@@ -513,6 +570,65 @@ const oodaPlugin = {
           }
         } catch {
           // Best-effort — cross-project recall is supplementary
+        }
+
+        // ==================================================================
+        // Phase 4: Orient — World Model first, episodic supplementary
+        // ==================================================================
+
+        try {
+          const worldModelPath = join(homedir(), ".openclaw", "world-model");
+          const worldModelStore = new WorldModelStore(worldModelPath);
+
+          if (!worldModelStore.isBootstrapped()) {
+            // Inject bootstrap prompt — agent conducts guided conversation
+            parts.push(BOOTSTRAP_PROMPT);
+          } else {
+            const index = worldModelStore.readIndex();
+            const incomingLower = event.prompt.toLowerCase();
+
+            // Active projects always relevant; paused only if mentioned
+            const activeProjects = index.projects.filter((p) => p.status === "active");
+            const pausedMentioned = index.projects.filter(
+              (p) => p.status === "paused" && incomingLower.includes(p.name.toLowerCase()),
+            );
+            const relevantProjectIds = [
+              ...activeProjects.map((p) => p.id),
+              ...pausedMentioned.map((p) => p.id),
+            ];
+
+            // Read full detail for relevant projects (capped at 5 for token budget)
+            const projectDetails = relevantProjectIds
+              .slice(0, 5)
+              .map((p) => worldModelStore.readProject(p))
+              .filter((p): p is ProjectState => p !== null);
+
+            const allAreas = worldModelStore.listAreas().filter((a): a is AreaState => a !== null);
+
+            const worldModelSection = renderWorldModelSection(projectDetails, allAreas);
+            if (worldModelSection.trim().length > 0) {
+              parts.push(worldModelSection);
+            }
+
+            // Engineering discipline excerpt (always relevant)
+            const engDiscipline = worldModelStore.readReference("engineering-discipline.md");
+            if (engDiscipline) {
+              const excerpt = engDiscipline.slice(0, 500);
+              parts.push(`<ooda-engineering-discipline>${excerpt}</ooda-engineering-discipline>`);
+            }
+
+            // Pending suggestions from world model meta (undismissed only)
+            const meta = worldModelStore.readMeta();
+            const activeSuggestions = meta.pendingProjectSuggestions.filter((s) => !s.dismissedAt);
+            if (activeSuggestions.length > 0) {
+              const suggestionsSection = renderSuggestions(activeSuggestions);
+              if (suggestionsSection) {
+                parts.push(suggestionsSection);
+              }
+            }
+          }
+        } catch (wmErr) {
+          api.logger.warn(`memory-ooda: world model read failed: ${String(wmErr)}`);
         }
 
         // ==================================================================
@@ -550,6 +666,9 @@ const oodaPlugin = {
 
           const sitrep = triageResult.sitrep;
 
+          // Health ping — triage ran
+          pingHealth(workspacePath, "triage", { priority: sitrep.priority });
+
           // S1: Persist SITREP to daily JSONL log
           try {
             appendSitrepLog(
@@ -570,6 +689,39 @@ const oodaPlugin = {
           sitrepLines.push(
             `Priority: ${sitrep.priority}/10 | ${sitrep.summary} | Domains: ${sitrep.recommendedDomains.join(", ") || "none"}`,
           );
+          // Phase 1: Append pending project suggestions from topic_tracker
+          try {
+            const dbPath = resolveLanceDbPath(api);
+            const { existsSync } = await import("node:fs");
+            const { join: pathJoin } = await import("node:path");
+            const sqlitePath = pathJoin(dbPath, "memories.sqlite");
+            if (existsSync(sqlitePath)) {
+              const { DatabaseSync } = await import("node:sqlite");
+              const suggestDb = new DatabaseSync(sqlitePath);
+              try {
+                const pendingSuggestions = suggestDb
+                  .prepare(
+                    "SELECT topic_key, sample_text FROM topic_tracker WHERE suggested_at IS NOT NULL AND dismissed_at IS NULL",
+                  )
+                  .all() as Array<{ topic_key: string; sample_text: string }>;
+                if (pendingSuggestions.length > 0) {
+                  sitrepLines.push("## Project Suggestions");
+                  for (const s of pendingSuggestions) {
+                    sitrepLines.push(
+                      `- Suggestion: "${s.topic_key}" may warrant a project (based on recent activity). Confirm with user.`,
+                    );
+                  }
+                }
+              } finally {
+                suggestDb.close();
+              }
+            }
+          } catch (suggestErr) {
+            api.logger.warn(
+              `memory-ooda: failed to read project suggestions: ${String(suggestErr)}`,
+            );
+          }
+
           const sitrepBlock = `<ooda-sitrep>${sitrepLines.join("\n")}</ooda-sitrep>`;
 
           if (!shouldRunFullOODA(sitrep, priorities, thinkingLevel)) {
@@ -602,6 +754,18 @@ const oodaPlugin = {
               const councilResult = await runCouncil(strategyInput, councilMode, callModel);
               councilResultRef = councilResult;
               const winner = councilResult.winner;
+
+              // Health pings — strategy + council
+              pingHealth(workspacePath, "strategy", {
+                action: winner.label,
+                mode: councilResult.mode,
+              });
+              if (councilResult.mode !== "none") {
+                pingHealth(workspacePath, "council", {
+                  mode: councilResult.mode,
+                  dissent: councilResult.dissent,
+                });
+              }
 
               parts.push(
                 `<ooda-strategy>Action: ${winner.label} | ${winner.reasoning}</ooda-strategy>`,
@@ -669,12 +833,19 @@ const oodaPlugin = {
           }
         }
 
+        // Health ping — before_agent_start fired successfully
+        pingHealth(workspacePath, "before_agent_start", {
+          triagePriority: triageResult?.sitrep?.priority,
+          councilMode: councilResultRef?.mode,
+        });
+
         return {
           prependSystemContext: parts.join("\n\n"),
           ...(oodaSummary ? { prependContext: oodaSummary } : {}),
         };
       } catch (err) {
         api.logger.warn(`memory-ooda: failed to inject context: ${String(err)}`);
+        pingHealthError(workspacePath, "before_agent_start", String(err));
       }
     });
 
@@ -690,11 +861,13 @@ const oodaPlugin = {
       // Fresh workspace or corrupt state — start from 0
     }
 
-    api.on("agent_end", (_event) => {
+    api.on("agent_end", (_event, ctx) => {
       // Do NOT gate on event.success. The archivist reads from the episodic
       // store (prior events), not the current turn. A failed turn — e.g. Ollama
       // down, embedding error, prompt error — must not prevent distillation.
       turnCount++;
+      // Health ping — agent_end hook is firing (proves loader fix is working)
+      pingHealth(workspacePath, "agent_end", { turnCount });
 
       // Increment turns_since_last_archivist and persist. The archivist resets
       // it to 0 after a successful run. No two-counter subtraction, no drift.
@@ -725,24 +898,20 @@ const oodaPlugin = {
 
       if (!shouldRunArchivist(currentState, turnInterval)) return;
 
-      // Fire archivist non-blocking
+      // Fire archivist non-blocking — callModel reads key from auth-profiles.json
       setImmediate(() => {
         void (async () => {
           try {
-            // Build EpisodicStore from lancedb
-            const episodicStore = await buildEpisodicStore(api);
+            const episodicStore = await getEpisodicStore();
             if (!episodicStore) {
-              api.logger.warn("memory-ooda: archivist skipped — lancedb unavailable");
+              api.logger.warn("memory-ooda: archivist skipped — episodic store unavailable");
               return;
             }
-
-            // Build SemanticStore
             const semanticStore: SemanticStore = {
               upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
               appendArchivistLog: (action, reason) =>
                 appendArchivistLog(workspacePath, action, reason),
             };
-
             const result = await runArchivist(
               workspacePath,
               turnCount,
@@ -751,55 +920,134 @@ const oodaPlugin = {
               callModel,
               { turnInterval },
             );
-
-            api.logger.info(
-              `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
-            );
-
-            // ── Meta-reviewer trigger ───────────────────────────────────────
-            // Fire after every N archivist completions (archivist_runs_since_meta_review
-            // is incremented inside runArchivist before we read it here).
-            try {
-              const updatedState = readState(workspacePath);
-              const metaInterval =
-                getPriorities(workspacePath).thresholds.meta_reviewer_archivist_interval ?? 5;
-              if (
-                metaInterval > 0 &&
-                updatedState.archivist_runs_since_meta_review >= metaInterval
-              ) {
-                api.logger.info(
-                  `memory-ooda: meta-reviewer triggered (${updatedState.archivist_runs_since_meta_review} archivist runs since last review)`,
-                );
-                const priorities = getPriorities(workspacePath);
-                const prioritiesStore: PrioritiesStore = {
-                  getPriorities: () => getPriorities(workspacePath),
-                  updateDomainWeight: (domain, newWeight, reason) =>
-                    updateDomainWeight(workspacePath, domain, newWeight, reason),
-                };
-                const proposalStore: ProposalStore = {
-                  addProposal: (p) => addProposal(workspacePath, p),
-                };
-                const metaResult = await runMetaReviewer(
-                  { failures: [], priorities },
-                  prioritiesStore,
-                  proposalStore,
-                  callModel,
-                );
-                // Reset counter
-                const stateAfterMeta = readState(workspacePath);
-                writeState(workspacePath, {
-                  ...stateAfterMeta,
-                  archivist_runs_since_meta_review: 0,
-                });
-                api.logger.info(
-                  `memory-ooda: meta-reviewer completed — ${metaResult.weightsAdjusted.length} weight adjustments, ${metaResult.proposalsCreated.length} proposals`,
-                );
-              }
-            } catch (metaErr) {
-              api.logger.warn(`memory-ooda: meta-reviewer failed: ${String(metaErr)}`);
+            if (result.fromFallback) {
+              api.logger.warn(
+                `memory-ooda: archivist model failed — will retry. Error: ${result.lastError ?? "unknown"}`,
+              );
+              pingHealthError(workspacePath, "archivist", result.lastError ?? "model failed");
+            } else {
+              api.logger.info(
+                `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
+              );
+              pingHealth(workspacePath, "archivist", {
+                eventsProcessed: result.eventsProcessed,
+                patternsExtracted: result.patternsExtracted.length,
+              });
             }
           } catch (err) {
             api.logger.warn(`memory-ooda: archivist failed: ${String(err)}`);
+            pingHealthError(workspacePath, "archivist", String(err));
+          }
+        })();
+      });
+    });
+
+    // ========================================================================
+    // Phase 3: Slow Clarify — background inbox drain on agent_end
+    // ========================================================================
+
+    api.on("agent_end", () => {
+      setImmediate(() => {
+        void (async () => {
+          try {
+            const dbPath = resolveLanceDbPath(api);
+            const { existsSync } = await import("node:fs");
+            const { join: pathJoin } = await import("node:path");
+            const sqlitePath = pathJoin(dbPath, "memories.sqlite");
+            if (!existsSync(sqlitePath)) return;
+
+            const { DatabaseSync } = await import("node:sqlite");
+            const db = new DatabaseSync(sqlitePath);
+
+            // Check if inbox table exists
+            const tableCheck = db
+              .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='inbox'")
+              .get() as Record<string, unknown> | undefined;
+            if (!tableCheck) {
+              db.close();
+              return;
+            }
+
+            const inboxDb: InboxDb = {
+              getUnprocessed(): InboxItem[] {
+                return db
+                  .prepare("SELECT * FROM inbox WHERE processed = 0 ORDER BY capturedAt ASC")
+                  .all() as InboxItem[];
+              },
+              markProcessed(ids: string[]) {
+                if (ids.length === 0) return;
+                const placeholders = ids.map(() => "?").join(",");
+                db.prepare(`UPDATE inbox SET processed = 1 WHERE id IN (${placeholders})`).run(
+                  ...ids,
+                );
+              },
+            };
+
+            const worldModelPath = join(homedir(), ".openclaw", "world-model");
+            const worldModelStore = new WorldModelStore(worldModelPath);
+            const sc = new SlowClarify(inboxDb, worldModelStore, callModel);
+
+            if (!sc.shouldRun()) {
+              db.close();
+              return;
+            }
+
+            const result = await sc.run();
+            db.close();
+
+            if (result.processed > 0) {
+              api.logger.info(
+                `memory-ooda: slow clarify completed — ${result.processed} items processed, ${result.updated.length} entities updated`,
+              );
+            }
+            // Health ping — slow clarify ran
+            pingHealth(workspacePath, "slow_clarify", {
+              processed: result.processed,
+              updated: result.updated.length,
+            });
+          } catch (err) {
+            api.logger.warn(`memory-ooda: slow clarify failed: ${String(err)}`);
+          }
+        })();
+      });
+    });
+
+    // ========================================================================
+    // Phase 5: Reflect — periodic world model review on agent_end
+    // ========================================================================
+
+    api.on("agent_end", () => {
+      setImmediate(() => {
+        void (async () => {
+          try {
+            const worldModelPath = join(homedir(), ".openclaw", "world-model");
+            const worldModelStore = new WorldModelStore(worldModelPath);
+
+            if (!worldModelStore.isBootstrapped()) return;
+
+            const episodicStore = await getEpisodicStore();
+            if (!episodicStore) return;
+
+            const reflect = new Reflect(worldModelStore, episodicStore, callModel);
+            if (!reflect.shouldRun()) return;
+
+            const result = await reflect.run();
+            api.logger.info(
+              `memory-ooda: reflect completed — ${result.patches.length} patches, ${result.reviewItems.length} review items`,
+            );
+            // Health ping — reflect ran
+            pingHealth(workspacePath, "reflect", {
+              patches: result.patches.length,
+              reviewItems: result.reviewItems.length,
+            });
+
+            // Deliver notification if review items exist
+            const notification = renderReflectNotification(result);
+            if (notification) {
+              api.logger.info(`memory-ooda: reflect notification: ${notification.slice(0, 200)}`);
+            }
+          } catch (err) {
+            api.logger.warn(`memory-ooda: reflect failed: ${String(err)}`);
           }
         })();
       });
@@ -893,7 +1141,7 @@ const oodaPlugin = {
     let structuralStore: EpisodicStore | null | undefined;
     async function getStructuralStore(): Promise<EpisodicStore | null> {
       if (structuralStore !== undefined) return structuralStore;
-      structuralStore = await buildEpisodicStore(api);
+      structuralStore = await getEpisodicStore();
       return structuralStore;
     }
 
@@ -1021,6 +1269,21 @@ const oodaPlugin = {
           importance: classified.importance,
           source: "structural",
         });
+
+        // Phase 5: Increment eventsSinceLastReflect for significant events
+        if (classified.importance >= 0.6 || classified.category === "decision") {
+          try {
+            const wmPath = join(homedir(), ".openclaw", "world-model");
+            const wmStore = new WorldModelStore(wmPath);
+            const meta = wmStore.readMeta();
+            wmStore.writeMeta({
+              ...meta,
+              eventsSinceLastReflect: (meta.eventsSinceLastReflect ?? 0) + 1,
+            });
+          } catch {
+            // best-effort — don't block structural capture on reflect counter
+          }
+        }
       } catch (err) {
         api.logger.warn(`memory-ooda: structural capture failed: ${String(err)}`);
       }
@@ -1138,8 +1401,69 @@ const oodaPlugin = {
             const ok = cancelTask(workspacePath, query);
             console.log(ok ? `Task cancelled.` : `No cancellable task found matching: ${query}`);
           });
+
+        // OODA Doctor
+        const ooda = program.command("ooda").description("OODA cognitive layer tools");
+        ooda
+          .command("doctor")
+          .description("Health check — reports subsystem status and detects silent failures")
+          .option("--json", "Output raw JSON instead of formatted report")
+          .option("--alert-only", "Only output if there are warnings or errors")
+          .action(async (opts: { json?: boolean; alertOnly?: boolean }) => {
+            let archivistState:
+              | { turnsSinceLast: number; interval: number; lastRunAt: string }
+              | undefined;
+            try {
+              const state = readState(workspacePath);
+              let interval = 15;
+              try {
+                interval = getPriorities(workspacePath).thresholds.archivist_turn_interval;
+              } catch {
+                /* default */
+              }
+              archivistState = {
+                turnsSinceLast: state.turns_since_last_archivist,
+                interval,
+                lastRunAt: state.last_run_at,
+              };
+            } catch {
+              /* best-effort */
+            }
+
+            let episodicStats: { total: number; processed: number } | undefined;
+            try {
+              const { existsSync } = await import("node:fs");
+              const { join: pathJoin } = await import("node:path");
+              const dbPath = resolveLanceDbPath(api);
+              const sqlitePath = pathJoin(dbPath, "memories.sqlite");
+              if (existsSync(sqlitePath)) {
+                const { DatabaseSync } = await import("node:sqlite");
+                const db = new DatabaseSync(sqlitePath);
+                const row = db
+                  .prepare(
+                    "SELECT COUNT(*) as total, SUM(archivistProcessed) as processed FROM memories",
+                  )
+                  .get() as Record<string, unknown>;
+                db.close();
+                episodicStats = {
+                  total: Number(row.total ?? 0),
+                  processed: Number(row.processed ?? 0),
+                };
+              }
+            } catch {
+              /* best-effort */
+            }
+
+            const report = buildDoctorReport(workspacePath, archivistState, episodicStats);
+            if (opts.json) {
+              console.log(JSON.stringify(report, null, 2));
+              return;
+            }
+            if (opts.alertOnly && isHealthy(report)) return;
+            console.log(renderDoctorReport(report));
+          });
       },
-      { commands: ["workspace", "tasks"] },
+      { commands: ["workspace", "tasks", "ooda"] },
     );
 
     // ========================================================================

@@ -865,3 +865,249 @@ describe("isSubstantiveAssistantTurn", () => {
     ).toBe(false);
   });
 });
+
+// ============================================================================
+// Phase 1: Inbox + Fast Clarify + Topic Tracker (CR_OPENCLOODA_PHASE1)
+// ============================================================================
+
+describe("parseFastClarifyResponse", () => {
+  test("parses valid JSON classification", async () => {
+    const { parseFastClarifyResponse } = await import("./index.js");
+
+    const result = parseFastClarifyResponse(
+      '{"type": "project", "pertains_to": "AMF Platform", "next_touchpoint": "today"}',
+    );
+    expect(result.type).toBe("project");
+    expect(result.pertiansTo).toBe("AMF Platform");
+    expect(result.nextTouchpoint).toBe("today");
+  });
+
+  test("parses JSON wrapped in code fences", async () => {
+    const { parseFastClarifyResponse } = await import("./index.js");
+
+    const result = parseFastClarifyResponse(
+      '```json\n{"type": "area", "pertains_to": null, "next_touchpoint": "this_week"}\n```',
+    );
+    expect(result.type).toBe("area");
+    expect(result.pertiansTo).toBeNull();
+    expect(result.nextTouchpoint).toBe("this_week");
+  });
+
+  test("returns safe default on parse failure", async () => {
+    const { parseFastClarifyResponse } = await import("./index.js");
+
+    const result = parseFastClarifyResponse("this is not json at all");
+    expect(result.type).toBe("reference");
+    expect(result.pertiansTo).toBeNull();
+    expect(result.nextTouchpoint).toBeNull();
+  });
+
+  test("returns safe default on empty string", async () => {
+    const { parseFastClarifyResponse } = await import("./index.js");
+
+    const result = parseFastClarifyResponse("");
+    expect(result.type).toBe("reference");
+    expect(result.pertiansTo).toBeNull();
+    expect(result.nextTouchpoint).toBeNull();
+  });
+
+  test("sanitizes invalid type values", async () => {
+    const { parseFastClarifyResponse } = await import("./index.js");
+
+    const result = parseFastClarifyResponse(
+      '{"type": "invalid_type", "pertains_to": null, "next_touchpoint": null}',
+    );
+    expect(result.type).toBe("reference");
+  });
+
+  test("sanitizes invalid nextTouchpoint values", async () => {
+    const { parseFastClarifyResponse } = await import("./index.js");
+
+    const result = parseFastClarifyResponse(
+      '{"type": "project", "pertains_to": "AMF", "next_touchpoint": "next_month"}',
+    );
+    expect(result.nextTouchpoint).toBeNull();
+  });
+});
+
+describe("inbox + topic_tracker (sqlite)", () => {
+  let tmpDir = "";
+  let db: import("node:sqlite").DatabaseSync;
+
+  beforeEach(async () => {
+    const fsp = await import("node:fs/promises");
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "openclaw-inbox-test-"));
+    const { DatabaseSync } = await import("node:sqlite");
+    db = new DatabaseSync(path.join(tmpDir, "memories.sqlite"));
+
+    // Create the tables as doInitialize would
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS inbox (
+        id TEXT PRIMARY KEY,
+        capturedAt INTEGER NOT NULL,
+        sessionId TEXT,
+        text TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('project','area','reference','trash','someday')),
+        pertiansTo TEXT,
+        nextTouchpoint TEXT CHECK (nextTouchpoint IN ('now','today','this_week','someday') OR nextTouchpoint IS NULL),
+        processed INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+      )
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS topic_tracker (
+        topic_key TEXT PRIMARY KEY,
+        sample_text TEXT,
+        turn_count INTEGER DEFAULT 0,
+        first_seen INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL,
+        suggested_at INTEGER,
+        dismissed_at INTEGER
+      )
+    `);
+  });
+
+  afterEach(async () => {
+    if (db) db.close();
+    if (tmpDir) {
+      const fsp = await import("node:fs/promises");
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("writeInboxItem stores typed items", () => {
+    db.prepare(
+      `INSERT INTO inbox (id, capturedAt, sessionId, text, type, pertiansTo, nextTouchpoint, processed, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "test-1",
+      Date.now(),
+      "session-1",
+      "AMF pipeline fix",
+      "project",
+      "AMF Platform",
+      "today",
+      0,
+      Date.now(),
+    );
+
+    const rows = db.prepare("SELECT * FROM inbox").all() as Array<Record<string, unknown>>;
+    expect(rows.length).toBe(1);
+    expect(rows[0].type).toBe("project");
+    expect(rows[0].pertiansTo).toBe("AMF Platform");
+    expect(rows[0].nextTouchpoint).toBe("today");
+  });
+
+  test("updateTopicTracker increments count", () => {
+    const now = Date.now();
+    // First insert
+    db.prepare(
+      "INSERT INTO topic_tracker (topic_key, sample_text, turn_count, first_seen, last_seen) VALUES (?, ?, 1, ?, ?)",
+    ).run("amf-pipeline", "AMF fix discussion", now, now);
+
+    // Simulate increment
+    db.prepare(
+      "UPDATE topic_tracker SET turn_count = turn_count + 1, sample_text = ?, last_seen = ? WHERE topic_key = ?",
+    ).run("AMF another mention", Date.now(), "amf-pipeline");
+
+    const row = db
+      .prepare("SELECT turn_count FROM topic_tracker WHERE topic_key = ?")
+      .get("amf-pipeline") as {
+      turn_count: number;
+    };
+    expect(row.turn_count).toBe(2);
+  });
+
+  test("getPendingProjectSuggestions returns only non-dismissed suggestions", () => {
+    const now = Date.now();
+    // Suggested, not dismissed
+    db.prepare(
+      "INSERT INTO topic_tracker (topic_key, sample_text, turn_count, first_seen, last_seen, suggested_at) VALUES (?, ?, 8, ?, ?, ?)",
+    ).run("new-topic", "Some recurring topic", now - 10000, now, now);
+
+    // Suggested AND dismissed
+    db.prepare(
+      "INSERT INTO topic_tracker (topic_key, sample_text, turn_count, first_seen, last_seen, suggested_at, dismissed_at) VALUES (?, ?, 8, ?, ?, ?, ?)",
+    ).run("dismissed-topic", "Dismissed topic", now - 20000, now, now - 5000, now);
+
+    // Not suggested yet
+    db.prepare(
+      "INSERT INTO topic_tracker (topic_key, sample_text, turn_count, first_seen, last_seen) VALUES (?, ?, 3, ?, ?)",
+    ).run("young-topic", "Young topic", now - 1000, now);
+
+    const pending = db
+      .prepare(
+        "SELECT topic_key, sample_text FROM topic_tracker WHERE suggested_at IS NOT NULL AND dismissed_at IS NULL",
+      )
+      .all() as Array<{ topic_key: string; sample_text: string }>;
+
+    expect(pending.length).toBe(1);
+    expect(pending[0].topic_key).toBe("new-topic");
+  });
+
+  test("inbox rejects invalid type values via CHECK constraint", () => {
+    expect(() => {
+      db.prepare(
+        `INSERT INTO inbox (id, capturedAt, sessionId, text, type, processed, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run("bad-1", Date.now(), "session-1", "test", "invalid_type", 0, Date.now());
+    }).toThrow();
+  });
+
+  test("multiple inbox items for same session", () => {
+    const now = Date.now();
+    for (let i = 0; i < 5; i++) {
+      db.prepare(
+        `INSERT INTO inbox (id, capturedAt, sessionId, text, type, pertiansTo, nextTouchpoint, processed, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        `item-${i}`,
+        now + i,
+        "amf-session",
+        `AMF observation ${i}`,
+        "project",
+        "AMF Platform",
+        "today",
+        0,
+        now + i,
+      );
+    }
+
+    const rows = db
+      .prepare("SELECT * FROM inbox WHERE sessionId = ? AND type = 'project'")
+      .all("amf-session") as Array<Record<string, unknown>>;
+    expect(rows.length).toBe(5);
+    expect(rows.every((r) => r.pertiansTo === "AMF Platform")).toBe(true);
+  });
+
+  test("topic_tracker reaches turn_count 8 for unknown topic", () => {
+    const now = Date.now();
+    db.prepare(
+      "INSERT INTO topic_tracker (topic_key, sample_text, turn_count, first_seen, last_seen) VALUES (?, ?, 7, ?, ?)",
+    ).run("unknown-topic", "Some new recurring discussion", now - 50000, now);
+
+    // Simulate the 8th increment
+    db.prepare(
+      "UPDATE topic_tracker SET turn_count = turn_count + 1, sample_text = ?, last_seen = ? WHERE topic_key = ?",
+    ).run("Latest mention of unknown topic", now, "unknown-topic");
+
+    const row = db
+      .prepare("SELECT turn_count FROM topic_tracker WHERE topic_key = ?")
+      .get("unknown-topic") as {
+      turn_count: number;
+    };
+    expect(row.turn_count).toBe(8);
+
+    // Simulate insight check marking it as suggested
+    db.prepare("UPDATE topic_tracker SET suggested_at = ? WHERE topic_key = ?").run(
+      now,
+      "unknown-topic",
+    );
+
+    const suggested = db
+      .prepare("SELECT suggested_at FROM topic_tracker WHERE topic_key = ?")
+      .get("unknown-topic") as { suggested_at: number };
+    expect(suggested.suggested_at).toBe(now);
+  });
+});

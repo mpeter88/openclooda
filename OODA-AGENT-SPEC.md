@@ -64,11 +64,11 @@ The memory stack provides the contextual gravity needed for the Orient phase of 
 
 ### 2.1 Tier 1 — Working Memory (Short-term)
 
-| Attribute     | Value                                     |
-|---------------|-------------------------------------------|
-| Storage       | RAM / in-context buffer                   |
-| Lifetime      | Current session                           |
-| Purpose       | Active attention — turn-by-turn state, entity extraction, tool output context |
+| Attribute | Value                                                                         |
+| --------- | ----------------------------------------------------------------------------- |
+| Storage   | RAM / in-context buffer                                                       |
+| Lifetime  | Current session                                                               |
+| Purpose   | Active attention — turn-by-turn state, entity extraction, tool output context |
 
 This partially exists in the Pi agent's session model. The addition is **structured
 entity extraction** on each turn to populate named slots (people, projects, dates,
@@ -76,13 +76,14 @@ decisions) that downstream tiers can reference.
 
 ### 2.2 Tier 2 — Episodic Memory (Long-term)
 
-| Attribute     | Value                                     |
-|---------------|-------------------------------------------|
-| Storage       | LanceDB (existing `extensions/memory-lancedb`) |
-| Lifetime      | Persistent across sessions                |
-| Purpose       | Historical journal — events with semantic embeddings for similarity retrieval |
+| Attribute | Value                                                                         |
+| --------- | ----------------------------------------------------------------------------- |
+| Storage   | LanceDB (existing `extensions/memory-lancedb`)                                |
+| Lifetime  | Persistent across sessions                                                    |
+| Purpose   | Historical journal — events with semantic embeddings for similarity retrieval |
 
 **Existing infrastructure (no changes needed):**
+
 - `MemoryDB` class — vector store/search/delete with dedup detection
 - `Embeddings` class — OpenAI embedding pipeline (configurable model + dimensions)
 - `memory_recall` / `memory_store` / `memory_forget` tools
@@ -99,8 +100,8 @@ event metadata for the Archivist and Meta-Reviewer to consume:
 ```typescript
 // Extend the existing MemoryEntry in extensions/memory-lancedb
 interface OodaMemoryEntry extends MemoryEntry {
-  source: string;              // "github" | "email" | "chat" | "tool_output" | "user"
-  actionId?: string;           // links to ExpectedOutcome for outcome tracking
+  source: string; // "github" | "email" | "chat" | "tool_output" | "user"
+  actionId?: string; // links to ExpectedOutcome for outcome tracking
   expectedOutcome?: ExpectedOutcome;
   actualOutcome?: ActualOutcome;
   archivistProcessed: boolean; // has the Archivist distilled this event?
@@ -113,18 +114,19 @@ Implemented as a new method on the existing `MemoryDB` class.
 
 ### 2.3 Tier 3 — Semantic Memory (Permanent)
 
-| Attribute     | Value                                     |
-|---------------|-------------------------------------------|
-| Storage       | `~/.openclaw/workspace/KNOWLEDGE.json`    |
-| Lifetime      | Permanent (updated by Archivist only)     |
-| Purpose       | Distilled truth — non-timestamped facts about the user and their world |
+| Attribute | Value                                                                  |
+| --------- | ---------------------------------------------------------------------- |
+| Storage   | `~/.openclaw/workspace/KNOWLEDGE.json`                                 |
+| Lifetime  | Permanent (updated by Archivist only)                                  |
+| Purpose   | Distilled truth — non-timestamped facts about the user and their world |
 
 **API:**
+
 ```typescript
 interface SemanticMemory {
   getFacts(): KnowledgeFile;
   upsertFact(section: string, key: string, value: unknown): void;
-  snapshot(): string;  // returns path to backup file
+  snapshot(): string; // returns path to backup file
 }
 ```
 
@@ -133,6 +135,7 @@ updates it, ensuring facts are distilled from repeated patterns rather than
 single observations.
 
 **Injection order in system prompt:**
+
 1. `AGENTS.md` / `SOUL.md` / `TOOLS.md` (existing)
 2. `KNOWLEDGE.json` facts (new — inserted after SOUL.md)
 3. `PRIORITIES.json` domain weights (new — inserted after KNOWLEDGE)
@@ -148,11 +151,11 @@ the `min_priority_for_full_ooda` threshold. Otherwise, skip to Phase C.
 
 ### 3.1 Phase A — Triage (Observe and Orient)
 
-| Attribute     | Value                                     |
-|---------------|-------------------------------------------|
-| Model         | Lightweight, high-context (Haiku / Gemini Flash) |
-| Input         | New observation + Tier 3 facts            |
-| Output        | SITREP object                             |
+| Attribute | Value                                            |
+| --------- | ------------------------------------------------ |
+| Model     | Lightweight, high-context (Haiku / Gemini Flash) |
+| Input     | New observation + Tier 3 facts                   |
+| Output    | SITREP object                                    |
 
 The Triage performs **salience detection**: does this new input actually matter
 given what we know about the user's priorities and current state?
@@ -161,13 +164,14 @@ given what we know about the user's priorities and current state?
 interface SITREP {
   priority: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
   summary: string;
-  conflictsDetected: string[];   // e.g. "new email contradicts Q2 deadline"
-  relevantFacts: string[];       // keys from KNOWLEDGE.json used in reasoning
-  recommendedDomains: string[];  // which PRIORITIES.json domains apply
+  conflictsDetected: string[]; // e.g. "new email contradicts Q2 deadline"
+  relevantFacts: string[]; // keys from KNOWLEDGE.json used in reasoning
+  recommendedDomains: string[]; // which PRIORITIES.json domains apply
 }
 ```
 
 **Prompt contract:** The Triage model receives a structured prompt containing:
+
 - The raw observation (user message, webhook event, tool output)
 - The full `KNOWLEDGE.json` facts section
 - Current `PRIORITIES.json` domain weights
@@ -188,23 +192,23 @@ and scores multiple candidate strategies.
 **Activity 1 — Hypothesis Generation:**
 The agent generates 2-4 distinct strategies from the configured archetypes:
 
-| Archetype              | Description                                           |
-|------------------------|-------------------------------------------------------|
-| `aggressive_fix`       | Act immediately with full effort and resources        |
-| `delegate_task`        | Route to another person or agent; track to completion |
-| `strategic_delay`      | Defer until a better moment; set reminder + context   |
-| `minimal_viable_action`| Do the smallest thing that unblocks progress          |
+| Archetype               | Description                                           |
+| ----------------------- | ----------------------------------------------------- |
+| `aggressive_fix`        | Act immediately with full effort and resources        |
+| `delegate_task`         | Route to another person or agent; track to completion |
+| `strategic_delay`       | Defer until a better moment; set reminder + context   |
+| `minimal_viable_action` | Do the smallest thing that unblocks progress          |
 
 The archetype list is extensible via `PRIORITIES.json`.
 
 **Activity 2 — Multi-Variable Scoring:**
 Each strategy is scored against three axes:
 
-| Axis        | Weight | Description                                            |
-|-------------|--------|--------------------------------------------------------|
-| Alignment   | 0.40   | Match with SOUL.md and active domain goals             |
-| Efficiency  | 0.35   | Token cost and time vs. expected value                 |
-| Risk        | 0.25   | Potential for irreversible side-effects or missed commitments |
+| Axis       | Weight | Description                                                   |
+| ---------- | ------ | ------------------------------------------------------------- |
+| Alignment  | 0.40   | Match with SOUL.md and active domain goals                    |
+| Efficiency | 0.35   | Token cost and time vs. expected value                        |
+| Risk       | 0.25   | Potential for irreversible side-effects or missed commitments |
 
 **Startup assertion:** Rubric weights must sum to 1.0. The VALUATION_ENGINE
 asserts this on boot and refuses to start if violated.
@@ -216,22 +220,22 @@ strategy wins.
 
 ```typescript
 interface Strategy {
-  label: string;           // archetype name
-  reasoning: string;       // one-line rationale
-  alignmentScore: number;  // 0.0 - 1.0
+  label: string; // archetype name
+  reasoning: string; // one-line rationale
+  alignmentScore: number; // 0.0 - 1.0
   efficiencyScore: number; // 0.0 - 1.0
-  riskScore: number;       // 0.0 - 1.0 (higher = safer)
-  weightedTotal: number;   // computed by VALUATION_ENGINE
+  riskScore: number; // 0.0 - 1.0 (higher = safer)
+  weightedTotal: number; // computed by VALUATION_ENGINE
 }
 ```
 
 ### 3.3 Phase C — Executive (Decide and Act)
 
-| Attribute     | Value                                     |
-|---------------|-------------------------------------------|
-| Model         | Large, reasoning-heavy (Claude Sonnet / Opus / GPT-4o) |
-| Input         | SITREP + winning Strategy + original observation |
-| Output        | Tool calls + ExpectedOutcome statement    |
+| Attribute | Value                                                  |
+| --------- | ------------------------------------------------------ |
+| Model     | Large, reasoning-heavy (Claude Sonnet / Opus / GPT-4o) |
+| Input     | SITREP + winning Strategy + original observation       |
+| Output    | Tool calls + ExpectedOutcome statement                 |
 
 The Executive receives the SITREP and winning strategy as structured context
 prepended to its system prompt. It commits to the chosen strategy and generates
@@ -242,10 +246,10 @@ a linear action script.
 ```typescript
 interface ExpectedOutcome {
   actionId: string;
-  description: string;     // "PR #1234 should merge successfully"
-  successSignal: string;   // "tool gh_pr_merge returns 200"
-  failureSignal: string;   // "tool returns 422 or user says 'no'"
-  domain: string;          // which PRIORITIES.json domain this falls under
+  description: string; // "PR #1234 should merge successfully"
+  successSignal: string; // "tool gh_pr_merge returns 200"
+  failureSignal: string; // "tool returns 422 or user says 'no'"
+  domain: string; // which PRIORITIES.json domain this falls under
 }
 ```
 
@@ -268,13 +272,14 @@ and event infrastructure.
 
 ### 4.1 The Archivist (Semantic Refinement)
 
-| Attribute     | Value                                     |
-|---------------|-------------------------------------------|
-| Trigger       | Every 100 turns (configurable via `thresholds.archivist_turn_interval`) |
-| Input         | Tier 2 episodic events since last run     |
-| Output        | Tier 3 fact upserts                       |
+| Attribute | Value                                                                   |
+| --------- | ----------------------------------------------------------------------- |
+| Trigger   | Every 100 turns (configurable via `thresholds.archivist_turn_interval`) |
+| Input     | Tier 2 episodic events since last run                                   |
+| Output    | Tier 3 fact upserts                                                     |
 
 **Turn counter:** Stored in `~/.openclaw/workspace/.archivist-state.json`:
+
 ```json
 {
   "last_run_turn": 0,
@@ -287,6 +292,7 @@ the state file is not updated, so the next run will reprocess the same window.
 This is safe because `upsertFact` is idempotent.
 
 **Process:**
+
 1. Query Tier 2 (LanceDB) for events since `last_run_turn`.
 2. Run a summarization pass (using the Triage model) to extract stable patterns.
 3. For each stable pattern, call `semanticMemory.upsertFact()`.
@@ -303,11 +309,11 @@ last 100 turns, it upserts a preference fact reflecting this pattern.
 
 ### 4.2 The Meta-Reviewer (Structural Refinement)
 
-| Attribute     | Value                                     |
-|---------------|-------------------------------------------|
-| Trigger       | (1) `criticalFailure` event, (2) weekly cron |
-| Input         | ExpectedOutcome + ActualOutcome pairs     |
-| Output        | Policy proposals + weight adjustments     |
+| Attribute | Value                                        |
+| --------- | -------------------------------------------- |
+| Trigger   | (1) `criticalFailure` event, (2) weekly cron |
+| Input     | ExpectedOutcome + ActualOutcome pairs        |
+| Output    | Policy proposals + weight adjustments        |
 
 #### Actual Outcome Detection
 
@@ -318,7 +324,7 @@ in v1:
 type ActualOutcome =
   | { source: "tool_result"; success: boolean; toolName: string; summary: string }
   | { source: "user_signal"; signal: "approved" | "overridden" | "corrected"; context: string }
-  | { source: "inferred"; confidence: number; reasoning: string };  // v2, gated off
+  | { source: "inferred"; confidence: number; reasoning: string }; // v2, gated off
 ```
 
 **`tool_result`** (high confidence): Captured automatically from tool call responses.
@@ -341,15 +347,16 @@ New event type on the Gateway event bus:
 interface CriticalFailureEvent {
   type: "criticalFailure";
   timestamp: string;
-  actionId: string;           // links to ExpectedOutcome
+  actionId: string; // links to ExpectedOutcome
   expectedOutcome: ExpectedOutcome;
   actualOutcome: ActualOutcome;
   severity: "warning" | "critical";
-  implicated_rule?: string;   // SOUL.md rule key, if applicable
+  implicated_rule?: string; // SOUL.md rule key, if applicable
 }
 ```
 
 **Emission criteria:** A `criticalFailure` is emitted when:
+
 - A tool call returns a 4xx/5xx AND the ExpectedOutcome predicted success, OR
 - The user explicitly overrides/corrects an agent action, OR
 - The `actualOutcome` priority score is >= `critical_failure_score_floor` (default 3)
@@ -365,16 +372,17 @@ it emits a `PolicyProposal`:
 interface PolicyProposal {
   id: string;
   timestamp: string;
-  rule: string;              // the SOUL.md rule implicated
-  proposal: string;          // suggested change
-  reasoning: string;         // why the change would help
-  evidence: string[];        // actionIds that support this
+  rule: string; // the SOUL.md rule implicated
+  proposal: string; // suggested change
+  reasoning: string; // why the change would help
+  evidence: string[]; // actionIds that support this
   status: "pending" | "approved" | "rejected";
 }
 ```
 
 **Delivery mechanism:** Policy proposals are written to
 `~/.openclaw/workspace/.policy-proposals.json` and surfaced via:
+
 1. A `openclaw workspace proposals` CLI command (new).
 2. A notification in the agent's next turn preamble ("You have 2 pending policy
    proposals").
@@ -397,6 +405,7 @@ new_weight = clamp(
 ```
 
 **Guardrails:**
+
 - Minimum observation window: 10 outcomes in a domain before any adjustment.
 - Maximum single adjustment: +/- 0.05 per review cycle.
 - Floor of 0.1 prevents any domain from being fully muted.
@@ -412,11 +421,12 @@ The VALUATION_ENGINE is the scoring function used in Phase B (Strategy).
 ```typescript
 interface ValuationEngine {
   score(strategies: Strategy[], domains: DomainWeights): Strategy;
-  validateRubric(rubric: ScoringRubric): void;  // asserts weights sum to 1.0
+  validateRubric(rubric: ScoringRubric): void; // asserts weights sum to 1.0
 }
 ```
 
 **Formula:** `V = sum(Si * Wi)` where:
+
 - `Si` = per-axis score (alignment, efficiency, risk) for strategy i
 - `Wi` = axis weight from `scoring_rubric` in `PRIORITIES.json`
 
@@ -424,6 +434,7 @@ The per-axis scores are then multiplied by the relevant domain weight from
 `PRIORITIES.json` to produce the final score.
 
 **Startup behavior:** On boot, the engine:
+
 1. Reads `PRIORITIES.json`.
 2. Asserts `scoring_rubric` weights sum to 1.0 (+/- 0.001 for floating point).
 3. Asserts all domain weights are in [0.1, 1.0].
@@ -461,18 +472,24 @@ interface KnowledgeFile {
     communication_style: string;
   };
   stack: Record<string, string>;
-  projects: Record<string, {
-    status: "active" | "paused" | "complete";
-    priority_domain: string;
-    key_constraint: string;
-    notes: string;
-  }>;
-  people: Record<string, {
-    role: string;
-    relationship: string;
-    communication_preference: string;
-    notes: string;
-  }>;
+  projects: Record<
+    string,
+    {
+      status: "active" | "paused" | "complete";
+      priority_domain: string;
+      key_constraint: string;
+      notes: string;
+    }
+  >;
+  people: Record<
+    string,
+    {
+      role: string;
+      relationship: string;
+      communication_preference: string;
+      notes: string;
+    }
+  >;
   preferences: {
     always_ask_before: string[];
     never_do: string[];
@@ -504,13 +521,16 @@ interface PrioritiesFile {
     updated_by: "user" | "meta_reviewer";
     description: string;
   };
-  domains: Record<string, {
-    weight: number;          // 0.1 - 1.0
-    description: string;
-    examples: string[];
-    approval_count: number;
-    override_count: number;
-  }>;
+  domains: Record<
+    string,
+    {
+      weight: number; // 0.1 - 1.0
+      description: string;
+      examples: string[];
+      approval_count: number;
+      override_count: number;
+    }
+  >;
   strategy_labels: Array<{
     label: string;
     description: string;
@@ -592,30 +612,30 @@ Everything that can be a plugin should be a plugin. This maximizes reuse of
 existing infrastructure (lifecycle hooks, cron, CLI registration, config schema)
 and keeps the core agent loop clean.
 
-| Component | Location | Rationale |
-|-----------|----------|-----------|
-| Tier 2 episodic memory | `extensions/memory-lancedb/` (extend) | Already has LanceDB, embeddings, tools, hooks. Add OODA-specific fields and pruning. |
-| Tier 3 semantic memory | `extensions/memory-ooda/semantic-memory.ts` | New. KNOWLEDGE.json read/write + snapshot. Registers `before_agent_start` hook to inject facts. |
-| Archivist cron | `extensions/memory-ooda/archivist.ts` | New. Registers as cron job via Gateway cron API. Reads Tier 2, writes Tier 3. |
-| OODA types | `extensions/memory-ooda/types.ts` | New. All shared interfaces (SITREP, Strategy, ExpectedOutcome, ActualOutcome, etc.) |
-| PRIORITIES.json management | `extensions/memory-ooda/priorities.ts` | New. Read/write/validate + snapshot. |
-| Policy proposals | `extensions/memory-ooda/proposals.ts` | New. Write/read `.policy-proposals.json`. |
-| CLI commands | `extensions/memory-ooda/` | New. `openclaw workspace proposals`, `openclaw workspace rollback`. |
+| Component                  | Location                                    | Rationale                                                                                       |
+| -------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Tier 2 episodic memory     | `extensions/memory-lancedb/` (extend)       | Already has LanceDB, embeddings, tools, hooks. Add OODA-specific fields and pruning.            |
+| Tier 3 semantic memory     | `extensions/memory-ooda/semantic-memory.ts` | New. KNOWLEDGE.json read/write + snapshot. Registers `before_agent_start` hook to inject facts. |
+| Archivist cron             | `extensions/memory-ooda/archivist.ts`       | New. Registers as cron job via Gateway cron API. Reads Tier 2, writes Tier 3.                   |
+| OODA types                 | `extensions/memory-ooda/types.ts`           | New. All shared interfaces (SITREP, Strategy, ExpectedOutcome, ActualOutcome, etc.)             |
+| PRIORITIES.json management | `extensions/memory-ooda/priorities.ts`      | New. Read/write/validate + snapshot.                                                            |
+| Policy proposals           | `extensions/memory-ooda/proposals.ts`       | New. Write/read `.policy-proposals.json`.                                                       |
+| CLI commands               | `extensions/memory-ooda/`                   | New. `openclaw workspace proposals`, `openclaw workspace rollback`.                             |
 
 ### Core Layer — `src/`
 
 These modifications touch the agent loop itself and cannot be plugins.
 
-| Component | Location | Rationale |
-|-----------|----------|-----------|
-| Triage phase | `src/agents/ooda/triage.ts` | New. Lightweight model pre-pass before Executive. |
-| Strategy / Decision Matrix | `src/agents/ooda/strategy.ts` | New. Hypothesis generation + scoring. |
-| VALUATION_ENGINE | `src/agents/ooda/valuation-engine.ts` | New. `V = sum(Si * Wi)` scoring function. |
-| Agent loop integration | `src/agents/cli-runner.ts` (modify) | Wrap existing LLM call with triage → strategy → executive sequence. |
-| Meta-Reviewer | `src/agents/ooda/meta-reviewer.ts` | New. Outcome tracking + weight adjustment. Hooks into agent events. |
-| `criticalFailure` event | `src/gateway/events.ts` (modify) | Add new event type to Gateway event bus. |
-| Outcome metadata | `src/gateway/server-methods/` (modify) | Extend `sessions.patch` schema with `expectedOutcome` / `actualOutcome`. |
-| Config schema | `src/config/` (modify) | Add `agents.defaults.triageModel` key. |
+| Component                  | Location                               | Rationale                                                                |
+| -------------------------- | -------------------------------------- | ------------------------------------------------------------------------ |
+| Triage phase               | `src/agents/ooda/triage.ts`            | New. Lightweight model pre-pass before Executive.                        |
+| Strategy / Decision Matrix | `src/agents/ooda/strategy.ts`          | New. Hypothesis generation + scoring.                                    |
+| VALUATION_ENGINE           | `src/agents/ooda/valuation-engine.ts`  | New. `V = sum(Si * Wi)` scoring function.                                |
+| Agent loop integration     | `src/agents/cli-runner.ts` (modify)    | Wrap existing LLM call with triage → strategy → executive sequence.      |
+| Meta-Reviewer              | `src/agents/ooda/meta-reviewer.ts`     | New. Outcome tracking + weight adjustment. Hooks into agent events.      |
+| `criticalFailure` event    | `src/gateway/events.ts` (modify)       | Add new event type to Gateway event bus.                                 |
+| Outcome metadata           | `src/gateway/server-methods/` (modify) | Extend `sessions.patch` schema with `expectedOutcome` / `actualOutcome`. |
+| Config schema              | `src/config/` (modify)                 | Add `agents.defaults.triageModel` key.                                   |
 
 ### Why This Split
 
@@ -668,6 +688,7 @@ system prompt via `before_agent_start` hook.
 **Location:** `extensions/memory-ooda/`
 
 **Files:**
+
 - `extensions/memory-ooda/package.json`
 - `extensions/memory-ooda/openclaw.plugin.json`
 - `extensions/memory-ooda/types.ts` — `KnowledgeFile` and `PrioritiesFile` interfaces
@@ -685,6 +706,7 @@ system prompt via `before_agent_start` hook.
 **Location:** `extensions/memory-lancedb/` (modify)
 
 **Files:**
+
 - `extensions/memory-lancedb/index.ts` — extend `MemoryEntry` with OODA fields
 - `extensions/memory-lancedb/index.test.ts` — pruning tests
 
@@ -698,10 +720,12 @@ system prompt via `before_agent_start` hook.
 **Location:** `src/agents/ooda/`
 
 **Files:**
+
 - `src/agents/ooda/triage.ts` — Triage phase with prompt template
 - `src/agents/ooda/triage.test.ts`
 
 **Modify:**
+
 - `src/agents/cli-runner.ts` — wrap existing LLM call with triage-first check
 - `src/config/` — add `agents.defaults.triageModel`
 
@@ -716,6 +740,7 @@ system prompt via `before_agent_start` hook.
 **Location:** `src/agents/ooda/` + `extensions/memory-ooda/`
 
 **Files:**
+
 - `src/agents/ooda/strategy.ts` — hypothesis generation + scoring
 - `src/agents/ooda/valuation-engine.ts` — `V = sum(Si * Wi)` implementation
 - `src/agents/ooda/strategy.test.ts`
@@ -732,6 +757,7 @@ system prompt via `before_agent_start` hook.
 **Location:** `extensions/memory-ooda/`
 
 **Files:**
+
 - `extensions/memory-ooda/archivist.ts` — cron job via Gateway cron API
 - `extensions/memory-ooda/archivist.test.ts`
 
@@ -745,12 +771,14 @@ policy proposals, weight adjustment.
 **Location:** `src/agents/ooda/` + `src/gateway/` + `extensions/memory-ooda/`
 
 **Files:**
+
 - `src/agents/ooda/meta-reviewer.ts`
 - `src/agents/ooda/meta-reviewer.test.ts`
 - `src/gateway/events.ts` — add `criticalFailure` event type
 - `extensions/memory-ooda/proposals.ts` — policy proposal storage
 
 **Modify:**
+
 - `sessions.patch` schema — add `expectedOutcome` and `actualOutcome` fields
 - `src/agents/cli-runner.ts` — Executive emits ExpectedOutcome with each action
 
@@ -765,6 +793,7 @@ add `openclaw workspace` CLI commands.
 **Location:** `extensions/memory-ooda/` + config changes
 
 **Files:**
+
 - `extensions/memory-ooda/cli.ts` — `proposals`, `rollback` subcommands
 - Config changes to enable OODA chain by default
 

@@ -672,11 +672,27 @@ export async function runArchivist(
     } catch (err) {
       lastError = err;
       if (attempt === cfg.maxRetries) {
-        // All attempts failed — still mark events as processed
-        // to avoid reprocessing, but extract no patterns
+        // All attempts failed — do NOT mark events processed and do NOT
+        // advance last_run_at. Leave them for the next archivist run to retry.
+        // Marking processed on LLM failure silently discards data.
         fromFallback = true;
       }
     }
+  }
+
+  // If model failed entirely, bail without touching processed flags or state.
+  if (fromFallback) {
+    semanticStore.appendArchivistLog(
+      "distill_failed",
+      `Model failed after ${cfg.maxRetries + 1} attempt(s) on ${events.length} events — will retry next run. Last error: ${errorMessage(lastError)}`,
+    );
+    return {
+      patternsExtracted: [],
+      eventsProcessed: 0,
+      eventsPruned: 0,
+      fromFallback: true,
+      lastError: errorMessage(lastError),
+    };
   }
 
   // Step 3: Upsert patterns into Tier 3 (all upserts before any marking — C1)

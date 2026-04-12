@@ -55,7 +55,11 @@ describe("sitrep-log", () => {
     it("includes attention and domains in the entry", () => {
       appendSitrepLog(
         tmpDir,
-        makeSitrep({ priority: 8, attention: "Focus on blockers", recommendedDomains: ["ops", "dev"] }),
+        makeSitrep({
+          priority: 8,
+          attention: "Focus on blockers",
+          recommendedDomains: ["ops", "dev"],
+        }),
         "sess-3",
         "high",
       );

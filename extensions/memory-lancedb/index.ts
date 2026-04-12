@@ -19,6 +19,7 @@ import {
   memoryConfigSchema,
   vectorDimsForModel,
 } from "./config.js";
+import { WorldModelStore } from "./world-model-store.js";
 
 // ============================================================================
 // Types
@@ -398,10 +399,42 @@ class SqliteVecMemoryDB {
     if (!colNames.has("outcomeAt")) {
       db.exec("ALTER TABLE memories ADD COLUMN outcomeAt INTEGER");
     }
+    // CR_SQLITE_VEC_ROWID_FIX: sqlite-vec 0.1.7-alpha.2 rejects explicit rowid on INSERT.
+    // Store the auto-assigned vec rowid in memories table for join/delete.
+    if (!colNames.has("vec_rowid")) {
+      db.exec("ALTER TABLE memories ADD COLUMN vec_rowid INTEGER");
+    }
 
     db.exec(
       `CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(vector float[${this.vectorDim}])`,
     );
+
+    // ── Phase 1: Inbox + Topic Tracker (OpenCLOODA) ──────────────────────
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS inbox (
+        id TEXT PRIMARY KEY,
+        capturedAt INTEGER NOT NULL,
+        sessionId TEXT,
+        text TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('project','area','reference','trash','someday')),
+        pertiansTo TEXT,
+        nextTouchpoint TEXT CHECK (nextTouchpoint IN ('now','today','this_week','someday') OR nextTouchpoint IS NULL),
+        processed INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+      )
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS topic_tracker (
+        topic_key TEXT PRIMARY KEY,
+        sample_text TEXT,
+        turn_count INTEGER DEFAULT 0,
+        first_seen INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL,
+        suggested_at INTEGER,
+        dismissed_at INTEGER
+      )
+    `);
 
     this.db = db;
   }
@@ -415,7 +448,10 @@ class SqliteVecMemoryDB {
       createdAt: Date.now(),
     };
 
-    // Insert into both tables in a transaction using the same rowid
+    // Insert into both tables in a transaction.
+    // CR_SQLITE_VEC_ROWID_FIX: sqlite-vec 0.1.7-alpha.2 rejects explicit rowid on INSERT
+    // into vec0 tables when using node:sqlite bindings. Insert vec with auto-rowid,
+    // then store the assigned rowid back into memories.vec_rowid for join/delete.
     db.exec("BEGIN");
     try {
       const insertMeta = db.prepare(
@@ -433,11 +469,14 @@ class SqliteVecMemoryDB {
         fullEntry.archivistProcessed ? 1 : 0,
       );
 
-      // Get the rowid just inserted
-      const rowid = (db.prepare("SELECT last_insert_rowid() as rid").get() as { rid: number }).rid;
+      // Insert vec without explicit rowid — auto-assigned to avoid sqlite-vec bug
+      const insertVec = db.prepare("INSERT INTO memories_vec (vector) VALUES (?)");
+      insertVec.run(new Float32Array(fullEntry.vector));
+      const vecRowid = (db.prepare("SELECT last_insert_rowid() as rid").get() as { rid: number })
+        .rid;
 
-      const insertVec = db.prepare("INSERT INTO memories_vec (rowid, vector) VALUES (?, ?)");
-      insertVec.run(rowid, new Float32Array(fullEntry.vector));
+      // Store vec_rowid back into memories for join/delete
+      db.prepare("UPDATE memories SET vec_rowid = ? WHERE id = ?").run(vecRowid, fullEntry.id);
 
       db.exec("COMMIT");
     } catch (err) {
@@ -455,7 +494,7 @@ class SqliteVecMemoryDB {
       .prepare(
         `SELECT m.*, mv.distance
          FROM memories_vec mv
-         JOIN memories m ON mv.rowid = m.rowid
+         JOIN memories m ON mv.rowid = m.vec_rowid
          WHERE mv.vector MATCH ? AND k = ?
          ORDER BY mv.distance`,
       )
@@ -501,16 +540,18 @@ class SqliteVecMemoryDB {
       throw new Error(`Invalid memory ID format: ${id}`);
     }
 
-    // Find the rowid for cascade delete into vec table
-    const row = db.prepare("SELECT rowid FROM memories WHERE id = ?").get(id) as
-      | { rowid: number }
+    // Find the vec_rowid for cascade delete into vec table
+    const row = db.prepare("SELECT vec_rowid FROM memories WHERE id = ?").get(id) as
+      | { vec_rowid: number }
       | undefined;
     if (!row) return false;
 
     db.exec("BEGIN");
     try {
       db.prepare("DELETE FROM memories WHERE id = ?").run(id);
-      db.prepare("DELETE FROM memories_vec WHERE rowid = ?").run(row.rowid);
+      if (row.vec_rowid != null) {
+        db.prepare("DELETE FROM memories_vec WHERE rowid = ?").run(row.vec_rowid);
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
@@ -590,6 +631,11 @@ class SqliteVecMemoryDB {
     }));
   }
 
+  /** Expose raw sqlite handle for inbox/topic_tracker queries. */
+  async getRawDb(): Promise<SqliteDatabase> {
+    return this.ensureInitialized();
+  }
+
   async markProcessed(id: string): Promise<void> {
     const db = await this.ensureInitialized();
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -604,10 +650,10 @@ class SqliteVecMemoryDB {
 
     const condition = onlyProcessed ? "createdAt < ? AND archivistProcessed = 1" : "createdAt < ?";
 
-    // Find rowids to delete from vec table
+    // Find vec_rowids to delete from vec table
     const rows = db
-      .prepare(`SELECT rowid FROM memories WHERE ${condition}`)
-      .all(olderThanMs) as Array<{ rowid: number }>;
+      .prepare(`SELECT vec_rowid FROM memories WHERE ${condition}`)
+      .all(olderThanMs) as Array<{ vec_rowid: number | null }>;
 
     if (rows.length === 0) return 0;
 
@@ -615,7 +661,9 @@ class SqliteVecMemoryDB {
     try {
       db.prepare(`DELETE FROM memories WHERE ${condition}`).run(olderThanMs);
       for (const row of rows) {
-        db.prepare("DELETE FROM memories_vec WHERE rowid = ?").run(row.rowid);
+        if (row.vec_rowid != null) {
+          db.prepare("DELETE FROM memories_vec WHERE rowid = ?").run(row.vec_rowid);
+        }
       }
       db.exec("COMMIT");
     } catch (err) {
@@ -625,6 +673,172 @@ class SqliteVecMemoryDB {
 
     return rows.length;
   }
+}
+
+// ============================================================================
+// Phase 1: Inbox + Fast Clarify + Topic Tracker (OpenCLOODA)
+// ============================================================================
+
+export interface InboxClassification {
+  type: "project" | "area" | "reference" | "trash" | "someday";
+  pertiansTo: string | null;
+  nextTouchpoint: "now" | "today" | "this_week" | "someday" | null;
+}
+
+interface InboxItem extends InboxClassification {
+  id: string;
+  capturedAt: number;
+  sessionId: string;
+  text: string;
+  processed: boolean;
+}
+
+interface TopicSuggestion {
+  topicKey: string;
+  sampleText: string;
+  suggestedAt: number;
+}
+
+const VALID_INBOX_TYPES = new Set(["project", "area", "reference", "trash", "someday"]);
+const VALID_TOUCHPOINTS = new Set(["now", "today", "this_week", "someday"]);
+
+function readKnowledgeProjectIds(knowledgePath: string): string[] {
+  try {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const raw = fs.readFileSync(knowledgePath, "utf8");
+    const knowledge = JSON.parse(raw);
+    const ids: string[] = [];
+    if (knowledge.projects && typeof knowledge.projects === "object") {
+      ids.push(...Object.keys(knowledge.projects));
+    }
+    if (knowledge.areas && typeof knowledge.areas === "object") {
+      ids.push(...Object.keys(knowledge.areas));
+    }
+    return ids.filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Parse fast Clarify LLM response into InboxClassification.
+ * On failure, returns safe default: type=reference, pertiansTo=null, nextTouchpoint=null.
+ */
+export function parseFastClarifyResponse(raw: string): InboxClassification {
+  const safeDefault: InboxClassification = {
+    type: "reference",
+    pertiansTo: null,
+    nextTouchpoint: null,
+  };
+  try {
+    // Strip markdown code fences if present
+    const cleaned = raw
+      .replace(/^```(?:json)?\s*\n?/m, "")
+      .replace(/\n?```\s*$/m, "")
+      .trim();
+    const parsed = JSON.parse(cleaned);
+    const type = VALID_INBOX_TYPES.has(parsed.type) ? parsed.type : "reference";
+    const pertiansTo = typeof parsed.pertains_to === "string" ? parsed.pertains_to : null;
+    const nextTouchpoint = VALID_TOUCHPOINTS.has(parsed.next_touchpoint)
+      ? parsed.next_touchpoint
+      : null;
+    return { type, pertiansTo, nextTouchpoint };
+  } catch {
+    return safeDefault;
+  }
+}
+
+function buildFastClarifyPrompt(text: string, projectIds: string[]): string {
+  const idsLine = projectIds.length > 0 ? projectIds.join(", ") : "(none)";
+  return `You are classifying an observation for a personal knowledge management system.
+
+Active projects and areas: ${idsLine}
+
+Observation: "${text}"
+
+Classify this observation. Return JSON only, no explanation:
+{
+  "type": "project" | "area" | "reference" | "trash" | "someday",
+  "pertains_to": "<id from the active list above>" | null,
+  "next_touchpoint": "now" | "today" | "this_week" | "someday" | null
+}
+
+Rules:
+- "project" = relates to active work on a specific project
+- "area" = relates to an ongoing responsibility (OpenClaw stability, health, etc.)
+- "reference" = factual info worth keeping (architecture decisions, lessons learned)
+- "trash" = noise, pleasantries, no informational value
+- "someday" = interesting idea with no current action
+- pertains_to must be one of the active ids above, or null if none fit
+- next_touchpoint: "now" = needs attention this session, "today" = today, "this_week" = this week, "someday" = no urgency, null = not actionable`;
+}
+
+function buildInsightCheckPrompt(topicKey: string, sampleText: string): string {
+  return `Does this look like a project — something with a clear outcome and multiple steps?
+Topic: "${topicKey}"
+Recent mention: "${sampleText}"
+Return JSON: {"is_project": true|false, "suggested_name": "..." | null, "reason": "..."}`;
+}
+
+function writeInboxItem(db: SqliteDatabase, item: InboxItem): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO inbox (id, capturedAt, sessionId, text, type, pertiansTo, nextTouchpoint, processed, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    item.id,
+    item.capturedAt,
+    item.sessionId,
+    item.text,
+    item.type,
+    item.pertiansTo,
+    item.nextTouchpoint,
+    item.processed ? 1 : 0,
+    Date.now(),
+  );
+}
+
+function normalizeTopicSlug(text: string): string {
+  return text
+    .toLowerCase()
+    .split(/\s+/)
+    .slice(0, 3)
+    .join("-")
+    .replace(/[^a-z0-9-]/g, "");
+}
+
+function updateTopicTracker(
+  db: SqliteDatabase,
+  topicKey: string,
+  sampleText: string,
+): { turnCount: number } {
+  const now = Date.now();
+  const existing = db
+    .prepare("SELECT turn_count FROM topic_tracker WHERE topic_key = ?")
+    .get(topicKey) as { turn_count: number } | undefined;
+
+  if (existing) {
+    db.prepare(
+      "UPDATE topic_tracker SET turn_count = turn_count + 1, sample_text = ?, last_seen = ? WHERE topic_key = ?",
+    ).run(sampleText, now, topicKey);
+    return { turnCount: existing.turn_count + 1 };
+  }
+  db.prepare(
+    "INSERT INTO topic_tracker (topic_key, sample_text, turn_count, first_seen, last_seen) VALUES (?, ?, 1, ?, ?)",
+  ).run(topicKey, sampleText, now, now);
+  return { turnCount: 1 };
+}
+
+export function getPendingProjectSuggestions(db: SqliteDatabase): TopicSuggestion[] {
+  const rows = db
+    .prepare(
+      "SELECT topic_key, sample_text, suggested_at FROM topic_tracker WHERE suggested_at IS NOT NULL AND dismissed_at IS NULL",
+    )
+    .all() as Array<{ topic_key: string; sample_text: string; suggested_at: number }>;
+  return rows.map((r) => ({
+    topicKey: r.topic_key,
+    sampleText: r.sample_text ?? "",
+    suggestedAt: r.suggested_at,
+  }));
 }
 
 // ============================================================================
@@ -1387,6 +1601,155 @@ const memoryPlugin = {
         } catch (err) {
           api.logger.warn(`memory-lancedb: capture failed: ${String(err)}`);
         }
+      });
+    }
+
+    // ========================================================================
+    // Phase 1: Fast Clarify (always on — not gated by autoCapture)
+    // ========================================================================
+
+    {
+      const clarifyClient = new OpenAI({ apiKey, baseURL: baseUrl });
+      const clarifyModel = cfg.fastClarifyModel || "claude-haiku-4-5-20251001";
+      const knowledgePath = path.join(
+        process.env.HOME || require("node:os").homedir(),
+        ".openclaw",
+        "workspace",
+        "KNOWLEDGE.json",
+      );
+
+      api.on("agent_end", async (event, ctx) => {
+        if (ctx?.sessionKey?.startsWith("ooda-")) return;
+        if (!event.success || !event.messages || event.messages.length === 0) return;
+
+        // Extract last substantive assistant text (same logic as Archivist capture)
+        const lastAssistantText = (() => {
+          for (let i = event.messages.length - 1; i >= 0; i--) {
+            const msg = event.messages[i] as Record<string, unknown>;
+            if (msg.role !== "assistant") continue;
+            const content = msg.content;
+            if (typeof content === "string" && content.length > 0) return content;
+            if (Array.isArray(content)) {
+              const textBlocks = content
+                .filter(
+                  (b) =>
+                    b &&
+                    typeof b === "object" &&
+                    (b as Record<string, unknown>).type === "text" &&
+                    typeof (b as Record<string, unknown>).text === "string",
+                )
+                .map((b) => (b as Record<string, unknown>).text as string)
+                .join("\n")
+                .trim();
+              if (textBlocks.length > 0) return textBlocks;
+            }
+            break;
+          }
+          return null;
+        })();
+
+        if (!lastAssistantText || !isSubstantiveAssistantTurn(lastAssistantText)) return;
+
+        // Fire and forget — non-blocking
+        setImmediate(async () => {
+          try {
+            const backend = await getDb();
+            // Only SqliteVecMemoryDB has getRawDb; LanceDB backend doesn't
+            if (!("getRawDb" in backend)) return;
+            const rawDb = await (backend as SqliteVecMemoryDB).getRawDb();
+
+            // Phase 2: prefer world model project IDs when bootstrapped
+            let projectIds: string[];
+            try {
+              const wmPath = path.join(
+                process.env.HOME || require("node:os").homedir(),
+                ".openclaw",
+                "world-model",
+              );
+              const wmStore = new WorldModelStore(wmPath);
+              if (wmStore.isBootstrapped()) {
+                projectIds = wmStore.listProjects("active").map((p) => p.id);
+              } else {
+                projectIds = readKnowledgeProjectIds(knowledgePath);
+              }
+            } catch {
+              projectIds = readKnowledgeProjectIds(knowledgePath);
+            }
+            const observation = lastAssistantText.slice(
+              0,
+              cfg.captureMaxChars ?? DEFAULT_CAPTURE_MAX_CHARS,
+            );
+            const prompt = buildFastClarifyPrompt(observation, projectIds);
+
+            let classification: InboxClassification;
+            try {
+              const completion = await clarifyClient.chat.completions.create({
+                model: clarifyModel,
+                messages: [{ role: "user", content: prompt }],
+                max_tokens: 200,
+                temperature: 0,
+              });
+              const raw = completion.choices?.[0]?.message?.content ?? "";
+              classification = parseFastClarifyResponse(raw);
+            } catch (err) {
+              api.logger.warn(`memory-lancedb: fast clarify LLM call failed: ${String(err)}`);
+              classification = { type: "reference", pertiansTo: null, nextTouchpoint: null };
+            }
+
+            // Write inbox item
+            const inboxItem: InboxItem = {
+              id: randomUUID(),
+              capturedAt: Date.now(),
+              sessionId: ctx?.sessionKey ?? "",
+              text: observation,
+              ...classification,
+              processed: false,
+            };
+            writeInboxItem(rawDb, inboxItem);
+
+            // Update topic tracker
+            const topicKey = classification.pertiansTo || normalizeTopicSlug(observation);
+            if (!topicKey) return;
+            const { turnCount } = updateTopicTracker(rawDb, topicKey, observation);
+
+            // Suggestion detection: at turn_count == 8 for topics without active project match
+            if (
+              turnCount === 8 &&
+              !classification.pertiansTo &&
+              (classification.type === "project" || classification.type === "reference")
+            ) {
+              try {
+                const insightPrompt = buildInsightCheckPrompt(topicKey, observation);
+                const insightCompletion = await clarifyClient.chat.completions.create({
+                  model: clarifyModel,
+                  messages: [{ role: "user", content: insightPrompt }],
+                  max_tokens: 200,
+                  temperature: 0,
+                });
+                const insightRaw = insightCompletion.choices?.[0]?.message?.content ?? "";
+                const insightCleaned = insightRaw
+                  .replace(/^```(?:json)?\s*\n?/m, "")
+                  .replace(/\n?```\s*$/m, "")
+                  .trim();
+                const insight = JSON.parse(insightCleaned);
+                if (insight.is_project) {
+                  rawDb
+                    .prepare("UPDATE topic_tracker SET suggested_at = ? WHERE topic_key = ?")
+                    .run(Date.now(), topicKey);
+                  api.logger.info(
+                    `memory-lancedb: project suggestion surfaced for topic "${topicKey}"`,
+                  );
+                }
+              } catch (err) {
+                api.logger.warn(
+                  `memory-lancedb: insight check failed for topic "${topicKey}": ${String(err)}`,
+                );
+              }
+            }
+          } catch (err) {
+            api.logger.warn(`memory-lancedb: fast clarify failed: ${String(err)}`);
+          }
+        });
       });
     }
 
