@@ -184,10 +184,25 @@ Any OpenAI-compatible embeddings endpoint works. For example, with Ollama:
 
 **Agent model configuration** is handled by OpenClaw's standard provider system -- configure your preferred LLM provider (Anthropic, OpenAI, Ollama, etc.) in the `connections` section of `openclaw.json`. The OODA triage and strategy phases use whatever model OpenClaw routes to. See the [OpenClaw docs](https://docs.openclaw.ai/configuration) for provider setup.
 
+**Archivist model (required):** The archivist runs outside the gateway request context (in `setImmediate` after `agent_end`) and therefore cannot use the gateway's model stack. It calls the Anthropic API directly using `claude-3-haiku-20240307`. You must have a direct Anthropic API key configured in OpenClaw's auth profiles:
+
+```bash
+# Check if you already have one:
+cat ~/.openclaw/agents/main/agent/auth-profiles.json | grep -A2 'anthropic:default'
+```
+
+If not, run `openclaw setup` or add it via the OpenClaw connections wizard. The key is stored at `~/.openclaw/agents/main/agent/auth-profiles.json` under `profiles.anthropic:default.key`. Note: this is separate from any Vertex AI or other provider you may use for the main agent.
+
 ### CLI commands
 
 ```bash
-openclaw workspace status                    # Health overview
+# Health check — run this first if anything seems off
+openclaw ooda doctor                         # Full health report (green/yellow/red per subsystem)
+openclaw ooda doctor --json                  # Machine-readable output
+openclaw ooda doctor --alert-only            # Silent if healthy, output only on problems
+
+# Workspace
+openclaw workspace status                    # Knowledge + priorities overview
 openclaw workspace proposals list --pending  # Review pending policy proposals
 openclaw workspace proposals approve <id>    # Approve a proposal
 openclaw workspace proposals reject <id>     # Reject a proposal
@@ -195,6 +210,8 @@ openclaw workspace rollback list             # Show available snapshots
 openclaw workspace rollback restore knowledge  # Restore KNOWLEDGE.json
 openclaw workspace rollback restore priorities # Restore PRIORITIES.json
 ```
+
+**Tip:** If `openclaw ooda doctor` shows subsystems as "never fired" after setup, the most common cause is a plugin loading issue. Check `openclaw plugins list` and verify `memory-ooda` shows status `loaded`. If it shows `error`, run `openclaw gateway restart` and check the logs.
 
 ## Runtime files
 
