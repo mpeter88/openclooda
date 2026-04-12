@@ -646,10 +646,15 @@ export async function runArchivist(
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const state = readState(workspacePath);
 
-  // Step 1: Retrieve events since last run
-  // Use last_run_at timestamp (converted to ms) for the time-based query
-  const sinceTimestamp = new Date(state.last_run_at).getTime();
-  const events = await episodicStore.retrieveSince(sinceTimestamp, cfg.maxEventsPerRun);
+  // Step 1: Retrieve unprocessed events.
+  // Always query from epoch (sinceTimestamp=0) — the episodic store's
+  // retrieveSince filters on archivistProcessed=0, which is the authoritative
+  // gate. last_run_at was previously used as the time window but causes drift:
+  // if last_run_at advances past the newest unprocessed row (e.g. clock skew,
+  // state written after data), retrieveSince returns 0 events forever.
+  // The processed flag never has this problem — it's set only after successful
+  // distillation and cleared only by explicit reset.
+  const events = await episodicStore.retrieveSince(0, cfg.maxEventsPerRun);
 
   if (events.length === 0) {
     // Do NOT advance state — retrieval may have failed silently (C3)

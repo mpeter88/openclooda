@@ -682,8 +682,11 @@ describe("runArchivist", () => {
     expect(result.lastError).toContain("JSON");
   });
 
-  it("uses sinceTimestamp from state file for retrieval", async () => {
-    // Write a state file with a known last_run_at
+  it("always passes sinceTimestamp=0 to retrieveSince (archivistProcessed flag is authoritative)", async () => {
+    // last_run_at in state is irrelevant — we always query from epoch
+    // so the archivistProcessed flag gates retrieval, not time-based windowing.
+    // Time-based windowing caused drift: if last_run_at advances past the
+    // newest unprocessed row, retrieveSince returns 0 events forever.
     writeState(tmpDir, {
       last_processed_turn: 50,
       turns_since_last_archivist: 5,
@@ -707,7 +710,8 @@ describe("runArchivist", () => {
 
     await runArchivist(tmpDir, 150, episodicStore, semantic, callModel);
 
-    expect(capturedTimestamp).toBe(new Date("2026-03-15T00:00:00Z").getTime());
+    // Must always be 0 — let the store's archivistProcessed filter gate retrieval
+    expect(capturedTimestamp).toBe(0);
   });
 });
 
