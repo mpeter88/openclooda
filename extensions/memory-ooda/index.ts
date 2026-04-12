@@ -442,70 +442,43 @@ const oodaPlugin = {
     // Shared callModel helper (subagent pattern)
     // ========================================================================
 
-    // callModel: direct Anthropic HTTP call.
-    // Subagent methods are only available during a gateway request context,
-    // but the archivist fires in setImmediate after agent_end (outside that
-    // context). Direct HTTP avoids all request-scope constraints.
+    // callModel: runs inside a gateway request context via api.runtime.subagent.
+    // Must only be called from before_agent_start (request-scoped) — not from
+    // setImmediate or agent_end (outside request scope). Routes through the
+    // gateway's configured model stack (Vertex, OpenAI, Ollama, etc.) with
+    // correct auth, rate limiting, and cost tracking.
     const callModel: ModelCallFn = async (prompt: string): Promise<string> => {
-      // Resolve key: env var first, then auth-profiles.json (where the gateway stores it)
-      let apiKey = process.env.ANTHROPIC_API_KEY;
-      if (!apiKey) {
-        try {
-          const { join: pjoin } = await import("node:path");
-          const { homedir: phome } = await import("node:os");
-          const { readFileSync: pread } = await import("node:fs");
-          const profilesPath = pjoin(
-            phome(),
-            ".openclaw",
-            "agents",
-            "main",
-            "agent",
-            "auth-profiles.json",
-          );
-          const profiles = JSON.parse(pread(profilesPath, "utf-8")) as Record<string, unknown>;
-          const p = profiles as Record<string, Record<string, Record<string, string>>>;
-          const key = p?.profiles?.["anthropic:default"]?.key;
-          if (key && key.startsWith("sk-")) apiKey = key;
-        } catch {
-          /* fallthrough */
-        }
-      }
-      if (!apiKey) {
-        throw new Error(
-          "No Anthropic API key found (checked ANTHROPIC_API_KEY env + auth-profiles.json)",
-        );
-      }
-      const model = "claude-3-haiku-20240307";
-
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 4096,
-          system:
-            "You are an OODA reasoning agent. Respond with raw JSON only. No explanation, no code fences.",
-          messages: [{ role: "user", content: prompt }],
-        }),
+      const sessionKey = `ooda-${Date.now()}`;
+      const { runId } = await api.runtime.subagent.run({
+        sessionKey,
+        idempotencyKey: sessionKey,
+        message: prompt,
+        extraSystemPrompt:
+          "You are an OODA reasoning agent. Respond with raw JSON only. No explanation, no code fences.",
+        deliver: false,
       });
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => "(unreadable)");
-        throw new Error(`Anthropic API error ${response.status}: ${errText.slice(0, 200)}`);
+      const waitResult = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 120_000 });
+      if (waitResult.status !== "ok") {
+        throw new Error(`subagent run failed: ${waitResult.status} ${waitResult.error ?? ""}`);
       }
 
-      const data = (await response.json()) as {
-        content: Array<{ type: string; text: string }>;
-      };
-      const textBlock = data.content?.find((b) => b.type === "text");
-      if (!textBlock?.text) {
-        throw new Error("No text block in Anthropic response");
+      const { messages } = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 10 });
+
+      // Extract last assistant text block
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i] as Record<string, unknown>;
+        if (msg.role === "assistant") {
+          if (typeof msg.content === "string") return msg.content;
+          if (Array.isArray(msg.content)) {
+            for (let j = (msg.content as unknown[]).length - 1; j >= 0; j--) {
+              const block = (msg.content as Record<string, unknown>[])[j];
+              if (block.type === "text" && typeof block.text === "string") return block.text;
+            }
+          }
+        }
       }
-      return textBlock.text;
+      throw new Error("No assistant reply found in subagent session");
     };
 
     // ========================================================================
@@ -513,6 +486,57 @@ const oodaPlugin = {
     // ========================================================================
 
     api.on("before_agent_start", async (event, ctx) => {
+      // ── Archivist intercept ─────────────────────────────────────────────────
+      // Runs before any context injection. The system event from agent_end
+      // triggers distillation here — inside the request context where
+      // api.runtime.subagent and callModel work correctly.
+      if (event.prompt.includes("[OODA_ARCHIVIST_RUN]")) {
+        try {
+          const episodicStore = await getEpisodicStore();
+          if (episodicStore) {
+            let turnInterval = 10;
+            try {
+              turnInterval = getPriorities(workspacePath).thresholds.archivist_turn_interval;
+            } catch {
+              /* default */
+            }
+            const semanticStore: SemanticStore = {
+              upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
+              appendArchivistLog: (action, reason) =>
+                appendArchivistLog(workspacePath, action, reason),
+            };
+            const result = await runArchivist(
+              workspacePath,
+              0,
+              episodicStore,
+              semanticStore,
+              callModel,
+              { turnInterval },
+            );
+            if (result.fromFallback) {
+              api.logger.warn(
+                `memory-ooda: archivist model failed — will retry. Error: ${result.lastError ?? "unknown"}`,
+              );
+              pingHealthError(workspacePath, "archivist", result.lastError ?? "model failed");
+            } else {
+              api.logger.info(
+                `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
+              );
+              pingHealth(workspacePath, "archivist", {
+                eventsProcessed: result.eventsProcessed,
+                patternsExtracted: result.patternsExtracted.length,
+              });
+            }
+          }
+        } catch (err) {
+          api.logger.warn(`memory-ooda: archivist failed: ${String(err)}`);
+          pingHealthError(workspacePath, "archivist", String(err));
+        }
+        // Return undefined — no context injection, no visible agent output
+        return;
+      }
+      // ── End archivist intercept ─────────────────────────────────────────────
+
       try {
         const knowledge = getFacts(workspacePath);
         const context = formatFactsForContext(knowledge);
@@ -898,48 +922,23 @@ const oodaPlugin = {
 
       if (!shouldRunArchivist(currentState, turnInterval)) return;
 
-      // Fire archivist non-blocking — callModel reads key from auth-profiles.json
-      setImmediate(() => {
-        void (async () => {
-          try {
-            const episodicStore = await getEpisodicStore();
-            if (!episodicStore) {
-              api.logger.warn("memory-ooda: archivist skipped — episodic store unavailable");
-              return;
-            }
-            const semanticStore: SemanticStore = {
-              upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
-              appendArchivistLog: (action, reason) =>
-                appendArchivistLog(workspacePath, action, reason),
-            };
-            const result = await runArchivist(
-              workspacePath,
-              turnCount,
-              episodicStore,
-              semanticStore,
-              callModel,
-              { turnInterval },
-            );
-            if (result.fromFallback) {
-              api.logger.warn(
-                `memory-ooda: archivist model failed — will retry. Error: ${result.lastError ?? "unknown"}`,
-              );
-              pingHealthError(workspacePath, "archivist", result.lastError ?? "model failed");
-            } else {
-              api.logger.info(
-                `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
-              );
-              pingHealth(workspacePath, "archivist", {
-                eventsProcessed: result.eventsProcessed,
-                patternsExtracted: result.patternsExtracted.length,
-              });
-            }
-          } catch (err) {
-            api.logger.warn(`memory-ooda: archivist failed: ${String(err)}`);
-            pingHealthError(workspacePath, "archivist", String(err));
-          }
-        })();
-      });
+      // Archivist is due — schedule via system event so it runs inside the next
+      // before_agent_start call, which is inside the gateway request context where
+      // api.runtime.subagent (and thus callModel) is available. The gateway model
+      // stack (Vertex/OpenAI/etc) handles auth and routing correctly.
+      const archivistSessionKey = ctx?.sessionKey;
+      if (!archivistSessionKey) {
+        api.logger.warn("memory-ooda: archivist due but no sessionKey — cannot schedule");
+        return;
+      }
+      try {
+        api.runtime.system.enqueueSystemEvent("[OODA_ARCHIVIST_RUN]", {
+          sessionKey: archivistSessionKey,
+        });
+        api.logger.info("memory-ooda: archivist scheduled via system event");
+      } catch (err) {
+        api.logger.warn(`memory-ooda: failed to schedule archivist: ${String(err)}`);
+      }
     });
 
     // ========================================================================
