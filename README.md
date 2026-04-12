@@ -184,14 +184,7 @@ Any OpenAI-compatible embeddings endpoint works. For example, with Ollama:
 
 **Agent model configuration** is handled by OpenClaw's standard provider system -- configure your preferred LLM provider (Anthropic, OpenAI, Ollama, etc.) in the `connections` section of `openclaw.json`. The OODA triage and strategy phases use whatever model OpenClaw routes to. See the [OpenClaw docs](https://docs.openclaw.ai/configuration) for provider setup.
 
-**Archivist model (required):** The archivist runs outside the gateway request context (in `setImmediate` after `agent_end`) and therefore cannot use the gateway's model stack. It calls the Anthropic API directly using `claude-3-haiku-20240307`. You must have a direct Anthropic API key configured in OpenClaw's auth profiles:
-
-```bash
-# Check if you already have one:
-cat ~/.openclaw/agents/main/agent/auth-profiles.json | grep -A2 'anthropic:default'
-```
-
-If not, run `openclaw setup` or add it via the OpenClaw connections wizard. The key is stored at `~/.openclaw/agents/main/agent/auth-profiles.json` under `profiles.anthropic:default.key`. Note: this is separate from any Vertex AI or other provider you may use for the main agent.
+**Archivist model:** The archivist uses the same model and provider as your main agent — no additional API keys required. It schedules itself via a system event and runs inside a gateway request context with full auth and routing support.
 
 ### CLI commands
 
