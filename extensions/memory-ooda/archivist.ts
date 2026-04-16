@@ -537,7 +537,7 @@ export function addWeightProposals(
 const DEFAULT_CONFIG: ArchivistConfig = {
   turnInterval: 100,
   pruneAfterDays: 90,
-  maxEventsPerRun: 500,
+  maxEventsPerRun: 20, // Process in small batches — keeps prompt tight and subagent within timeout
   maxRetries: 1,
 };
 

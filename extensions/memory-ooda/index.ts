@@ -458,7 +458,7 @@ const oodaPlugin = {
         deliver: false,
       });
 
-      const waitResult = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 120_000 });
+      const waitResult = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 300_000 });
       if (waitResult.status !== "ok") {
         throw new Error(`subagent run failed: ${waitResult.status} ${waitResult.error ?? ""}`);
       }
@@ -486,57 +486,6 @@ const oodaPlugin = {
     // ========================================================================
 
     api.on("before_agent_start", async (event, ctx) => {
-      // ── Archivist intercept ─────────────────────────────────────────────────
-      // Runs before any context injection. The system event from agent_end
-      // triggers distillation here — inside the request context where
-      // api.runtime.subagent and callModel work correctly.
-      if (event.prompt.includes("[OODA_ARCHIVIST_RUN]")) {
-        try {
-          const episodicStore = await getEpisodicStore();
-          if (episodicStore) {
-            let turnInterval = 10;
-            try {
-              turnInterval = getPriorities(workspacePath).thresholds.archivist_turn_interval;
-            } catch {
-              /* default */
-            }
-            const semanticStore: SemanticStore = {
-              upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
-              appendArchivistLog: (action, reason) =>
-                appendArchivistLog(workspacePath, action, reason),
-            };
-            const result = await runArchivist(
-              workspacePath,
-              0,
-              episodicStore,
-              semanticStore,
-              callModel,
-              { turnInterval },
-            );
-            if (result.fromFallback) {
-              api.logger.warn(
-                `memory-ooda: archivist model failed — will retry. Error: ${result.lastError ?? "unknown"}`,
-              );
-              pingHealthError(workspacePath, "archivist", result.lastError ?? "model failed");
-            } else {
-              api.logger.info(
-                `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
-              );
-              pingHealth(workspacePath, "archivist", {
-                eventsProcessed: result.eventsProcessed,
-                patternsExtracted: result.patternsExtracted.length,
-              });
-            }
-          }
-        } catch (err) {
-          api.logger.warn(`memory-ooda: archivist failed: ${String(err)}`);
-          pingHealthError(workspacePath, "archivist", String(err));
-        }
-        // Return undefined — no context injection, no visible agent output
-        return;
-      }
-      // ── End archivist intercept ─────────────────────────────────────────────
-
       try {
         const knowledge = getFacts(workspacePath);
         const context = formatFactsForContext(knowledge);
@@ -767,8 +716,7 @@ const oodaPlugin = {
               let councilMode: CouncilMode = "none";
               if (
                 priorities.thresholds.council_system2_enabled &&
-                sitrep.priority >= (priorities.thresholds.council_priority_threshold ?? 7) &&
-                thinkingRank[thinkingLevel] >= thinkingRank.medium
+                sitrep.priority >= (priorities.thresholds.council_priority_threshold ?? 7)
               ) {
                 councilMode = "system2";
               } else if (priorities.thresholds.council_system1_enabled) {
@@ -922,23 +870,45 @@ const oodaPlugin = {
 
       if (!shouldRunArchivist(currentState, turnInterval)) return;
 
-      // Archivist is due — schedule via system event so it runs inside the next
-      // before_agent_start call, which is inside the gateway request context where
-      // api.runtime.subagent (and thus callModel) is available. The gateway model
-      // stack (Vertex/OpenAI/etc) handles auth and routing correctly.
-      const archivistSessionKey = ctx?.sessionKey;
-      if (!archivistSessionKey) {
-        api.logger.warn("memory-ooda: archivist due but no sessionKey — cannot schedule");
-        return;
-      }
-      try {
-        api.runtime.system.enqueueSystemEvent("[OODA_ARCHIVIST_RUN]", {
-          sessionKey: archivistSessionKey,
-        });
-        api.logger.info("memory-ooda: archivist scheduled via system event");
-      } catch (err) {
-        api.logger.warn(`memory-ooda: failed to schedule archivist: ${String(err)}`);
-      }
+      // Archivist is due — run in setImmediate (after response is sent) so it
+      // never blocks the user's primary thread. Same pattern as Slow Clarify.
+      api.logger.info("memory-ooda: archivist scheduled via setImmediate (background)");
+      setImmediate(async () => {
+        try {
+          const episodicStore = await getEpisodicStore();
+          if (!episodicStore) return;
+          const semanticStore: SemanticStore = {
+            upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
+            appendArchivistLog: (action, reason) =>
+              appendArchivistLog(workspacePath, action, reason),
+          };
+          const result = await runArchivist(
+            workspacePath,
+            0,
+            episodicStore,
+            semanticStore,
+            callModel,
+            { turnInterval },
+          );
+          if (result.fromFallback) {
+            api.logger.warn(
+              `memory-ooda: archivist model failed — will retry. Error: ${result.lastError ?? "unknown"}`,
+            );
+            pingHealthError(workspacePath, "archivist", result.lastError ?? "model failed");
+          } else {
+            api.logger.info(
+              `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
+            );
+            pingHealth(workspacePath, "archivist", {
+              eventsProcessed: result.eventsProcessed,
+              patternsExtracted: result.patternsExtracted.length,
+            });
+          }
+        } catch (err) {
+          api.logger.warn(`memory-ooda: archivist background run failed: ${String(err)}`);
+          pingHealthError(workspacePath, "archivist", String(err));
+        }
+      });
     });
 
     // ========================================================================
