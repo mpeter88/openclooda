@@ -725,9 +725,18 @@ export async function runArchivist(
     }
   }
 
+  // Fetch all recent events once — reused by steps 3c, 9, 10, 11.
+  // Previously each step called retrieveSince(0, 10_000) independently,
+  // causing 4 redundant full table scans per archivist run.
+  let allRecent: EpisodicEvent[] = [];
+  try {
+    allRecent = await episodicStore.retrieveSince(0, 10_000);
+  } catch {
+    // Best-effort — supplementary steps degrade gracefully
+  }
+
   // Step 3c (O5): Outcome stats — summarize outcome data into KNOWLEDGE.json
   try {
-    const allRecent = await episodicStore.retrieveSince(0, 10_000);
     const withOutcome = allRecent.filter((e) => e.outcome);
     if (withOutcome.length > 0) {
       const outcomeStats: Record<string, string> = {};
@@ -821,7 +830,6 @@ export async function runArchivist(
   // Step 9 (V3): Weight proposal generation from domain outcome stats
   if (priorities) {
     try {
-      const allRecent = await episodicStore.retrieveSince(0, 10_000);
       const domainStats = aggregateDomainOutcomes(allRecent);
       const weightProposals = generateWeightProposals(domainStats, priorities);
       if (weightProposals.length > 0) {
@@ -849,8 +857,7 @@ export async function runArchivist(
         "knowledge",
         "ooda-lessons.json",
       );
-      const outcomeEvents = await episodicStore.retrieveSince(0, 10_000);
-      const exported = exportOodaLessons(amfLessonsPath, patterns, outcomeEvents);
+      const exported = exportOodaLessons(amfLessonsPath, patterns, allRecent);
       if (exported > 0) {
         semanticStore.appendArchivistLog(
           "amf_lessons_exported",
@@ -865,7 +872,6 @@ export async function runArchivist(
   // Step 11 (K5): Promote high-importance AMF findings into KNOWLEDGE.json
   try {
     const { promoteAMFFindings } = await import("./cross-project.js");
-    const allRecent = await episodicStore.retrieveSince(0, 10_000);
     const promoted = promoteAMFFindings(allRecent, semanticStore);
     if (promoted > 0) {
       semanticStore.appendArchivistLog(
@@ -884,4 +890,150 @@ export async function runArchivist(
     fromFallback,
     lastError: lastError ? errorMessage(lastError) : undefined,
   };
+}
+
+// ============================================================================
+// ArchivistRunner — Async Singleton
+// ============================================================================
+
+/** Logger interface matching the subset used by ArchivistRunner. */
+export interface ArchivistLogger {
+  info(msg: string): void;
+  warn(msg: string): void;
+}
+
+/** Dependencies injected at construction time. */
+export interface ArchivistRunnerDeps {
+  workspacePath: string;
+  logger: ArchivistLogger;
+  getEpisodicStore: () => Promise<EpisodicStore | null>;
+  makeSemanticStore: () => SemanticStore;
+  callModel: ModelCallFn;
+  /** Return current priorities, or undefined if unavailable. */
+  getPriorities: () => PrioritiesFile | undefined;
+  /** Health reporting callbacks. */
+  pingHealth: (component: string, data: Record<string, unknown>) => void;
+  pingHealthError: (component: string, error: string) => void;
+}
+
+/**
+ * Async singleton that owns the archivist lifecycle.
+ *
+ * - Instantiated once during plugin registration.
+ * - `nudge()` is called from every `agent_end` — increments turn counter,
+ *   persists state, and if the archivist is due, kicks off a background run
+ *   via setImmediate. At most one run at a time.
+ * - `callModel` uses direct Anthropic API calls (no subagent/request context
+ *   needed), so running from agent_end is safe.
+ */
+export class ArchivistRunner {
+  private running = false;
+  private turnCount: number;
+  private readonly deps: ArchivistRunnerDeps;
+
+  constructor(deps: ArchivistRunnerDeps) {
+    this.deps = deps;
+
+    // Restore turn count from persisted state
+    try {
+      const state = readState(deps.workspacePath);
+      this.turnCount = state.last_processed_turn;
+    } catch {
+      this.turnCount = 0;
+    }
+  }
+
+  /** True while a run is in progress. */
+  get isRunning(): boolean {
+    return this.running;
+  }
+
+  /**
+   * Called from `agent_end`. Increments the turn counter, persists state,
+   * and — if the archivist is due and not already running — kicks off a
+   * background run via setImmediate.
+   */
+  nudge(): void {
+    this.turnCount++;
+    this.deps.pingHealth("agent_end", { turnCount: this.turnCount });
+
+    // Persist turn counter
+    let currentState: ArchivistState;
+    try {
+      currentState = readState(this.deps.workspacePath);
+      writeState(this.deps.workspacePath, {
+        ...currentState,
+        last_processed_turn: this.turnCount,
+        turns_since_last_archivist: currentState.turns_since_last_archivist + 1,
+      });
+      currentState = {
+        ...currentState,
+        turns_since_last_archivist: currentState.turns_since_last_archivist + 1,
+      };
+    } catch (err) {
+      this.deps.logger.warn(`memory-ooda: failed to persist turn count: ${String(err)}`);
+      return;
+    }
+
+    if (this.running) return;
+
+    let turnInterval: number;
+    try {
+      const priorities = this.deps.getPriorities();
+      turnInterval = priorities?.thresholds?.archivist_turn_interval ?? 15;
+    } catch {
+      turnInterval = 15;
+    }
+
+    if (!shouldRunArchivist(currentState, turnInterval)) return;
+
+    // Archivist is due — run in setImmediate so it never blocks the user's
+    // response. callModel uses direct Anthropic API (no gateway subagent),
+    // so no request context is needed.
+    this.running = true;
+    this.deps.logger.info("memory-ooda: archivist starting (background)");
+    setImmediate(() => {
+      this.execute(turnInterval)
+        .catch((err) => {
+          this.deps.logger.warn(`memory-ooda: archivist background run failed: ${String(err)}`);
+          this.deps.pingHealthError("archivist", String(err));
+        })
+        .finally(() => {
+          this.running = false;
+        });
+    });
+  }
+
+  private async execute(turnInterval: number): Promise<void> {
+    const episodicStore = await this.deps.getEpisodicStore();
+    if (!episodicStore) return;
+
+    const semanticStore = this.deps.makeSemanticStore();
+    const priorities = this.deps.getPriorities();
+
+    const result = await runArchivist(
+      this.deps.workspacePath,
+      0,
+      episodicStore,
+      semanticStore,
+      this.deps.callModel,
+      { turnInterval },
+      priorities,
+    );
+
+    if (result.fromFallback) {
+      this.deps.logger.warn(
+        `memory-ooda: archivist model failed — will retry. Error: ${result.lastError ?? "unknown"}`,
+      );
+      this.deps.pingHealthError("archivist", result.lastError ?? "model failed");
+    } else {
+      this.deps.logger.info(
+        `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
+      );
+      this.deps.pingHealth("archivist", {
+        eventsProcessed: result.eventsProcessed,
+        patternsExtracted: result.patternsExtracted.length,
+      });
+    }
+  }
 }

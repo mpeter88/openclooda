@@ -24,6 +24,7 @@ import {
   writeState,
   shouldRunArchivist,
   runArchivist,
+  ArchivistRunner,
   type EpisodicStore,
   type EpisodicEvent,
   type SemanticStore,
@@ -439,47 +440,98 @@ const oodaPlugin = {
     }
 
     // ========================================================================
-    // Shared callModel helper (subagent pattern)
+    // Shared callModel helper (direct Anthropic API)
     // ========================================================================
 
-    // callModel: runs inside a gateway request context via api.runtime.subagent.
-    // Must only be called from before_agent_start (request-scoped) — not from
-    // setImmediate or agent_end (outside request scope). Routes through the
-    // gateway's configured model stack (Vertex, OpenAI, Ollama, etc.) with
-    // correct auth, rate limiting, and cost tracking.
-    const callModel: ModelCallFn = async (prompt: string): Promise<string> => {
-      const sessionKey = `ooda-${Date.now()}`;
-      const { runId } = await api.runtime.subagent.run({
-        sessionKey,
-        idempotencyKey: sessionKey,
-        message: prompt,
-        extraSystemPrompt:
-          "You are an OODA reasoning agent. Respond with raw JSON only. No explanation, no code fences.",
-        deliver: false,
+    // callModel: direct HTTP call to the Anthropic Messages API. Bypasses
+    // the gateway's subagent/lane/session-lock machinery entirely, so it
+    // works from any context (agent_end, setImmediate, fire-and-forget).
+    // API key is resolved once via modelAuth and cached for the plugin lifetime.
+
+    let cachedApiKey: string | undefined;
+
+    async function resolveApiKey(): Promise<string> {
+      if (cachedApiKey) return cachedApiKey;
+      const auth = await api.runtime.modelAuth.resolveApiKeyForProvider({
+        provider: "anthropic",
       });
-
-      const waitResult = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 300_000 });
-      if (waitResult.status !== "ok") {
-        throw new Error(`subagent run failed: ${waitResult.status} ${waitResult.error ?? ""}`);
+      if (!auth?.apiKey) {
+        throw new Error("memory-ooda: could not resolve Anthropic API key via modelAuth");
       }
+      cachedApiKey = auth.apiKey;
+      return cachedApiKey;
+    }
 
-      const { messages } = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 10 });
+    const callModel: ModelCallFn = async (prompt: string): Promise<string> => {
+      const apiKey = await resolveApiKey();
 
-      // Extract last assistant text block
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i] as Record<string, unknown>;
-        if (msg.role === "assistant") {
-          if (typeof msg.content === "string") return msg.content;
-          if (Array.isArray(msg.content)) {
-            for (let j = (msg.content as unknown[]).length - 1; j >= 0; j--) {
-              const block = (msg.content as Record<string, unknown>[])[j];
-              if (block.type === "text" && typeof block.text === "string") return block.text;
-            }
-          }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60_000);
+
+      try {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            system:
+              "You are an OODA reasoning agent. Respond with raw JSON only. No explanation, no code fences.",
+            messages: [{ role: "user", content: prompt }],
+          }),
+        });
+
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          throw new Error(`Anthropic API ${res.status}: ${body.slice(0, 200)}`);
         }
+
+        const data = (await res.json()) as {
+          content: Array<{ type: string; text?: string }>;
+        };
+
+        const textBlock = data.content?.find((b) => b.type === "text" && b.text);
+        if (!textBlock?.text) {
+          throw new Error("No text block in Anthropic API response");
+        }
+        return textBlock.text;
+      } finally {
+        clearTimeout(timeout);
       }
-      throw new Error("No assistant reply found in subagent session");
     };
+
+    // ========================================================================
+    // Archivist — async singleton, Tier 2 → Tier 3 distillation
+    // ========================================================================
+    // Constructed here (before event handlers) so both before_agent_start
+    // and agent_end can reference it. nudge() increments turns from agent_end;
+    // tryStart() fires the background run from before_agent_start where a
+    // request context is available for callModel → subagent.run().
+
+    const archivistRunner = new ArchivistRunner({
+      workspacePath,
+      logger: api.logger,
+      getEpisodicStore,
+      makeSemanticStore: () => ({
+        upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
+        appendArchivistLog: (action, reason) => appendArchivistLog(workspacePath, action, reason),
+      }),
+      callModel,
+      getPriorities: () => {
+        try {
+          return getPriorities(workspacePath);
+        } catch {
+          return undefined;
+        }
+      },
+      pingHealth: (component, data) => pingHealth(workspacePath, component, data),
+      pingHealthError: (component, error) => pingHealthError(workspacePath, component, error),
+    });
 
     // ========================================================================
     // Context Injection + OODA Triage/Strategy
@@ -821,94 +873,12 @@ const oodaPlugin = {
       }
     });
 
-    // ========================================================================
-    // Archivist — async Tier 2 → Tier 3 distillation on agent_end
-    // ========================================================================
-
-    let turnCount = 0;
-    try {
-      const initialState = readState(workspacePath);
-      turnCount = initialState.last_processed_turn;
-    } catch {
-      // Fresh workspace or corrupt state — start from 0
-    }
-
-    api.on("agent_end", (_event, ctx) => {
-      // Do NOT gate on event.success. The archivist reads from the episodic
-      // store (prior events), not the current turn. A failed turn — e.g. Ollama
-      // down, embedding error, prompt error — must not prevent distillation.
-      turnCount++;
-      // Health ping — agent_end hook is firing (proves loader fix is working)
-      pingHealth(workspacePath, "agent_end", { turnCount });
-
-      // Increment turns_since_last_archivist and persist. The archivist resets
-      // it to 0 after a successful run. No two-counter subtraction, no drift.
-      let currentState: ReturnType<typeof readState>;
-      try {
-        currentState = readState(workspacePath);
-        writeState(workspacePath, {
-          ...currentState,
-          last_processed_turn: turnCount,
-          turns_since_last_archivist: currentState.turns_since_last_archivist + 1,
-        });
-        currentState = {
-          ...currentState,
-          turns_since_last_archivist: currentState.turns_since_last_archivist + 1,
-        };
-      } catch (err) {
-        api.logger.warn(`memory-ooda: failed to persist turn count: ${String(err)}`);
-        return;
-      }
-
-      // Check if archivist is due
-      let turnInterval: number;
-      try {
-        turnInterval = getPriorities(workspacePath).thresholds.archivist_turn_interval;
-      } catch {
-        turnInterval = 15;
-      }
-
-      if (!shouldRunArchivist(currentState, turnInterval)) return;
-
-      // Archivist is due — run in setImmediate (after response is sent) so it
-      // never blocks the user's primary thread. Same pattern as Slow Clarify.
-      api.logger.info("memory-ooda: archivist scheduled via setImmediate (background)");
-      setImmediate(async () => {
-        try {
-          const episodicStore = await getEpisodicStore();
-          if (!episodicStore) return;
-          const semanticStore: SemanticStore = {
-            upsertFact: (section, key, value) => upsertFact(workspacePath, section, key, value),
-            appendArchivistLog: (action, reason) =>
-              appendArchivistLog(workspacePath, action, reason),
-          };
-          const result = await runArchivist(
-            workspacePath,
-            0,
-            episodicStore,
-            semanticStore,
-            callModel,
-            { turnInterval },
-          );
-          if (result.fromFallback) {
-            api.logger.warn(
-              `memory-ooda: archivist model failed — will retry. Error: ${result.lastError ?? "unknown"}`,
-            );
-            pingHealthError(workspacePath, "archivist", result.lastError ?? "model failed");
-          } else {
-            api.logger.info(
-              `memory-ooda: archivist completed — ${result.eventsProcessed} events, ${result.patternsExtracted.length} patterns`,
-            );
-            pingHealth(workspacePath, "archivist", {
-              eventsProcessed: result.eventsProcessed,
-              patternsExtracted: result.patternsExtracted.length,
-            });
-          }
-        } catch (err) {
-          api.logger.warn(`memory-ooda: archivist background run failed: ${String(err)}`);
-          pingHealthError(workspacePath, "archivist", String(err));
-        }
-      });
+    api.on("agent_end", () => {
+      // nudge() increments the turn counter, persists state, and — if the
+      // archivist is due and not already running — kicks off a background run.
+      // callModel now uses direct Anthropic API (no subagent/request context
+      // needed), so running from agent_end via setImmediate is safe.
+      archivistRunner.nudge();
     });
 
     // ========================================================================
