@@ -116,6 +116,8 @@ export interface PrioritiesFile {
     council_priority_threshold: number;
     council_system1_enabled: boolean;
     council_system2_enabled: boolean;
+    /** Trajectory-aware triage scaling config. */
+    trajectory_scaling?: TrajectoryScalingConfig;
   };
   _weight_adjustment_log: Array<{
     timestamp: string;
@@ -127,11 +129,33 @@ export interface PrioritiesFile {
 }
 
 // ============================================================================
+// Trajectory Scaling
+// ============================================================================
+
+export interface TrajectoryScalingConfig {
+  enabled: boolean; // default: true
+  /** Scale when cumulative positive, current signal positive. Default: 0.9 */
+  pos_pos_scale: number;
+  /** Scale when cumulative positive, current signal negative. Default: 0.7 */
+  pos_neg_scale: number;
+  /** Scale when cumulative negative, current signal positive. Default: 0.8 */
+  neg_pos_scale: number;
+  /** Scale when cumulative negative, current signal negative. Default: 1.3 */
+  neg_neg_scale: number;
+  /** Days of outcome history to compute trajectory. Default: 30 */
+  trajectory_window_days: number;
+  /** Minimum outcomes needed before trajectory is computed. Default: 3 */
+  min_outcomes_for_trajectory: number;
+}
+
+// ============================================================================
 // OODA Reasoning Chain
 // ============================================================================
 
 export interface SITREP {
   priority: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+  /** Priority before trajectory scaling (for debugging/logging). */
+  rawPriority?: number;
   summary: string;
   conflictsDetected: string[];
   relevantFacts: string[];
@@ -184,6 +208,10 @@ export interface DomainOutcomeStats {
   failures: number;
   partials: number;
   successRate: number;
+  /** Grounded metric from MetricRegistry, if available. [0.0, 1.0]. */
+  groundedScore?: number;
+  /** Description of the grounded metric source. */
+  groundedMetricSource?: string;
 }
 
 /** A proposed weight adjustment for a domain, based on outcome data. */

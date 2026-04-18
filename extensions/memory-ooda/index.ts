@@ -29,6 +29,7 @@ import {
   type EpisodicEvent,
   type SemanticStore,
 } from "./archivist.js";
+import { inferDomain } from "./archivist.js";
 import { registerWorkspaceCli } from "./cli.js";
 import { runCouncil, type CouncilMode } from "./council.js";
 import {
@@ -41,6 +42,7 @@ import {
   healthPath,
 } from "./health.js";
 import { runMetaReviewer, type PrioritiesStore, type ProposalStore } from "./meta-reviewer.js";
+import { createDefaultRegistry } from "./metric-registry.js";
 import { getPriorities, updateDomainWeight } from "./priorities.js";
 import { countPending, getProposals, addProposal } from "./proposals.js";
 import { Reflect, renderReflectNotification } from "./reflect.js";
@@ -61,7 +63,13 @@ import {
   wakeSync,
   evaluateDispatch,
 } from "./task-bridge.js";
-import { runTriage, shouldRunFullOODA, type ModelCallFn } from "./triage.js";
+import {
+  runTriage,
+  shouldRunFullOODA,
+  computeDomainTrajectories,
+  applyTrajectoryScaling,
+  type ModelCallFn,
+} from "./triage.js";
 
 // ============================================================================
 // Config
@@ -509,9 +517,9 @@ const oodaPlugin = {
     // Archivist — async singleton, Tier 2 → Tier 3 distillation
     // ========================================================================
     // Constructed here (before event handlers) so both before_agent_start
-    // and agent_end can reference it. nudge() increments turns from agent_end;
-    // tryStart() fires the background run from before_agent_start where a
-    // request context is available for callModel → subagent.run().
+    // and agent_end can reference it. nudge() increments turns from agent_end.
+
+    const metricRegistry = createDefaultRegistry();
 
     const archivistRunner = new ArchivistRunner({
       workspacePath,
@@ -531,6 +539,12 @@ const oodaPlugin = {
       },
       pingHealth: (component, data) => pingHealth(workspacePath, component, data),
       pingHealthError: (component, error) => pingHealthError(workspacePath, component, error),
+      metricRegistry,
+      makeMetricContext: (episodicStore) => ({
+        workspacePath,
+        episodicStore,
+        worldModelStore: new WorldModelStore(join(homedir(), ".openclaw", "world-model")),
+      }),
     });
 
     // ========================================================================
@@ -684,15 +698,48 @@ const oodaPlugin = {
         let councilResultRef: import("./council.js").CouncilResult | undefined;
 
         try {
+          // Compute domain trajectories from recent outcome-labeled events
+          let domainTrajectories: Record<string, number> | undefined;
+          try {
+            const episodicStore = await getEpisodicStore();
+            if (episodicStore) {
+              const trajConfig = priorities.thresholds.trajectory_scaling;
+              const windowDays = trajConfig?.trajectory_window_days ?? 30;
+              const minOutcomes = trajConfig?.min_outcomes_for_trajectory ?? 3;
+              const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+              const recentEvents = await episodicStore.retrieveSince(cutoff, 10_000);
+              domainTrajectories = computeDomainTrajectories(
+                recentEvents,
+                windowDays,
+                minOutcomes,
+                inferDomain,
+              );
+            }
+          } catch {
+            // Best-effort — trajectory enrichment is supplementary
+          }
+
           triageResult = await runTriage(
-            { observation: event.prompt, facts: knowledge, priorities },
+            { observation: event.prompt, facts: knowledge, priorities, domainTrajectories },
             callModel,
           );
 
-          const sitrep = triageResult.sitrep;
+          // Apply trajectory scaling to the SITREP priority
+          let sitrep = triageResult.sitrep;
+          if (domainTrajectories) {
+            sitrep = applyTrajectoryScaling(
+              sitrep,
+              domainTrajectories,
+              priorities.thresholds.trajectory_scaling,
+            );
+            triageResult = { ...triageResult, sitrep };
+          }
 
           // Health ping — triage ran
-          pingHealth(workspacePath, "triage", { priority: sitrep.priority });
+          pingHealth(workspacePath, "triage", {
+            priority: sitrep.priority,
+            rawPriority: sitrep.rawPriority,
+          });
 
           // S1: Persist SITREP to daily JSONL log
           try {

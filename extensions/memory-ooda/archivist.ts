@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type { MetricRegistry, MetricContext } from "./metric-registry.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import { addArchivistProposals, addProposal, type ProposalCandidate } from "./proposals.js";
 import type { ModelCallFn } from "./triage.js";
@@ -467,15 +468,18 @@ export function shouldProposeWeightAdjustment(
   stats: DomainOutcomeStats,
   currentWeight: number,
 ): WeightProposal | null {
+  // Prefer grounded metric when available; fall back to LLM-label success rate
+  const observedRate = stats.groundedScore ?? stats.successRate;
+  const metricSource = stats.groundedScore !== undefined ? "grounded" : "llm-labels";
   const expectedSuccessRate = currentWeight;
-  const delta = stats.successRate - expectedSuccessRate;
+  const delta = observedRate - expectedSuccessRate;
   if (Math.abs(delta) > 0.2 && stats.decisions >= 5) {
     const proposedWeight = clamp(currentWeight + delta * 0.3, 0.1, 1.0);
     return {
       domain: stats.domain,
       currentWeight,
       proposedWeight,
-      rationale: `${stats.decisions} decisions, ${(stats.successRate * 100).toFixed(0)}% success rate vs ${(currentWeight * 100).toFixed(0)}% weight`,
+      rationale: `${stats.decisions} decisions, ${(observedRate * 100).toFixed(0)}% ${metricSource} rate vs ${(currentWeight * 100).toFixed(0)}% weight`,
     };
   }
   return null;
@@ -642,6 +646,10 @@ export async function runArchivist(
   config?: Partial<ArchivistConfig>,
   /** Optional: pass priorities to enable V3 weight proposal generation. */
   priorities?: PrioritiesFile,
+  /** Optional: grounded metric registry for evaluation harness. */
+  metricRegistry?: MetricRegistry,
+  /** Optional: metric context for grounded score computation. */
+  metricContext?: MetricContext,
 ): Promise<ArchivistResult> {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const state = readState(workspacePath);
@@ -831,6 +839,26 @@ export async function runArchivist(
   if (priorities) {
     try {
       const domainStats = aggregateDomainOutcomes(allRecent);
+
+      // Attach grounded scores from the metric registry when available
+      if (metricRegistry && metricContext) {
+        for (const stats of domainStats) {
+          const result = await metricRegistry.compute(stats.domain, metricContext);
+          if (result) {
+            stats.groundedScore = result.score;
+            stats.groundedMetricSource = result.description;
+
+            // Log discrepancy between LLM labels and grounded metric
+            if (Math.abs(result.score - stats.successRate) > 0.3) {
+              semanticStore.appendArchivistLog(
+                "metric_discrepancy",
+                `Domain ${stats.domain}: grounded=${result.score.toFixed(2)} vs LLM-labels=${stats.successRate.toFixed(2)} (${result.description})`,
+              );
+            }
+          }
+        }
+      }
+
       const weightProposals = generateWeightProposals(domainStats, priorities);
       if (weightProposals.length > 0) {
         const wpAdded = addWeightProposals(workspacePath, weightProposals);
@@ -914,6 +942,10 @@ export interface ArchivistRunnerDeps {
   /** Health reporting callbacks. */
   pingHealth: (component: string, data: Record<string, unknown>) => void;
   pingHealthError: (component: string, error: string) => void;
+  /** Optional: grounded metric registry for evaluation harness. */
+  metricRegistry?: MetricRegistry;
+  /** Optional: builds the metric context for grounded score computation. */
+  makeMetricContext?: (episodicStore: EpisodicStore) => MetricContext;
 }
 
 /**
@@ -1010,6 +1042,7 @@ export class ArchivistRunner {
 
     const semanticStore = this.deps.makeSemanticStore();
     const priorities = this.deps.getPriorities();
+    const metricContext = this.deps.makeMetricContext?.(episodicStore);
 
     const result = await runArchivist(
       this.deps.workspacePath,
@@ -1019,6 +1052,8 @@ export class ArchivistRunner {
       this.deps.callModel,
       { turnInterval },
       priorities,
+      this.deps.metricRegistry,
+      metricContext,
     );
 
     if (result.fromFallback) {

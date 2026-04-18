@@ -9,7 +9,7 @@
  */
 
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
-import type { KnowledgeFile, PrioritiesFile, SITREP } from "./types.js";
+import type { KnowledgeFile, PrioritiesFile, SITREP, TrajectoryScalingConfig } from "./types.js";
 
 // ============================================================================
 // Types
@@ -22,6 +22,8 @@ export interface TriageInput {
   facts: KnowledgeFile;
   /** Domain weights and thresholds from PRIORITIES.json */
   priorities: PrioritiesFile;
+  /** Domain trajectory scores from recent outcome history. Key: domain name, value: [-1.0, 1.0]. */
+  domainTrajectories?: Record<string, number>;
 }
 
 /**
@@ -285,4 +287,97 @@ export function shouldRunFullOODA(
   }
 
   return sitrep.priority >= minPriority;
+}
+
+// ============================================================================
+// Trajectory-Aware Scaling
+// ============================================================================
+
+const DEFAULT_TRAJECTORY_CONFIG: TrajectoryScalingConfig = {
+  enabled: true,
+  pos_pos_scale: 0.9,
+  pos_neg_scale: 0.7,
+  neg_pos_scale: 0.8,
+  neg_neg_scale: 1.3,
+  trajectory_window_days: 30,
+  min_outcomes_for_trajectory: 3,
+};
+
+/**
+ * Compute domain trajectory scores from outcome-labeled episodic events.
+ * Returns a map of domain → trajectory score in [-1.0, 1.0].
+ * Positive = succeeding trend, negative = failing trend.
+ */
+export function computeDomainTrajectories(
+  events: Array<{ outcome?: string; text: string; createdAt: number }>,
+  windowDays: number,
+  minOutcomes: number,
+  inferDomainFn: (text: string) => string,
+): Record<string, number> {
+  const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+  const withOutcome = events.filter((e) => e.outcome && e.createdAt >= cutoff);
+
+  const byDomain = new Map<string, { successes: number; failures: number; total: number }>();
+
+  for (const e of withOutcome) {
+    const domain = inferDomainFn(e.text);
+    const stats = byDomain.get(domain) ?? { successes: 0, failures: 0, total: 0 };
+    if (e.outcome === "success") stats.successes++;
+    else if (e.outcome === "failure") stats.failures++;
+    stats.total++;
+    byDomain.set(domain, stats);
+  }
+
+  const trajectories: Record<string, number> = {};
+  for (const [domain, stats] of byDomain) {
+    if (stats.total >= minOutcomes) {
+      trajectories[domain] = (stats.successes - stats.failures) / stats.total;
+    }
+  }
+  return trajectories;
+}
+
+/**
+ * Apply trajectory-based scaling to a SITREP's priority.
+ * Adjusts the priority up or down based on the asymmetric scaling matrix
+ * (inspired by AOD-CFR's sign-dependent instantaneous regret scaling).
+ *
+ * Pure function — does not mutate the input SITREP.
+ */
+export function applyTrajectoryScaling(
+  sitrep: SITREP,
+  trajectories: Record<string, number>,
+  config?: Partial<TrajectoryScalingConfig>,
+): SITREP {
+  const cfg = { ...DEFAULT_TRAJECTORY_CONFIG, ...config };
+  if (!cfg.enabled) return sitrep;
+
+  // Determine average trajectory across recommended domains
+  const domainTrajectories = sitrep.recommendedDomains
+    .map((d) => trajectories[d])
+    .filter((t): t is number => t !== undefined);
+
+  if (domainTrajectories.length === 0) return sitrep;
+
+  const avgTrajectory = domainTrajectories.reduce((a, b) => a + b, 0) / domainTrajectories.length;
+  const cumulativePositive = avgTrajectory > 0;
+
+  // Current signal polarity: priority <= 4 = positive, >= 6 = negative, 5 = neutral
+  if (sitrep.priority === 5) return sitrep;
+  const signalNegative = sitrep.priority >= 6;
+
+  // Select scaling factor from the asymmetric matrix
+  let scale: number;
+  if (cumulativePositive && !signalNegative) scale = cfg.pos_pos_scale;
+  else if (cumulativePositive && signalNegative) scale = cfg.pos_neg_scale;
+  else if (!cumulativePositive && !signalNegative) scale = cfg.neg_pos_scale;
+  else scale = cfg.neg_neg_scale;
+
+  const rawPriority = sitrep.priority;
+  const scaled = Math.round(rawPriority * scale);
+  const clamped = Math.max(1, Math.min(10, scaled)) as SITREP["priority"];
+
+  if (clamped === rawPriority) return sitrep;
+
+  return { ...sitrep, priority: clamped, rawPriority };
 }
