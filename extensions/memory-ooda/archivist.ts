@@ -14,6 +14,7 @@ import path from "node:path";
 import type { MetricRegistry, MetricContext } from "./metric-registry.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import { addArchivistProposals, addProposal, type ProposalCandidate } from "./proposals.js";
+import { getFacts } from "./semantic-memory.js";
 import type { ModelCallFn } from "./triage.js";
 import type { DomainOutcomeStats, PrioritiesFile, WeightProposal } from "./types.js";
 
@@ -220,8 +221,29 @@ function formatEventsBlock(events: EpisodicEvent[]): string {
     .join("\n");
 }
 
-export function buildArchivistPrompt(events: EpisodicEvent[]): string {
+export function buildArchivistPrompt(
+  events: EpisodicEvent[],
+  existingKeys?: { lessons: string[]; domain: string[] },
+): string {
   const eventsBlock = formatEventsBlock(events);
+
+  // Show existing keys so the model can update rather than reinvent
+  let existingKeysBlock = "";
+  if (existingKeys) {
+    const lessonKeys = existingKeys.lessons.length > 0 ? existingKeys.lessons.join(", ") : "(none)";
+    const domainKeys = existingKeys.domain.length > 0 ? existingKeys.domain.join(", ") : "(none)";
+    existingKeysBlock = `
+## Existing Keys (REUSE these — do NOT create duplicates)
+
+lessons_learned keys: ${lessonKeys}
+domain_context keys: ${domainKeys}
+
+CRITICAL: If the events describe something already covered by an existing key,
+use THAT key to update its value. Do NOT create a new key with slightly different
+wording (e.g. "exact_whitespace_for_edits" vs "exact_copy_for_replacement" — these
+are the same lesson and must use one canonical key).
+`;
+  }
 
   return `You are the Archivist — a long-term memory distillation agent.
 
@@ -230,7 +252,7 @@ Your job: extract durable knowledge worth remembering across future sessions.
 
 ## Episodic Events
 ${eventsBlock}
-
+${existingKeysBlock}
 ## Target Sections (extract to each one actively)
 
 ### lessons_learned  ← MOST IMPORTANT
@@ -283,7 +305,8 @@ Return [] if no patterns found. Maximum 15 patterns per batch.
 - lessons_learned entries can come from a SINGLE event if it clearly describes a mistake or lesson
 - All other sections require 2+ supporting events
 - Never infer sensitive personal information (health, finances)
-- Prefer updating existing facts over creating new ones
+- REUSE existing keys when the concept already exists — update the value, don't create a near-duplicate
+- Only create a NEW key when the pattern is genuinely novel (not covered by any existing key)
 
 Verify your JSON is syntactically valid before responding.`;
 }
@@ -674,7 +697,19 @@ export async function runArchivist(
   let fromFallback = false;
   let lastError: unknown;
 
-  const prompt = buildArchivistPrompt(events);
+  // Read existing keys so the model can update rather than re-duplicate
+  let existingKeys: { lessons: string[]; domain: string[] } | undefined;
+  try {
+    const facts = getFacts(workspacePath);
+    existingKeys = {
+      lessons: Object.keys(facts.lessons_learned ?? {}),
+      domain: Object.keys(facts.domain_context ?? {}),
+    };
+  } catch {
+    // Best-effort — prompt works without existing keys
+  }
+
+  const prompt = buildArchivistPrompt(events, existingKeys);
 
   for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
     try {
