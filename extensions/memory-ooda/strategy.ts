@@ -30,6 +30,13 @@ export interface StrategyInput {
   observation: string;
   /** Hard constraints forwarded from user preferences (never_do) */
   neverDo?: string[];
+  /**
+   * CR_OODA_PATTERN_SEPARATION_GATE: summaries of near-identical past memories
+   * (band=exact_duplicate) surfaced by the retrieval layer. When non-empty,
+   * runCouncil spawns a Discriminator member to force an explicit
+   * "what's different?" call before the chair decides.
+   */
+  separationMatches?: string[];
 }
 
 export interface StrategyResult {

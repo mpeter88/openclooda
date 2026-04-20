@@ -7,6 +7,12 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import {
+  reportRawEditWarning,
+  stampContentHash,
+  verifyContentHash,
+  type HashableFile,
+} from "./content-hash.js";
 import { createSnapshot, restoreLatestSnapshot } from "./snapshot.js";
 import type { PrioritiesFile } from "./types.js";
 
@@ -114,6 +120,7 @@ export function getPriorities(workspacePath: string): PrioritiesFile {
 
   if (!fs.existsSync(filePath)) {
     const defaults = createDefaultPriorities();
+    stampContentHash(defaults as unknown as HashableFile);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, JSON.stringify(defaults, null, 2) + "\n", "utf-8");
     return defaults;
@@ -130,6 +137,16 @@ export function getPriorities(workspacePath: string): PrioritiesFile {
     throw new Error("Invalid PRIORITIES.json: missing scoring_rubric");
   }
 
+  const verdict = verifyContentHash(parsed as unknown as HashableFile);
+  if (verdict.status === "mismatch") {
+    reportRawEditWarning(workspacePath, PRIORITIES_FILENAME, verdict.claimed, verdict.computed);
+    try {
+      createSnapshot(workspacePath, PRIORITIES_FILENAME);
+    } catch {
+      // snapshot best-effort
+    }
+  }
+
   return parsed;
 }
 
@@ -143,6 +160,7 @@ export function writePriorities(workspacePath: string, priorities: PrioritiesFil
 
   priorities._meta.updated_at = new Date().toISOString();
 
+  stampContentHash(priorities as unknown as HashableFile);
   const json = JSON.stringify(priorities, null, 2) + "\n";
 
   try {

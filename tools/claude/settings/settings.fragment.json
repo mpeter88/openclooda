@@ -1,0 +1,27 @@
+{
+  "_comment": "Fragment — merge into ~/.claude/settings.json via scripts/install-claude-extras.sh",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/openclaw-status-inject.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/openclaw-memory-capture.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

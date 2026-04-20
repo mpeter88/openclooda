@@ -7,6 +7,8 @@
  */
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import type * as LanceDB from "@lancedb/lancedb";
 import { Type } from "@sinclair/typebox";
@@ -20,6 +22,41 @@ import {
   vectorDimsForModel,
 } from "./config.js";
 import { WorldModelStore } from "./world-model-store.js";
+
+// ============================================================================
+// CR_OODA_EMOTIONAL_TAGGING (phase 2): read the memory-ooda SITREP sidecar so
+// autoCapture importance tracks the turn's arousal level. Convention-coupled
+// to the memory-ooda workspace default (~/.openclaw/workspace). No code import
+// between plugins; just a shared file path.
+// ============================================================================
+
+const OODA_SITREP_SIDECAR = path.join(homedir(), ".openclaw", "workspace", ".turn-sitrep.json");
+const OODA_SITREP_MAX_AGE_MS = 5 * 60 * 1000;
+
+function readOodaTurnPriority(): number | undefined {
+  try {
+    if (!fs.existsSync(OODA_SITREP_SIDECAR)) return undefined;
+    const raw = fs.readFileSync(OODA_SITREP_SIDECAR, "utf-8");
+    const parsed = JSON.parse(raw) as { priority?: number; writtenAt?: string };
+    if (typeof parsed.priority !== "number") return undefined;
+    if (!parsed.writtenAt) return undefined;
+    const age = Date.now() - new Date(parsed.writtenAt).getTime();
+    if (!Number.isFinite(age) || age > OODA_SITREP_MAX_AGE_MS) return undefined;
+    return parsed.priority;
+  } catch {
+    return undefined;
+  }
+}
+
+function priorityWeight(priority: number | undefined): number {
+  if (typeof priority !== "number") return 0.75;
+  const clamped = Math.max(1, Math.min(10, priority));
+  return 0.5 + 0.05 * clamped;
+}
+
+function weightedImportance(baseline: number, priority: number | undefined): number {
+  return Math.max(0, Math.min(1, baseline * priorityWeight(priority)));
+}
 
 // ============================================================================
 // Types
@@ -136,6 +173,10 @@ class MemoryDB {
           outcome: "",
           outcomeSignal: "",
           outcomeAt: 0,
+          // CR_OODA_PATTERN_SEPARATION_GATE: 128-bit MinHash signature (32 hex
+          // chars) alongside the dense embedding. Empty string on the schema
+          // row; real rows fill in via minhash(text) at capture.
+          hashSignature: "",
         },
       ]);
       await this.table.delete('id = "__schema__"');
@@ -151,7 +192,13 @@ class MemoryDB {
       createdAt: Date.now(),
     };
 
-    await this.table!.add([fullEntry]);
+    // CR_OODA_PATTERN_SEPARATION_GATE: stamp the hash sketch on every write.
+    const { minhash, serializeSignature } = await import("./min-hash.js");
+    const rowWithHash = {
+      ...fullEntry,
+      hashSignature: serializeSignature(minhash(fullEntry.text)),
+    };
+    await this.table!.add([rowWithHash]);
     return fullEntry;
   }
 
@@ -207,6 +254,40 @@ class MemoryDB {
   async count(): Promise<number> {
     await this.ensureInitialized();
     return this.table!.countRows();
+  }
+
+  /**
+   * CR_OODA_PATTERN_SEPARATION_GATE (lancedb parity with sqlite-vec path).
+   * Returns candidates annotated with both dense cosine similarity and MinHash
+   * Jaccard on the stored hashSignature column. Pre-migration rows (before
+   * the hashSignature field existed) return hashJaccard=0 — treat as
+   * weak_signal at the caller.
+   */
+  async searchForSeparation(
+    queryText: string,
+    vector: number[],
+    limit = 20,
+  ): Promise<Array<{ memoryId: string; text: string; denseSim: number; hashJaccard: number }>> {
+    await this.ensureInitialized();
+    const { minhash, minhashJaccard, deserializeSignature } = await import("./min-hash.js");
+    const querySig = minhash(queryText);
+
+    const results = await this.table!.vectorSearch(vector).limit(limit).toArray();
+
+    return results.map((row) => {
+      const distance = row._distance ?? 0;
+      const denseSim = 1 / (1 + distance);
+      const storedHex = (row.hashSignature as string | null) ?? "";
+      const candidateSig = storedHex ? deserializeSignature(storedHex) : [];
+      const hashJaccard =
+        candidateSig.length === querySig.length ? minhashJaccard(querySig, candidateSig) : 0;
+      return {
+        memoryId: row.id as string,
+        text: row.text as string,
+        denseSim,
+        hashJaccard,
+      };
+    });
   }
 
   // ===========================================================================
@@ -404,6 +485,12 @@ class SqliteVecMemoryDB {
     if (!colNames.has("vec_rowid")) {
       db.exec("ALTER TABLE memories ADD COLUMN vec_rowid INTEGER");
     }
+    // CR_OODA_PATTERN_SEPARATION_GATE: 128-bit MinHash signature (32 hex chars)
+    // stored as TEXT for dentate-gyrus-style surface-form similarity alongside
+    // the dense embedding. Null for rows captured before the column existed.
+    if (!colNames.has("hashSignature")) {
+      db.exec("ALTER TABLE memories ADD COLUMN hashSignature TEXT");
+    }
 
     db.exec(
       `CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(vector float[${this.vectorDim}])`,
@@ -448,6 +535,12 @@ class SqliteVecMemoryDB {
       createdAt: Date.now(),
     };
 
+    // CR_OODA_PATTERN_SEPARATION_GATE: compute the MinHash sketch alongside
+    // the dense vector. Stored as a 32-char hex string so the column can be
+    // joined against the sketch of a future query without re-tokenising.
+    const { minhash, serializeSignature } = await import("./min-hash.js");
+    const hashSignatureHex = serializeSignature(minhash(fullEntry.text));
+
     // Insert into both tables in a transaction.
     // CR_SQLITE_VEC_ROWID_FIX: sqlite-vec 0.1.7-alpha.2 rejects explicit rowid on INSERT
     // into vec0 tables when using node:sqlite bindings. Insert vec with auto-rowid,
@@ -455,8 +548,8 @@ class SqliteVecMemoryDB {
     db.exec("BEGIN");
     try {
       const insertMeta = db.prepare(
-        `INSERT INTO memories (id, text, importance, category, createdAt, source, actionId, archivistProcessed)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO memories (id, text, importance, category, createdAt, source, actionId, archivistProcessed, hashSignature)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       insertMeta.run(
         fullEntry.id,
@@ -467,6 +560,7 @@ class SqliteVecMemoryDB {
         fullEntry.source ?? null,
         fullEntry.actionId ?? null,
         fullEntry.archivistProcessed ? 1 : 0,
+        hashSignatureHex,
       );
 
       // Insert vec without explicit rowid — auto-assigned to avoid sqlite-vec bug
@@ -531,6 +625,57 @@ class SqliteVecMemoryDB {
         };
       })
       .filter((r) => r.score >= minScore);
+  }
+
+  /**
+   * CR_OODA_PATTERN_SEPARATION_GATE: search with dual-signal retrieval.
+   * Returns candidates annotated with both dense cosine similarity and MinHash
+   * Jaccard on the stored hashSignature column. Callers classify into bands
+   * (exact_duplicate / semantic_twin / lexical_echo / fuzzy_candidate /
+   * weak_signal) using pattern-separation.ts.
+   */
+  async searchForSeparation(
+    queryText: string,
+    vector: number[],
+    limit = 20,
+  ): Promise<
+    Array<{
+      memoryId: string;
+      text: string;
+      denseSim: number;
+      hashJaccard: number;
+    }>
+  > {
+    const db = await this.ensureInitialized();
+    const { minhash, minhashJaccard, deserializeSignature } = await import("./min-hash.js");
+    const querySig = minhash(queryText);
+
+    const rows = db
+      .prepare(
+        `SELECT m.id, m.text, m.hashSignature, mv.distance
+         FROM memories_vec mv
+         JOIN memories m ON mv.rowid = m.vec_rowid
+         WHERE mv.vector MATCH ? AND k = ?
+         ORDER BY mv.distance`,
+      )
+      .all(new Float32Array(vector), limit) as Array<
+      Record<string, unknown> & { distance: number }
+    >;
+
+    return rows.map((row) => {
+      const distance = row.distance ?? 0;
+      const denseSim = 1 / (1 + distance);
+      const storedHex = (row.hashSignature as string | null) ?? "";
+      const candidateSig = storedHex ? deserializeSignature(storedHex) : [];
+      const hashJaccard =
+        candidateSig.length === querySig.length ? minhashJaccard(querySig, candidateSig) : 0;
+      return {
+        memoryId: row.id as string,
+        text: row.text as string,
+        denseSim,
+        hashJaccard,
+      };
+    });
   }
 
   async delete(id: string): Promise<boolean> {
@@ -1517,6 +1662,7 @@ const memoryPlugin = {
           // Store each capturable user message (limit to 3 per turn)
           const backend = await getDb();
           let stored = 0;
+          const turnPriority = readOodaTurnPriority();
           for (const text of toCapture.slice(0, 3)) {
             const category = detectCategory(text);
             const vector = await embeddings.embed(text);
@@ -1530,7 +1676,7 @@ const memoryPlugin = {
             await backend.store({
               text,
               vector,
-              importance: 0.7,
+              importance: weightedImportance(0.7, turnPriority),
               category,
               source: "user",
             });
@@ -1584,7 +1730,7 @@ const memoryPlugin = {
                 await backend.store({
                   text: summary,
                   vector,
-                  importance: 0.65,
+                  importance: weightedImportance(0.65, turnPriority),
                   category: detectAssistantCategory(summary),
                   source: "assistant",
                 });

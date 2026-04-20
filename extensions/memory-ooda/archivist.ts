@@ -11,12 +11,89 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { buildCausalIndex, findAntecedents, formatAntecedents } from "./causal-retrieval.js";
+import {
+  appendDistortionSample,
+  computeDistortion,
+  readDistortionHistory,
+} from "./distortion-index.js";
+import { aggregateAxisPriors } from "./error-classifier.js";
+import { DEFAULT_FORGETTING_POLICY, partitionForPrune } from "./learned-forgetting.js";
 import type { MetricRegistry, MetricContext } from "./metric-registry.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import { addArchivistProposals, addProposal, type ProposalCandidate } from "./proposals.js";
 import { getFacts } from "./semantic-memory.js";
 import type { ModelCallFn } from "./triage.js";
-import type { DomainOutcomeStats, PrioritiesFile, WeightProposal } from "./types.js";
+import type {
+  CriticalFailureEvent,
+  DomainOutcomeStats,
+  ErrorTag,
+  PrioritiesFile,
+  WeightProposal,
+} from "./types.js";
+import { gateWrite } from "./write-gate.js";
+
+const ERROR_TAGS_SIDECAR = ".error-tags.jsonl";
+const CRITICAL_FAILURES_FILE = ".critical-failures.jsonl";
+const AXIS_PRIORS_FILE = ".axis-priors.json";
+const DEFAULT_DISTORTION_WINDOW = { days: 30, minSamples: 10 };
+const DEFAULT_AXIS_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+function readErrorTagsSidecar(workspacePath: string): Map<string, ErrorTag[]> {
+  const file = path.join(workspacePath, ERROR_TAGS_SIDECAR);
+  const map = new Map<string, ErrorTag[]>();
+  if (!fs.existsSync(file)) return map;
+  const content = fs.readFileSync(file, "utf-8");
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed) as { eventId: string; tags: ErrorTag[] };
+      if (row.eventId && Array.isArray(row.tags)) {
+        map.set(row.eventId, row.tags);
+      }
+    } catch {
+      // skip malformed rows
+    }
+  }
+  return map;
+}
+
+export function appendErrorTagsSidecar(
+  workspacePath: string,
+  eventId: string,
+  tags: ErrorTag[],
+): void {
+  const file = path.join(workspacePath, ERROR_TAGS_SIDECAR);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(
+    file,
+    JSON.stringify({ eventId, tags, at: new Date().toISOString() }) + "\n",
+    "utf-8",
+  );
+}
+
+export function appendCriticalFailure(workspacePath: string, event: CriticalFailureEvent): void {
+  const file = path.join(workspacePath, CRITICAL_FAILURES_FILE);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, JSON.stringify(event) + "\n", "utf-8");
+}
+
+export function readCriticalFailures(workspacePath: string): CriticalFailureEvent[] {
+  const file = path.join(workspacePath, CRITICAL_FAILURES_FILE);
+  if (!fs.existsSync(file)) return [];
+  const out: CriticalFailureEvent[] = [];
+  for (const line of fs.readFileSync(file, "utf-8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as CriticalFailureEvent);
+    } catch {
+      // skip
+    }
+  }
+  return out;
+}
 
 // ============================================================================
 // Types
@@ -36,6 +113,10 @@ export interface EpisodicEvent {
   outcome?: "success" | "failure" | "partial";
   outcomeSignal?: string;
   outcomeAt?: number;
+  /** CR_OODA_ERROR_TAXONOMY: five-axis failure tags populated for outcome !== "success". */
+  errorTags?: import("./types.js").ErrorTag[];
+  /** CR_OODA_EMOTIONAL_TAGGING: SITREP priority (1-10) at capture time. Weighting multiplier for recall + aggregation. */
+  sitrepPriorityAtCapture?: number;
 }
 
 /** Outcome label applied to a decision memory. */
@@ -57,12 +138,23 @@ export interface EpisodicStore {
   labelOutcome?(actionId: string, label: OutcomeLabel): Promise<void>;
   /** O2: Find recent memories with an actionId for outcome labeling. */
   findRecentWithActionId?(limit?: number): Promise<EpisodicEvent[]>;
+  /** CR_OODA_LEARNED_FORGETTING: remove a specific event by id when usefulness policy drops it. */
+  delete?(id: string): Promise<boolean | void>;
 }
 
 /** Abstraction over Tier 3 store for testability. */
 export interface SemanticStore {
-  upsertFact(section: string, key: string, value: unknown): void;
+  upsertFact(
+    section: string,
+    key: string,
+    value: unknown,
+    opts?: import("./types.js").UpsertOptions,
+  ): void;
   appendArchivistLog(action: string, reason: string): void;
+  /** CR_OODA_ARCHIVIST_CRUD_CLASSIFIER: remove fact from flat section (does NOT touch temporal history). Optional for back-compat. */
+  deleteFact?(section: string, key: string): void;
+  /** CR_OODA_BITEMPORAL_KNOWLEDGE: mark currently-valid envelope as invalid without deleting the flat value. Optional for back-compat. */
+  invalidateFact?(section: string, key: string, reason: string): void;
 }
 
 /** Persisted state across archivist runs. */
@@ -98,6 +190,9 @@ export interface ArchivistConfig {
 
 /** A single pattern extracted by the model from episodic events. */
 export interface PatternExtraction {
+  /** CR_OODA_ARCHIVIST_CRUD_CLASSIFIER: optional — defaults to "ADD" for
+   *  backward compat with model outputs predating the CRUD prompt. */
+  action?: import("./types.js").PatternAction;
   section:
     | "stack"
     | "projects"
@@ -106,8 +201,30 @@ export interface PatternExtraction {
     | "lessons_learned"
     | "preferences_notes";
   key: string;
+  /** Present for ADD/UPDATE/BELIEVE. Null for DELETE or NOOP. */
   value: unknown;
+  /** For UPDATE: prior value the model believes is being replaced. */
+  previousValue?: unknown;
+  /** For DELETE: reason the fact is no longer true. */
+  invalidation_reason?: string;
   reason: string;
+}
+
+/** Result of applying a single PatternExtraction. */
+export interface ApplyActionResult {
+  action: import("./types.js").PatternAction;
+  applied: boolean;
+  rejectedReason?: string;
+}
+
+/** Summary of CRUD action counts across an archivist run. */
+export interface ActionCounts {
+  add: number;
+  update: number;
+  delete: number;
+  noop: number;
+  believe: number;
+  rejected: number;
 }
 
 /** Result of a single archivist run. */
@@ -118,6 +235,8 @@ export interface ArchivistResult {
   fromFallback: boolean;
   /** Last error from model call attempts, if any. */
   lastError?: string;
+  /** CR_OODA_ARCHIVIST_CRUD_CLASSIFIER: per-action breakdown. */
+  actionCounts?: ActionCounts;
 }
 
 // ============================================================================
@@ -287,14 +406,27 @@ Cross-project patterns, recurring failure modes, architectural decisions that re
 ### stack
 Technology, tools, versions that are stable across sessions.
 
+## Actions (choose exactly one per pattern)
+
+- **ADD** — new fact not in store. Omit action entirely for backward compat (defaults to ADD).
+- **UPDATE** — existing fact whose value is now wrong. Provide previousValue matching the stored value.
+- **DELETE** — fact no longer true. Provide invalidation_reason. value should be null.
+- **NOOP** — events noted but no durable change. Explain in reason; emit only when you considered adding and decided against.
+- **BELIEVE** — pattern is a working theory, not yet a stable truth. Use for repeated observations with confidence 0.4-0.7.
+
+Prefer NOOP over forcing a change when events are noise. UPDATE requires accurate previousValue or the write will be rejected.
+
 ## Output Format
 Respond with raw JSON only. No code fences, no text outside the JSON.
 
 [
   {
+    "action": "ADD" | "UPDATE" | "DELETE" | "NOOP" | "BELIEVE",
     "section": "<stack | projects | people | domain_context | lessons_learned | preferences_notes>",
     "key": "<identifier>",
-    "value": <string for stack/domain_context/lessons_learned/preferences_notes, object for projects/people>,
+    "value": <string for stack/domain_context/lessons_learned/preferences_notes, object for projects/people, null for DELETE/NOOP>,
+    "previousValue": <current stored value for UPDATE only>,
+    "invalidation_reason": "<required for DELETE>",
     "reason": "<which events support this>"
   }
 ]
@@ -377,13 +509,161 @@ export function parsePatterns(raw: string): PatternExtraction[] {
       throw new Error(`Pattern[${idx}] must have a non-empty reason`);
     }
 
+    // Validate optional action field
+    const validActions = new Set(["ADD", "UPDATE", "DELETE", "NOOP", "BELIEVE"]);
+    let action: import("./types.js").PatternAction | undefined;
+    if (obj.action !== undefined) {
+      if (typeof obj.action !== "string" || !validActions.has(obj.action)) {
+        throw new Error(
+          `Pattern[${idx}].action must be one of: ADD, UPDATE, DELETE, NOOP, BELIEVE`,
+        );
+      }
+      action = obj.action as import("./types.js").PatternAction;
+    }
+
     return {
+      action,
       section: obj.section as PatternExtraction["section"],
       key: obj.key,
       value: obj.value,
+      previousValue: obj.previousValue,
+      invalidation_reason:
+        typeof obj.invalidation_reason === "string" ? obj.invalidation_reason : undefined,
       reason: obj.reason,
     };
   });
+}
+
+// ============================================================================
+// CR_OODA_ARCHIVIST_CRUD_CLASSIFIER — applyPatternAction
+// ============================================================================
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== "object") return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Apply a single PatternExtraction action to the semantic store.
+ *
+ * ADD:    create new fact. Rejected if envelope with valid_to=null exists (forces UPDATE).
+ * UPDATE: previousValue must match current stored value (stale-check).
+ * DELETE: invalidates the envelope; does not destroy flat value unless deleteFact is used.
+ * NOOP:   records a log entry, no store change.
+ * BELIEVE: handled externally (B3). This dispatcher just records and returns applied=false.
+ *
+ * Rejection reasons:
+ *  - "already_exists": ADD against existing fact (model must re-classify)
+ *  - "stale_previous_value": UPDATE's previousValue doesn't match store
+ *  - "missing_value": ADD/UPDATE/BELIEVE with null value
+ *  - "missing_reason": DELETE without invalidation_reason
+ *  - "unknown_action": action string outside the enum
+ */
+export async function applyPatternAction(
+  workspacePath: string,
+  pattern: PatternExtraction,
+  semanticStore: SemanticStore,
+  currentValue: unknown,
+): Promise<ApplyActionResult> {
+  const action = pattern.action ?? "ADD";
+
+  // CR_OODA_PASS_K_ACCEPTANCE_GATE (Path C): gate write-producing actions.
+  // ADD/UPDATE/DELETE mutate KNOWLEDGE.json; NOOP and BELIEVE don't. Falls open
+  // when the admission corpus has <5 cases, so bootstrap workspaces behave
+  // exactly as pre-gate code did.
+  if (action === "ADD" || action === "UPDATE" || action === "DELETE") {
+    const gate = await gateWrite({
+      kind: "knowledge_edit",
+      id: `knowledge-${pattern.section}-${pattern.key}-${Date.now()}-${randomUUID().slice(0, 6)}`,
+      summary: `${action} ${pattern.section}.${pattern.key}`,
+      diff: JSON.stringify({
+        before: currentValue ?? null,
+        after: pattern.value ?? null,
+        reason: pattern.reason ?? pattern.invalidation_reason ?? "",
+      }),
+      workspacePath,
+      initiator: "archivist",
+    });
+    if (!gate.admit) {
+      semanticStore.appendArchivistLog(
+        `pattern_gate_rejected_${pattern.section}_${pattern.key}`,
+        `admission_gate: ${gate.reason}`,
+      );
+      return {
+        action,
+        applied: false,
+        rejectedReason: `admission_gate: ${gate.reason}`,
+      };
+    }
+  }
+
+  switch (action) {
+    case "ADD": {
+      if (pattern.value === null || pattern.value === undefined) {
+        return { action, applied: false, rejectedReason: "missing_value" };
+      }
+      if (currentValue !== undefined) {
+        // Fall through to reconfirmation path — semantically a NOOP at storage level.
+        if (deepEqual(currentValue, pattern.value)) {
+          semanticStore.upsertFact(pattern.section, pattern.key, pattern.value);
+          return { action, applied: true };
+        }
+        return { action, applied: false, rejectedReason: "already_exists" };
+      }
+      semanticStore.upsertFact(pattern.section, pattern.key, pattern.value);
+      return { action, applied: true };
+    }
+
+    case "UPDATE": {
+      if (pattern.value === null || pattern.value === undefined) {
+        return { action, applied: false, rejectedReason: "missing_value" };
+      }
+      if (pattern.previousValue !== undefined && !deepEqual(currentValue, pattern.previousValue)) {
+        return { action, applied: false, rejectedReason: "stale_previous_value" };
+      }
+      semanticStore.upsertFact(pattern.section, pattern.key, pattern.value, {
+        invalidation_reason: pattern.invalidation_reason ?? pattern.reason,
+      });
+      return { action, applied: true };
+    }
+
+    case "DELETE": {
+      if (!pattern.invalidation_reason) {
+        return { action, applied: false, rejectedReason: "missing_reason" };
+      }
+      if (semanticStore.invalidateFact) {
+        semanticStore.invalidateFact(pattern.section, pattern.key, pattern.invalidation_reason);
+      } else if (semanticStore.deleteFact) {
+        semanticStore.deleteFact(pattern.section, pattern.key);
+      } else {
+        return { action, applied: false, rejectedReason: "store_missing_delete" };
+      }
+      return { action, applied: true };
+    }
+
+    case "NOOP": {
+      semanticStore.appendArchivistLog(
+        `pattern_noop_${pattern.section}_${pattern.key}`,
+        pattern.reason,
+      );
+      return { action, applied: true };
+    }
+
+    case "BELIEVE": {
+      // Beliefs tier handled in B3 — here we log and defer.
+      semanticStore.appendArchivistLog(
+        `pattern_believe_${pattern.section}_${pattern.key}`,
+        `Belief candidate deferred to beliefs tier: ${pattern.reason}`,
+      );
+      return { action, applied: false, rejectedReason: "deferred_to_beliefs_tier" };
+    }
+
+    default:
+      return { action, applied: false, rejectedReason: "unknown_action" };
+  }
 }
 
 // ============================================================================
@@ -743,9 +1023,64 @@ export async function runArchivist(
     };
   }
 
-  // Step 3: Upsert patterns into Tier 3 (all upserts before any marking — C1)
+  // Step 3: Apply each pattern via CRUD classifier (CR_OODA_ARCHIVIST_CRUD_CLASSIFIER).
+  // All writes happen before any event marking (C1 ordering).
+  const actionCounts: ActionCounts = {
+    add: 0,
+    update: 0,
+    delete: 0,
+    noop: 0,
+    believe: 0,
+    rejected: 0,
+  };
+
+  // Resolve current values once from the facts snapshot
+  let currentFacts: Awaited<ReturnType<typeof getFacts>> | undefined;
+  try {
+    currentFacts = getFacts(workspacePath);
+  } catch {
+    // Best-effort — proceed with undefined currentValue checks
+  }
+
   for (const pattern of patterns) {
-    semanticStore.upsertFact(pattern.section, pattern.key, pattern.value);
+    const section = currentFacts?.[pattern.section as keyof typeof currentFacts] as
+      | Record<string, unknown>
+      | undefined;
+    const currentValue = section && typeof section === "object" ? section[pattern.key] : undefined;
+
+    const result = await applyPatternAction(workspacePath, pattern, semanticStore, currentValue);
+
+    if (!result.applied) {
+      actionCounts.rejected++;
+      semanticStore.appendArchivistLog(
+        `pattern_${result.action.toLowerCase()}_rejected`,
+        `${pattern.section}.${pattern.key}: ${result.rejectedReason ?? "unknown"}`,
+      );
+      continue;
+    }
+
+    switch (result.action) {
+      case "ADD":
+        actionCounts.add++;
+        break;
+      case "UPDATE":
+        actionCounts.update++;
+        break;
+      case "DELETE":
+        actionCounts.delete++;
+        break;
+      case "NOOP":
+        actionCounts.noop++;
+        break;
+      case "BELIEVE":
+        actionCounts.believe++;
+        break;
+    }
+
+    semanticStore.appendArchivistLog(
+      `pattern_${result.action.toLowerCase()}`,
+      `${pattern.section}.${pattern.key}: ${pattern.reason}`,
+    );
   }
 
   // Step 3b (O1): Tag decision patterns with actionId and store into episodic backend
@@ -841,9 +1176,32 @@ export async function runArchivist(
     );
   }
 
-  // Step 6: Prune old processed events
+  // Step 6: Prune old processed events.
+  // CR_OODA_LEARNED_FORGETTING: prefer selective delete-by-id using the
+  // usefulness policy when the store supports it; fall back to the legacy
+  // blind age-based prune when it doesn't. The policy protects high-importance
+  // events, outcome-labeled decisions, recently-touched memories, and any
+  // category in the allowlist (default: decision).
   const pruneThreshold = Date.now() - cfg.pruneAfterDays * 24 * 60 * 60 * 1000;
-  const eventsPruned = await episodicStore.prune(pruneThreshold, true);
+  let eventsPruned = 0;
+  if (episodicStore.delete) {
+    const candidates = await episodicStore.retrieveSince(0, 10_000);
+    const { drop } = partitionForPrune(
+      candidates,
+      { ...DEFAULT_FORGETTING_POLICY, olderThanMs: cfg.pruneAfterDays * 24 * 60 * 60 * 1000 },
+      Date.now(),
+    );
+    for (const e of drop) {
+      try {
+        await episodicStore.delete(e.id);
+        eventsPruned++;
+      } catch {
+        // best-effort; keep going with remaining candidates
+      }
+    }
+  } else {
+    eventsPruned = await episodicStore.prune(pruneThreshold, true);
+  }
 
   // Step 7: Reset turns_since_last_archivist to 0. last_processed_turn is
   // maintained by index.ts on every agent_end — don't touch it here.
@@ -909,6 +1267,123 @@ export async function runArchivist(
     }
   }
 
+  // Step 9.5 (Capability Uplift): distortion index + axis priors + critical failure emission.
+  // Decoupled from priorities so it runs even on bootstrap workspaces where PRIORITIES.json is absent.
+  try {
+    // Distortion samples: per-domain approval-vs-grounded drift snapshot.
+    if (priorities) {
+      const freshStats = aggregateDomainOutcomes(allRecent);
+      if (metricRegistry && metricContext) {
+        for (const stats of freshStats) {
+          const result = await metricRegistry.compute(stats.domain, metricContext);
+          if (result) {
+            stats.groundedScore = result.score;
+            stats.groundedMetricSource = result.description;
+          }
+        }
+      }
+      const now = Date.now();
+      for (const stats of freshStats) {
+        const entry = priorities.domains[stats.domain];
+        const approvalCount = Number.isFinite(entry?.approval_count) ? entry!.approval_count : 0;
+        const overrideCount = Number.isFinite(entry?.override_count) ? entry!.override_count : 0;
+        appendDistortionSample(workspacePath, {
+          domain: stats.domain,
+          timestamp: now,
+          measured: stats.successRate,
+          grounded: stats.groundedScore ?? stats.successRate,
+          approvalCount,
+          overrideCount,
+        });
+      }
+
+      // Per-domain distortion regime computed from the sidecar history.
+      const allHistory = readDistortionHistory(workspacePath);
+      const domainsSeen = new Set<string>(allHistory.map((s) => s.domain));
+      for (const domain of domainsSeen) {
+        const reading = computeDistortion(
+          allHistory.filter((s) => s.domain === domain),
+          DEFAULT_DISTORTION_WINDOW,
+        );
+        if (reading.regime === "campbell_suspected") {
+          semanticStore.appendArchivistLog(
+            "campbell_suspected",
+            `Domain ${domain}: ${reading.evidence.join("; ")}`,
+          );
+          // CR_OODA_CAUSAL_RETRIEVAL: attach the most recent failure
+          // antecedents so meta-reviewer sees what preceded this regime shift
+          // without re-querying. Domain-filter is best-effort; rows without
+          // matching actionId joins are silently skipped.
+          const antecedents = formatAntecedents(
+            findAntecedents(allRecent, {
+              outcome: "failure",
+              limit: 5,
+            }),
+          );
+          appendCriticalFailure(workspacePath, {
+            type: "criticalFailure",
+            timestamp: new Date().toISOString(),
+            actionId: `distortion-${domain}-${now}`,
+            expectedOutcome: {
+              actionId: `distortion-${domain}-${now}`,
+              description: `Grounded metric for ${domain} tracks approval signal`,
+              successSignal: "grounded_tracks_measured",
+              failureSignal: "campbell_suspected",
+              domain,
+            },
+            actualOutcome: {
+              source: "inferred",
+              confidence: Math.max(reading.campbellIndex, 0.7),
+              reasoning: `campbell_suspected regime: ${reading.evidence.join("; ")}`,
+            },
+            severity: "critical",
+            implicated_rule: "distortion.campbell_regime",
+            ...(antecedents.length > 0 ? { antecedents } : {}),
+          });
+        } else if (reading.regime === "goodhart_warning") {
+          semanticStore.appendArchivistLog(
+            "goodhart_warning",
+            `Domain ${domain}: ${reading.evidence.join("; ")}`,
+          );
+        }
+      }
+    }
+
+    // Axis priors: aggregate failure-axis evidence from episodic events + sidecar.
+    const errorTagMap = readErrorTagsSidecar(workspacePath);
+    if (errorTagMap.size > 0) {
+      const enriched = allRecent.map((e) => {
+        const tags = errorTagMap.get(e.id);
+        return tags ? { ...e, errorTags: tags } : e;
+      });
+      // CR_OODA_EMOTIONAL_TAGGING: weight error-tag contributions by the
+      // SITREP priority at capture so high-arousal failures dominate the
+      // axis-prior signal used by triage and meta-review.
+      const priors = aggregateAxisPriors(enriched, DEFAULT_AXIS_WINDOW_MS, inferDomain, {
+        priorityWeighting: true,
+      });
+      if (priors.length > 0) {
+        const file = path.join(workspacePath, AXIS_PRIORS_FILE);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(
+          file,
+          JSON.stringify(
+            { generatedAt: new Date().toISOString(), windowDays: 30, priors },
+            null,
+            2,
+          ) + "\n",
+          "utf-8",
+        );
+        semanticStore.appendArchivistLog(
+          "axis_priors_refreshed",
+          `Aggregated ${priors.length} axis-prior row(s) across domains`,
+        );
+      }
+    }
+  } catch (err) {
+    semanticStore.appendArchivistLog("capability_uplift_error", errorMessage(err));
+  }
+
   // Step 10 (K3): Export AMF-relevant lessons to shared knowledge file
   if (patterns.length > 0) {
     try {
@@ -952,6 +1427,7 @@ export async function runArchivist(
     eventsPruned,
     fromFallback,
     lastError: lastError ? errorMessage(lastError) : undefined,
+    actionCounts,
   };
 }
 

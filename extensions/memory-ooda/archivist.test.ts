@@ -499,10 +499,14 @@ describe("runArchivist", () => {
 
     await runArchivist(tmpDir, 100, episodic, semantic, callModel);
 
-    expect(semantic.logEntries).toHaveLength(1);
-    expect(semantic.logEntries[0].action).toBe("distill");
-    expect(semantic.logEntries[0].reason).toContain("2 patterns");
-    expect(semantic.logEntries[0].reason).toContain("3 events");
+    // B2 CRUD classifier emits per-action rows before the batch-level "distill" row.
+    const distill = semantic.logEntries.find((e) => e.action === "distill");
+    expect(distill).toBeDefined();
+    expect(distill!.reason).toContain("2 patterns");
+    expect(distill!.reason).toContain("3 events");
+    // 2 ADD patterns → 2 per-action rows + 1 distill row = 3 entries.
+    const actionRows = semantic.logEntries.filter((e) => e.action.startsWith("pattern_"));
+    expect(actionRows.length).toBeGreaterThanOrEqual(2);
   });
 
   it("updates state file after run", async () => {

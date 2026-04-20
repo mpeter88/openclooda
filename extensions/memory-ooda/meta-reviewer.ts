@@ -18,20 +18,26 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { listAdmissionCases } from "./admission-gate.js";
 import {
   aggregateDomainOutcomes,
   inferDomain,
   type EpisodicEvent,
   type EpisodicStore,
 } from "./archivist.js";
+import { runChangeGate, type ChangeGateConfig } from "./change-gate.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
+import type { AdmissionRunnable } from "./pass-k.js";
 import { readSitrepLog, type SitrepLogEntry } from "./sitrep-log.js";
 import type { ModelCallFn } from "./triage.js";
 import type {
   ActualOutcome,
+  AdmissionCase,
+  AdmissionReport,
   CriticalFailureEvent,
   DomainEntry,
   DomainOutcomeStats,
+  GateOutcome,
   KnowledgeFile,
   PolicyProposal,
   PrioritiesFile,
@@ -50,6 +56,20 @@ export interface PrioritiesStore {
 /** Abstraction over policy proposal storage for testability. */
 export interface ProposalStore {
   addProposal(proposal: Omit<PolicyProposal, "status">): PolicyProposal;
+  /** Optional — flip an existing proposal's status to rejected. Used by the change-gate. */
+  rejectProposal?(id: string, reason: string): void;
+}
+
+/** Options controlling the CR_OODA_PASS_K_ACCEPTANCE_GATE admission gate. */
+export interface MetaReviewerGateOptions {
+  /** Workspace directory (required for per-run history + admission corpus lookup). */
+  workspacePath: string;
+  /** Optional AdmissionRunnable — falls open when omitted (no corpus ⇒ admit). */
+  runnable?: AdmissionRunnable;
+  /** Admission corpus; defaults to empty (gate falls open under minCasesForGate). */
+  admissionCorpus?: AdmissionCase[];
+  /** Forwarded to runChangeGate. */
+  gateConfig?: ChangeGateConfig;
 }
 
 export interface MetaReviewerInput {
@@ -59,10 +79,26 @@ export interface MetaReviewerInput {
 
 export interface MetaReviewerResult {
   proposalsCreated: PolicyProposal[];
+  /** Proposals the change-gate rejected (already flipped to status=rejected if the store supports it). */
+  proposalsRejected?: PolicyProposal[];
   weightsAdjusted: Array<{ domain: string; oldWeight: number; newWeight: number }>;
   fromFallback: boolean;
   /** Last error from model call attempts, if any. */
   lastError?: string;
+}
+
+function gateOutcomeToAdmissionReport(proposalId: string, gate: GateOutcome): AdmissionReport {
+  return {
+    proposalId,
+    casesRun: gate.ranCases,
+    casesPassed: 0,
+    casesFailed: [],
+    passRate: 0,
+    kPassRates: gate.passK?.passRates ?? {},
+    admit: gate.admit,
+    admitReason: gate.reason,
+    computedAt: new Date().toISOString(),
+  };
 }
 
 // ============================================================================
@@ -329,13 +365,15 @@ export async function runMetaReviewer(
   prioritiesStore: PrioritiesStore,
   proposalStore: ProposalStore,
   callModel: ModelCallFn,
-  options?: { maxRetries?: number },
+  options?: { maxRetries?: number; gate?: MetaReviewerGateOptions },
 ): Promise<MetaReviewerResult> {
   const maxRetries = options?.maxRetries ?? 1;
+  const gateOptions = options?.gate;
 
   // Step 1: Policy review for failures with implicated rules
   const reviewable = input.failures.filter(shouldTriggerPolicyReview);
   let proposalsCreated: PolicyProposal[] = [];
+  const proposalsRejected: PolicyProposal[] = [];
   let fromFallback = false;
   let lastError: unknown;
 
@@ -348,15 +386,79 @@ export async function runMetaReviewer(
         const rawProposals = parseProposals(raw);
 
         for (const rp of rawProposals) {
-          const proposal = proposalStore.addProposal({
-            id: `proposal-${randomUUID().slice(0, 8)}`,
+          const proposalId = `proposal-${randomUUID().slice(0, 8)}`;
+
+          // CR_OODA_PASS_K_ACCEPTANCE_GATE: run the admission gate before emitting.
+          // Falls open for empty corpora (minCasesForGate bootstrap), so early workspaces
+          // behave exactly as pre-gate code did. With a populated corpus the gate becomes
+          // authoritative and rejected proposals persist with rejectionReason.
+          let gateOutcome: GateOutcome | undefined;
+          if (gateOptions) {
+            try {
+              const corpus =
+                gateOptions.admissionCorpus ?? listAdmissionCases(gateOptions.workspacePath);
+              gateOutcome = await runChangeGate(
+                {
+                  kind: "policy_proposal",
+                  id: proposalId,
+                  summary: rp.proposal,
+                  diff: rp.reasoning,
+                  initiator: "meta_reviewer",
+                },
+                corpus,
+                gateOptions.runnable ??
+                  (async () => ({
+                    source: "inferred",
+                    confidence: 1,
+                    reasoning: "no runnable supplied — gate falls open under min corpus floor",
+                  })),
+                gateOptions.gateConfig ?? {},
+                gateOptions.workspacePath,
+              );
+            } catch {
+              // Gate failure must not block meta-reviewer — treat as admit.
+            }
+          }
+
+          const admissionReport =
+            gateOutcome && gateOptions
+              ? gateOutcomeToAdmissionReport(proposalId, gateOutcome)
+              : undefined;
+          const rejected = gateOutcome !== undefined && gateOutcome.admit === false;
+
+          const payload: Omit<PolicyProposal, "status"> = {
+            id: proposalId,
             timestamp: new Date().toISOString(),
             rule: rp.rule,
             proposal: rp.proposal,
             reasoning: rp.reasoning,
             evidence: rp.evidence,
-          });
-          proposalsCreated.push(proposal);
+            category: "policy",
+            confidence: 1.0,
+            autoGenerated: true,
+            ...(admissionReport ? { admissionReport, admissionRequired: true } : {}),
+            ...(rejected
+              ? {
+                  rejectionReason: `admission_gate: ${gateOutcome!.reason}`,
+                  rejectedAt: new Date().toISOString(),
+                }
+              : {}),
+          };
+
+          const proposal = proposalStore.addProposal(payload);
+
+          if (rejected) {
+            // Flip status when the store exposes rejectProposal — additive so legacy
+            // mocks without the method keep working (proposal stays "pending" with
+            // rejectionReason set as a self-describing marker).
+            proposalStore.rejectProposal?.(
+              proposal.id,
+              payload.rejectionReason ?? "admission_gate rejected",
+            );
+            proposalsRejected.push(proposal);
+          } else {
+            proposalsCreated.push(proposal);
+          }
         }
 
         lastError = undefined;
@@ -375,6 +477,7 @@ export async function runMetaReviewer(
 
   return {
     proposalsCreated,
+    ...(proposalsRejected.length > 0 ? { proposalsRejected } : {}),
     weightsAdjusted,
     fromFallback,
     lastError: lastError ? errorMessage(lastError) : undefined,

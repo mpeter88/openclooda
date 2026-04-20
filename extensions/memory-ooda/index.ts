@@ -25,13 +25,42 @@ import {
   shouldRunArchivist,
   runArchivist,
   ArchivistRunner,
+  appendErrorTagsSidecar,
   type EpisodicStore,
   type EpisodicEvent,
   type SemanticStore,
 } from "./archivist.js";
 import { inferDomain } from "./archivist.js";
+import { formatBeliefsForContext, getActiveBeliefs } from "./beliefs.js";
 import { registerWorkspaceCli } from "./cli.js";
 import { runCouncil, type CouncilMode } from "./council.js";
+import {
+  DEFAULT_DMN_CONFIG,
+  DEFAULT_WORK_UNIT_FLAGS,
+  advanceWorkUnitRotation,
+  appendDMNLog,
+  cadenceMs,
+  createDMNScheduler,
+  isLLMBackedKind,
+  readDMNState,
+  recordLLMCall,
+  runBeliefRescore,
+  runCampbellWatchdog,
+  runPatternDistill,
+  runRehearsal,
+  runRetrospectiveChair,
+  selectBucket,
+  selectWorkUnit,
+  withinLLMBudget,
+  writeDMNState,
+  type DMNBucket,
+  type DMNCadenceConfig,
+  type DMNScheduler,
+  type DMNWorkKind,
+  type DMNWorkUnitFlags,
+} from "./dmn.js";
+import { clearTurnSitrep, weightImportance, writeTurnSitrep } from "./emotional-tagging.js";
+import { classifyError } from "./error-classifier.js";
 import {
   pingHealth,
   pingHealthError,
@@ -52,6 +81,7 @@ import {
   upsertFact,
   appendArchivistLog,
 } from "./semantic-memory.js";
+import { formatMatchesForDiscriminator, scanForNearDuplicates } from "./separation-scan.js";
 import { appendSitrepLog } from "./sitrep-log.js";
 import { SlowClarify, type InboxDb, type InboxItem } from "./slow-clarify.js";
 import { runStrategy } from "./strategy.js";
@@ -63,11 +93,14 @@ import {
   wakeSync,
   evaluateDispatch,
 } from "./task-bridge.js";
+import { appendTrajectoryAudit } from "./trajectory-audit.js";
 import {
   runTriage,
   shouldRunFullOODA,
   computeDomainTrajectories,
   applyTrajectoryScaling,
+  classifyQuadrant,
+  resolveTrajectoryMode,
   type ModelCallFn,
 } from "./triage.js";
 
@@ -427,6 +460,20 @@ const oodaPlugin = {
 
     let sharedEpisodicStore: EpisodicStore | null | undefined = undefined; // undefined = not yet built
 
+    // CR_OODA_EMOTIONAL_TAGGING: in-process stash of the current turn's SITREP
+    // priority, set at the end of before_agent_start and cleared on agent_end.
+    // Read by after_tool_call capture paths so structural events inherit the
+    // turn's arousal level as a durability multiplier.
+    let currentTurnPriority: number | undefined;
+
+    // CR_OODA_DMN_INTEGRATION_LOOP: idle-state integration scheduler.
+    // Tracks last user activity so the bucket (active/recent/idle/dormant/
+    // asleep) can decay work cadence when the operator is away.
+    let lastUserActivityAt = Date.now();
+    const dmnConfig: DMNCadenceConfig = { ...DEFAULT_DMN_CONFIG };
+    const dmnFlags: DMNWorkUnitFlags = { ...DEFAULT_WORK_UNIT_FLAGS };
+    let dmnScheduler: DMNScheduler | null = null;
+
     async function getEpisodicStore(): Promise<EpisodicStore | null> {
       if (sharedEpisodicStore !== undefined) return sharedEpisodicStore;
       sharedEpisodicStore = await buildEpisodicStore(api);
@@ -552,6 +599,9 @@ const oodaPlugin = {
     // ========================================================================
 
     api.on("before_agent_start", async (event, ctx) => {
+      // CR_OODA_DMN_INTEGRATION_LOOP: any user-initiated turn resets the DMN
+      // bucket to active; downstream tick picks up the fresh cadence.
+      lastUserActivityAt = Date.now();
       try {
         const knowledge = getFacts(workspacePath);
         const context = formatFactsForContext(knowledge);
@@ -559,6 +609,21 @@ const oodaPlugin = {
 
         if (context) {
           parts.push(context);
+        }
+
+        // Tier 4 Beliefs — inject evolving stances that affect triage.
+        // Distinct from stable facts above; flagged so downstream models know
+        // these are revisable working theories.
+        try {
+          const activeBeliefs = getActiveBeliefs(workspacePath, {
+            affectsPhase: "triage",
+            minConfidence: 0.6,
+            limit: 10,
+          });
+          const beliefsBlock = formatBeliefsForContext(activeBeliefs, { floor: 0.6, limit: 10 });
+          if (beliefsBlock) parts.push(beliefsBlock);
+        } catch {
+          // Best-effort — beliefs injection is supplementary
         }
 
         // Notify about pending proposals (enhanced: show text inline when only 1)
@@ -724,14 +789,45 @@ const oodaPlugin = {
             callModel,
           );
 
-          // Apply trajectory scaling to the SITREP priority
+          // Apply trajectory scaling to the SITREP priority, respecting mode (off/shadow/live)
+          // CR_OODA_TRAJECTORY_AWARE_TRIAGE_V2: scaled priority only promoted in "live" mode;
+          // shadow computes the quadrant + scaled value for audit without adopting it.
           let sitrep = triageResult.sitrep;
-          if (domainTrajectories) {
-            sitrep = applyTrajectoryScaling(
-              sitrep,
-              domainTrajectories,
-              priorities.thresholds.trajectory_scaling,
-            );
+          const trajConfig = priorities.thresholds.trajectory_scaling;
+          const trajMode = resolveTrajectoryMode(trajConfig);
+          if (domainTrajectories && trajMode !== "off") {
+            const rawPriority = sitrep.priority;
+            const relevant = sitrep.recommendedDomains
+              .map((d) => domainTrajectories[d])
+              .filter((t): t is number => t !== undefined);
+            const avgTrajectory =
+              relevant.length > 0 ? relevant.reduce((a, b) => a + b, 0) / relevant.length : 0;
+            const scaled = applyTrajectoryScaling(sitrep, domainTrajectories, trajConfig);
+            const quadrant = classifyQuadrant(rawPriority, avgTrajectory);
+            const scaleApplied = rawPriority > 0 ? scaled.priority / rawPriority : 1;
+
+            try {
+              appendTrajectoryAudit(workspacePath, {
+                timestamp: Date.now(),
+                sitrepSummary: sitrep.summary,
+                rawPriority,
+                scaledPriority: scaled.priority,
+                quadrant,
+                scaleApplied,
+                domains: sitrep.recommendedDomains,
+                avgTrajectory,
+                mode: trajMode,
+              });
+            } catch (auditErr) {
+              api.logger.warn(`memory-ooda: trajectory audit write failed: ${String(auditErr)}`);
+            }
+
+            if (trajMode === "live") {
+              sitrep = scaled;
+            } else {
+              // shadow: keep raw priority but tag rawPriority so downstream has both values.
+              sitrep = { ...sitrep, rawPriority };
+            }
             triageResult = { ...triageResult, sitrep };
           }
 
@@ -740,6 +836,25 @@ const oodaPlugin = {
             priority: sitrep.priority,
             rawPriority: sitrep.rawPriority,
           });
+
+          // CR_OODA_EMOTIONAL_TAGGING: stash the arousal signal for this turn.
+          // Downstream capture paths (after_tool_call, structural events) read
+          // this to scale importance by SITREP priority.
+          currentTurnPriority = sitrep.priority;
+
+          // Cross-plugin sidecar so memory-lancedb (separate plugin, same
+          // process) can also weight its autoCapture of user + assistant
+          // messages. Freshness guard: 5-minute TTL; readers check age.
+          try {
+            writeTurnSitrep(workspacePath, {
+              priority: sitrep.priority,
+              rawPriority: sitrep.rawPriority,
+              writtenAt: new Date().toISOString(),
+              sessionKey: ctx?.sessionKey,
+            });
+          } catch (sidecarErr) {
+            api.logger.warn(`memory-ooda: turn-sitrep sidecar write failed: ${String(sidecarErr)}`);
+          }
 
           // S1: Persist SITREP to daily JSONL log
           try {
@@ -803,11 +918,30 @@ const oodaPlugin = {
             parts.push(sitrepBlock);
 
             try {
+              // CR_OODA_PATTERN_SEPARATION_GATE: scan memories.sqlite for
+              // near-duplicate rows by MinHash Jaccard. Populates separationMatches
+              // for the Discriminator when strong hash-matches exist; otherwise
+              // passes undefined so runCouncil takes its normal path.
+              let separationMatches: string[] | undefined;
+              try {
+                const dbPath = resolveLanceDbPath(api);
+                const matches = await scanForNearDuplicates(dbPath, event.prompt, {
+                  minJaccard: 0.6,
+                  limit: 3,
+                });
+                if (matches.length > 0) {
+                  separationMatches = formatMatchesForDiscriminator(matches);
+                }
+              } catch (scanErr) {
+                api.logger.warn(`memory-ooda: separation scan failed: ${String(scanErr)}`);
+              }
+
               const strategyInput = {
                 sitrep,
                 priorities,
                 observation: event.prompt,
                 neverDo: knowledge.preferences.never_do,
+                ...(separationMatches ? { separationMatches } : {}),
               };
 
               // Determine council mode
@@ -926,6 +1060,15 @@ const oodaPlugin = {
       // callModel now uses direct Anthropic API (no subagent/request context
       // needed), so running from agent_end via setImmediate is safe.
       archivistRunner.nudge();
+      // CR_OODA_EMOTIONAL_TAGGING: clear the per-turn arousal stash so captures
+      // after this point (delayed cron jobs, sidecar writes) default to the
+      // neutral baseline instead of inheriting a stale priority.
+      currentTurnPriority = undefined;
+      try {
+        clearTurnSitrep(workspacePath);
+      } catch {
+        // best-effort — sidecar cleanup must not block agent_end
+      }
     });
 
     // ========================================================================
@@ -1034,6 +1177,83 @@ const oodaPlugin = {
             }
           } catch (err) {
             api.logger.warn(`memory-ooda: reflect failed: ${String(err)}`);
+          }
+        })();
+      });
+    });
+
+    // ========================================================================
+    // CR_OODA_ERROR_TAXONOMY: classify failed episodic events on agent_end.
+    // Deduped via the `.error-tags.jsonl` sidecar: an event already present
+    // there is skipped so we don't reclassify on every turn.
+    // ========================================================================
+
+    let classifyBusy = false;
+    api.on("agent_end", () => {
+      if (classifyBusy) return;
+      classifyBusy = true;
+      setImmediate(() => {
+        void (async () => {
+          try {
+            const episodicStore = await getEpisodicStore();
+            if (!episodicStore?.findRecentWithActionId) return;
+
+            const { join: pathJoin } = await import("node:path");
+            const { existsSync, readFileSync } = await import("node:fs");
+            const sidecarPath = pathJoin(workspacePath, ".error-tags.jsonl");
+            const alreadyClassified = new Set<string>();
+            if (existsSync(sidecarPath)) {
+              for (const line of readFileSync(sidecarPath, "utf-8").split("\n")) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                try {
+                  const row = JSON.parse(trimmed) as { eventId?: string };
+                  if (row.eventId) alreadyClassified.add(row.eventId);
+                } catch {
+                  // skip malformed rows
+                }
+              }
+            }
+
+            const recent = await episodicStore.findRecentWithActionId(10);
+            const failures = recent.filter(
+              (e) => e.outcome && e.outcome !== "success" && !alreadyClassified.has(e.id),
+            );
+            // Cap per-turn work so a long outage does not stall the hot path.
+            for (const event of failures.slice(0, 3)) {
+              const tags = await classifyError(
+                event,
+                {
+                  actualOutcome: {
+                    source: "inferred",
+                    confidence: 0.7,
+                    reasoning: event.outcomeSignal ?? event.outcome ?? "unlabeled failure",
+                  },
+                  toolTrace: [
+                    {
+                      tool: event.source ?? "unknown",
+                      args: {},
+                      result: null,
+                      error: event.outcomeSignal ?? event.outcome,
+                    },
+                  ],
+                },
+                callModel,
+              );
+              if (tags.length > 0) {
+                try {
+                  appendErrorTagsSidecar(workspacePath, event.id, tags);
+                } catch (persistErr) {
+                  api.logger.warn(
+                    `memory-ooda: error-tag sidecar write failed: ${String(persistErr)}`,
+                  );
+                }
+              }
+            }
+          } catch (err) {
+            api.logger.warn(`memory-ooda: error classifier failed: ${String(err)}`);
+          } finally {
+            classifyBusy = false;
           }
         })();
       });
@@ -1249,15 +1469,22 @@ const oodaPlugin = {
 
         if (!store?.store) return;
 
+        // CR_OODA_EMOTIONAL_TAGGING: weight importance by the turn's SITREP
+        // priority so high-arousal decisions encode with greater durability.
+        // When no triage has run this turn (missing priority), default to the
+        // neutral baseline (P5 → weight 0.75).
+        const weightedImportance = weightImportance(classified.importance, currentTurnPriority);
+
         await store.store({
           text: classified.text,
           category: classified.category,
-          importance: classified.importance,
+          importance: weightedImportance,
           source: "structural",
+          sitrepPriorityAtCapture: currentTurnPriority,
         });
 
         // Phase 5: Increment eventsSinceLastReflect for significant events
-        if (classified.importance >= 0.6 || classified.category === "decision") {
+        if (weightedImportance >= 0.6 || classified.category === "decision") {
           try {
             const wmPath = join(homedir(), ".openclaw", "world-model");
             const wmStore = new WorldModelStore(wmPath);
@@ -1466,6 +1693,143 @@ const oodaPlugin = {
       },
       stop: () => {
         api.logger.info("memory-ooda: stopped");
+      },
+    });
+
+    // ========================================================================
+    // CR_OODA_DMN_INTEGRATION_LOOP — tapered idle-state work scheduler.
+    //
+    // Separate service so it can be enabled/disabled independently of the main
+    // memory-ooda plugin surface. Uses setTimeout (not setInterval) so each
+    // tick re-evaluates the bucket and re-schedules at the fresh cadence.
+    // ========================================================================
+
+    async function dmnTick(): Promise<void> {
+      if (!dmnConfig.enabled) return;
+      const absenceMs = Date.now() - lastUserActivityAt;
+      const bucket: DMNBucket = selectBucket(absenceMs, dmnConfig);
+
+      if (bucket === "asleep") {
+        // No-op tick — scheduler will re-call us at asleep cadence.
+        return;
+      }
+
+      let state = readDMNState(workspacePath);
+      state = { ...state, bucket };
+      const kind = selectWorkUnit(bucket, state, dmnFlags);
+      if (!kind) {
+        writeDMNState(workspacePath, state);
+        return;
+      }
+
+      // LLM budget check for LLM-backed kinds.
+      if (isLLMBackedKind(kind) && !withinLLMBudget(state)) {
+        appendDMNLog(workspacePath, {
+          timestamp: new Date().toISOString(),
+          bucket,
+          kind,
+          outcome: "noop",
+          details: "llm budget exhausted for 24h window",
+        });
+        writeDMNState(workspacePath, state);
+        return;
+      }
+
+      const start = Date.now();
+      let outcome: "success" | "noop" | "error" = "noop";
+      let details: string | undefined;
+
+      try {
+        if (kind === "campbell_watchdog") {
+          const r = runCampbellWatchdog(workspacePath);
+          outcome = r.triggered ? "success" : "noop";
+          details = r.triggered ? `campbell_suspected in ${r.domain}` : `regime=${r.regime}`;
+        } else if (kind === "belief_rescore") {
+          // Pull a modest recent-events window — memory-lancedb fallback is
+          // fine since we only need text + outcome, not vectors.
+          const episodicStore = await getEpisodicStore();
+          if (!episodicStore) {
+            outcome = "noop";
+            details = "no episodic store";
+          } else {
+            const since = Date.now() - 2 * 60 * 60 * 1000; // 2h window
+            const events = await episodicStore.retrieveSince(since, 200);
+            const r = runBeliefRescore(workspacePath, events);
+            outcome = r.reinforced.length + r.weakened.length > 0 ? "success" : "noop";
+            details = `reinforced=${r.reinforced.length} weakened=${r.weakened.length}${r.skipped_no_recent_events ? " (no recent outcome events)" : ""}`;
+          }
+        } else if (kind === "retrospective_chair") {
+          const r = await runRetrospectiveChair(workspacePath, callModel);
+          outcome = r.evaluated > 0 ? (r.criticalEmitted ? "success" : "noop") : "noop";
+          details = `evaluated=${r.evaluated} winnerShare=${r.winnerShare?.toFixed(2) ?? "n/a"} critical=${r.criticalEmitted}`;
+        } else if (kind === "rehearsal") {
+          const r = await runRehearsal(workspacePath, callModel);
+          outcome = r.rehearsed ? "success" : "noop";
+          details = r.rehearsed
+            ? `rehearsed commitment="${r.commitmentLabel}" priority=${r.cachedSitrep?.priority}`
+            : "no eligible commitment";
+        } else if (kind === "pattern_distill") {
+          const episodicStore = await getEpisodicStore();
+          const r = await runPatternDistill(workspacePath, callModel, episodicStore);
+          outcome = r.candidatesAdded > 0 ? "success" : "noop";
+          details = `scanned=${r.eventsScanned} added=${r.candidatesAdded}`;
+        } else {
+          outcome = "noop";
+          details = `${kind} dispatched but no runner`;
+        }
+      } catch (err) {
+        outcome = "error";
+        details = String(err).slice(0, 200);
+      }
+
+      // Advance rotation + budget accounting.
+      let updated = advanceWorkUnitRotation(state, kind, bucket, dmnFlags);
+      updated = { ...updated, ticks_since_last_user_turn: updated.ticks_since_last_user_turn + 1 };
+      if (isLLMBackedKind(kind) && outcome === "success") {
+        updated = recordLLMCall(updated);
+      }
+      writeDMNState(workspacePath, updated);
+      appendDMNLog(workspacePath, {
+        timestamp: new Date().toISOString(),
+        bucket,
+        kind,
+        outcome,
+        details,
+        durationMs: Date.now() - start,
+      });
+    }
+
+    function nextDelayMs(): number {
+      const absenceMs = Date.now() - lastUserActivityAt;
+      const bucket = selectBucket(absenceMs, dmnConfig);
+      if (bucket === "asleep") return 10 * 60 * 1000; // re-poll for user return
+      return cadenceMs(bucket, dmnConfig);
+    }
+
+    api.registerService({
+      id: "memory-ooda-dmn",
+      start: () => {
+        if (!dmnConfig.enabled) {
+          api.logger.info("memory-ooda-dmn: disabled via config");
+          return;
+        }
+        if (!dmnScheduler) {
+          dmnScheduler = createDMNScheduler({
+            tick: dmnTick,
+            nextDelayMs,
+            onError: (err) => api.logger.warn(`memory-ooda: dmn tick failed: ${String(err)}`),
+          });
+        }
+        // First tick fires after the Active cadence so the gateway finishes
+        // its own boot before DMN starts running work.
+        dmnScheduler.start(dmnConfig.active_interval_ms);
+        api.logger.info(
+          `memory-ooda-dmn: started (first tick in ${dmnConfig.active_interval_ms / 1000}s)`,
+        );
+      },
+      stop: () => {
+        dmnScheduler?.stop();
+        api.logger.info("memory-ooda-dmn: stopped");
       },
     });
   },

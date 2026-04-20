@@ -5,6 +5,13 @@
  * System 2 (Full Council): deliberative multi-member council for high-priority decisions.
  */
 
+import { runAdaptiveChair, type ChairSampleFn } from "./adaptive-chair.js";
+import {
+  buildChairPreReadPrompt,
+  computeDisagreement,
+  parseChairPrior,
+  runJury,
+} from "./council-discipline.js";
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
 import {
   buildChairPrompt,
@@ -13,7 +20,7 @@ import {
   type StrategyInput,
 } from "./strategy.js";
 import type { ModelCallFn } from "./triage.js";
-import type { CouncilTrace, Strategy } from "./types.js";
+import type { ChairPrior, CouncilTrace, JuryResult, Strategy } from "./types.js";
 
 // ============================================================================
 // Types
@@ -22,9 +29,43 @@ import type { CouncilTrace, Strategy } from "./types.js";
 export type CouncilMode = "system1" | "system2" | "none";
 
 export interface CouncilMember {
-  role: "analyst" | "strategist" | "skeptic" | "devils_advocate";
+  role: "analyst" | "strategist" | "skeptic" | "devils_advocate" | "discriminator";
   prompt: string;
   output?: string;
+}
+
+/**
+ * CR_OODA_PATTERN_SEPARATION_GATE: Discriminator member prompt.
+ *
+ * Fires when retrieval produces at least one `exact_duplicate` candidate. One
+ * question only: what is different between the current situation and the
+ * near-match? Forces an explicit separation call so the rest of the council
+ * doesn't gap-fill by echoing the prior answer.
+ */
+export function buildDiscriminatorPrompt(
+  observation: string,
+  nearMatchSummaries: string[],
+): string {
+  const matches =
+    nearMatchSummaries.length > 0
+      ? nearMatchSummaries.map((m, i) => `(${i + 1}) ${m}`).join("\n")
+      : "(no summaries available — infer from context)";
+  return `You are the Discriminator — a council member whose sole job is pattern separation.
+
+The retrieval layer flagged at least one near-identical past memory for this observation. The rest of the council is about to reason — your job is to make them do real work, not echo the prior.
+
+## Current observation
+${observation.slice(0, 600)}
+
+## Near-identical prior(s)
+${matches}
+
+## Task
+Answer in 1-3 sentences:
+  - If nothing is materially different between the current situation and the near-match, say "No material difference" and stop.
+  - Otherwise, name the specific difference(s). Be concrete — timestamp, constraint, actor, side effect, whatever it is.
+
+Respond with raw text only.`;
 }
 
 export interface CouncilResult {
@@ -200,6 +241,40 @@ export async function runCouncil(
       { role: "skeptic", prompt: skepticPrompt },
     ];
 
+    const archetypes = input.priorities.strategy_labels.map((s) => s.label);
+
+    // CR_OODA_PATTERN_SEPARATION_GATE: Discriminator fires when the retrieval
+    // layer flagged exact-duplicate near-matches. Runs in parallel with the
+    // other members; its output is attached to the chair's context so the
+    // verdict can cite "what's different."
+    let discriminatorOutput: string | undefined;
+    const separationMatches = input.separationMatches ?? [];
+    if (separationMatches.length > 0) {
+      const discriminatorPrompt = buildDiscriminatorPrompt(input.observation, separationMatches);
+      members.push({ role: "discriminator", prompt: discriminatorPrompt });
+      try {
+        discriminatorOutput = await callModel(discriminatorPrompt);
+        members[members.length - 1].output = discriminatorOutput;
+      } catch {
+        discriminatorOutput = "[discriminator failed]";
+        members[members.length - 1].output = discriminatorOutput;
+      }
+    }
+
+    // CR_OODA_COUNCIL_ADVERSARIAL_DISCIPLINE: chair pre-read anchor.
+    // Chair commits to an initial lean based ONLY on the SITREP, before seeing
+    // member outputs. Used later to flag post-read reversals and anchor fallbacks.
+    let chairPrior: ChairPrior | undefined;
+    if (input.priorities.thresholds.council_chair_anchoring_enabled) {
+      try {
+        const preReadPrompt = buildChairPreReadPrompt(input.sitrep, archetypes);
+        const preReadRaw = await callModel(preReadPrompt);
+        chairPrior = parseChairPrior(preReadRaw);
+      } catch {
+        // Pre-read is best-effort — absence is tolerated downstream.
+      }
+    }
+
     // Run all 3 members in parallel
     const [analystResult, strategistResult, skepticResult] = await Promise.allSettled([
       callModel(analystPrompt),
@@ -270,6 +345,84 @@ export async function runCouncil(
     // Parse chair response
     const chairParsed = parseChairResponse(chairRaw);
 
+    // CR_OODA_COUNCIL_ADVERSARIAL_DISCIPLINE: disagreement score + flip detection.
+    const disagreement = computeDisagreement(
+      [
+        { role: "analyst", output: analystOutput },
+        { role: "strategist", output: strategistOutput },
+        { role: "skeptic", output: skepticOutput },
+      ],
+      archetypes,
+    );
+    const minDisagreement = input.priorities.thresholds.council_min_disagreement ?? 0.15;
+    const lowDisagreement = disagreement.score < minDisagreement;
+    const flipped = chairPrior !== undefined && chairPrior.preReadWinner !== chairParsed.label;
+
+    // CR_OODA_COUNCIL_ADVERSARIAL_DISCIPLINE: optional jury on high-priority + high-disagreement decisions.
+    let juryResult: JuryResult | undefined;
+    const juryPriorityFloor = input.priorities.thresholds.council_jury_priority_floor ?? 9;
+    const juryDisagreementFloor =
+      input.priorities.thresholds.council_jury_disagreement_floor ?? 0.6;
+    if (
+      input.priorities.thresholds.council_jury_enabled &&
+      input.sitrep.priority >= juryPriorityFloor &&
+      disagreement.score >= juryDisagreementFloor
+    ) {
+      try {
+        juryResult = await runJury(
+          { label: chairParsed.label, reasoning: chairParsed.reasoning },
+          {
+            analyst: analystOutput,
+            strategist: strategistOutput,
+            skeptic: skepticOutput,
+          },
+          input.sitrep,
+          callModel,
+        );
+      } catch {
+        // Jury is supplementary — absence does not invalidate the chair verdict.
+      }
+    }
+
+    // CR_OODA_COUNCIL_KS_STOPPING: optional adaptive-chair stability sampling.
+    // Trace-only in this integration; the chair verdict above remains authoritative
+    // (scoring requires a fully-parsed chair response, which adaptive sampling
+    // does not produce). Stability metrics land on councilTrace.adaptiveChair.
+    let adaptiveTrace: CouncilTrace["adaptiveChair"] | undefined;
+    const adaptiveFloor = input.priorities.thresholds.council_adaptive_chair_priority_floor ?? 7;
+    if (
+      input.priorities.thresholds.council_adaptive_chair_enabled &&
+      input.sitrep.priority >= adaptiveFloor
+    ) {
+      try {
+        const sampleFn: ChairSampleFn = async (_attempt, _temperature) => {
+          const raw = await callModel(chairPrompt);
+          const parsed = parseChairResponse(raw);
+          return { label: parsed.label, confidence: parsed.alignmentScore, raw };
+        };
+        const adaptiveConfig = {
+          enabled: true,
+          minSamples: input.priorities.thresholds.council_adaptive_chair_min_samples ?? 3,
+          maxSamples: input.priorities.thresholds.council_adaptive_chair_max_samples ?? 9,
+          ksThreshold: input.priorities.thresholds.council_adaptive_chair_ks_threshold ?? 0.15,
+          temperatures: [0.0, 0.4, 0.8],
+          priorityFloor: adaptiveFloor,
+          dailyBudget: input.priorities.thresholds.council_chair_daily_budget ?? 200,
+        };
+        const adaptive = await runAdaptiveChair(sampleFn, adaptiveConfig);
+        adaptiveTrace = {
+          enabled: true,
+          sampleCount: adaptive.samples.length,
+          stabilizedAt: adaptive.stabilizedAt,
+          winnerShare: adaptive.winnerShare,
+          ksTrajectory: adaptive.ksByRound,
+          forcedStop: adaptive.forcedStop,
+        };
+      } catch {
+        // Adaptive chair is diagnostic — absence does not invalidate anything.
+      }
+    }
+
     const councilTrace: CouncilTrace = {
       mode: "system2",
       members: [
@@ -279,6 +432,12 @@ export async function runCouncil(
       ],
       chairReasoning: chairParsed.chairReasoning,
       dissent: chairParsed.dissent,
+      prior: chairPrior,
+      flipped,
+      disagreement,
+      low_disagreement: lowDisagreement,
+      jury: juryResult,
+      adaptiveChair: adaptiveTrace,
     };
 
     const winner: Strategy = {
@@ -309,6 +468,7 @@ export async function runCouncil(
         strategist: strategistOutput,
         skeptic: skepticOutput,
         chair: chairParsed.chairReasoning,
+        ...(discriminatorOutput ? { discriminator: discriminatorOutput } : {}),
       },
     };
   } catch (err) {
@@ -329,7 +489,7 @@ export async function runCouncil(
 // Chair Response Parsing
 // ============================================================================
 
-interface ChairParsed {
+export interface ChairParsed {
   label: string;
   reasoning: string;
   alignmentScore: number;

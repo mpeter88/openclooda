@@ -7,10 +7,67 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import {
+  reportRawEditWarning,
+  stampContentHash,
+  verifyContentHash,
+  type HashableFile,
+} from "./content-hash.js";
 import { createSnapshot, restoreLatestSnapshot } from "./snapshot.js";
-import type { KnowledgeFile } from "./types.js";
+import type { KnowledgeFile, TemporalEnvelope, UpsertOptions } from "./types.js";
 
 const KNOWLEDGE_FILENAME = "KNOWLEDGE.json";
+
+// ============================================================================
+// Bitemporal helpers (CR_OODA_BITEMPORAL_KNOWLEDGE)
+// ============================================================================
+
+/** Canonical envelope key: `<section>.<fact_key>`. */
+function envelopeKey(section: string, key: string): string {
+  return `${section}.${key}`;
+}
+
+/** Read section's fact value — handles Record-shaped sections only. */
+function readSectionFact(knowledge: KnowledgeFile, section: string, key: string): unknown {
+  const sectionData = (knowledge as unknown as Record<string, unknown>)[section];
+  if (typeof sectionData !== "object" || sectionData === null || Array.isArray(sectionData)) {
+    return undefined;
+  }
+  return (sectionData as Record<string, unknown>)[key];
+}
+
+/** Deep-equality check suitable for fact values (primitives + plain objects). */
+function valuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null) return false;
+  if (typeof a !== "object") return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** Ensure at most one envelope per key has `valid_to === null`. */
+function assertTemporalInvariant(knowledge: KnowledgeFile): void {
+  const temporal = knowledge._temporal ?? {};
+  for (const [canonicalKey, envelopes] of Object.entries(temporal)) {
+    const valid = envelopes.filter((e) => e.valid_to === null);
+    if (valid.length > 1) {
+      throw new Error(
+        `Temporal invariant violated for ${canonicalKey}: ${valid.length} envelopes with valid_to=null`,
+      );
+    }
+  }
+}
+
+/** Find the currently-valid envelope for a key (valid_to === null), if any. */
+function findCurrentEnvelope(
+  temporal: Record<string, TemporalEnvelope[]>,
+  section: string,
+  key: string,
+): TemporalEnvelope | undefined {
+  const envs = temporal[envelopeKey(section, key)];
+  if (!envs) return undefined;
+  return envs.find((e) => e.valid_to === null);
+}
 
 /**
  * Create a default empty KnowledgeFile template.
@@ -47,6 +104,7 @@ export function createDefaultKnowledge(): KnowledgeFile {
     domain_context: {},
     lessons_learned: {},
     _archivist_log: [],
+    _temporal: {},
   };
 }
 
@@ -66,6 +124,7 @@ export function getFacts(workspacePath: string): KnowledgeFile {
 
   if (!fs.existsSync(filePath)) {
     const defaults = createDefaultKnowledge();
+    stampContentHash(defaults as unknown as HashableFile);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const tmpPath = filePath + ".tmp";
     fs.writeFileSync(tmpPath, JSON.stringify(defaults, null, 2) + "\n", "utf-8");
@@ -81,30 +140,42 @@ export function getFacts(workspacePath: string): KnowledgeFile {
     throw new Error(`Invalid KNOWLEDGE.json: missing or malformed _meta block`);
   }
 
+  // CR_OODA_PASS_K_ACCEPTANCE_GATE (Path C): raw-edit detection. Mismatch
+  // means the file drifted outside the authoritative writer; log once and
+  // take a snapshot so the current state is recoverable.
+  const verdict = verifyContentHash(parsed as unknown as HashableFile);
+  if (verdict.status === "mismatch") {
+    reportRawEditWarning(workspacePath, KNOWLEDGE_FILENAME, verdict.claimed, verdict.computed);
+    try {
+      createSnapshot(workspacePath, KNOWLEDGE_FILENAME);
+    } catch {
+      // snapshot best-effort
+    }
+  }
+
   return parsed;
 }
 
 /**
  * Upsert a fact into a section of KNOWLEDGE.json.
  *
- * Takes a snapshot before writing. If the write produces invalid JSON,
- * the snapshot is restored automatically.
+ * Takes a snapshot before writing. Bitemporal envelopes tracked in `_temporal`:
+ * - identical re-write → reconfirmation (append to existing envelope's reconfirmations[])
+ * - different value → supersession (seal predecessor, write new envelope)
  *
- * @param workspacePath - Path to the OODA workspace directory
- * @param section - Top-level key in KnowledgeFile (e.g. "stack", "projects", "people", "domain_context")
- * @param key - Key within the section's Record
- * @param value - Value to set
+ * If the write produces invalid JSON or violates the temporal invariant
+ * (>1 valid_to=null envelope per key), the snapshot is restored automatically.
  */
 export function upsertFact(
   workspacePath: string,
   section: string,
   key: string,
   value: unknown,
+  opts?: UpsertOptions,
 ): void {
   const knowledge = getFacts(workspacePath);
   const filePath = knowledgePath(workspacePath);
 
-  // Validate that the section is a Record-style section we can upsert into
   const recordSections = [
     "stack",
     "projects",
@@ -119,41 +190,264 @@ export function upsertFact(
     );
   }
 
-  // Auto-initialise section if not yet present in the file (e.g. lessons_learned)
+  // Auto-initialise section + _temporal
   if (!(section in knowledge)) {
     (knowledge as Record<string, unknown>)[section] = {};
   }
+  if (!knowledge._temporal) {
+    knowledge._temporal = {};
+  }
 
-  // Snapshot before writing
   createSnapshot(workspacePath, KNOWLEDGE_FILENAME);
 
-  // Perform the upsert
+  const now = new Date().toISOString();
+  const canonicalKey = envelopeKey(section, key);
+  const currentValue = readSectionFact(knowledge, section, key);
+  const currentEnvelope = findCurrentEnvelope(knowledge._temporal, section, key);
+
+  // --- Bitemporal envelope logic ---
+  if (!knowledge._temporal[canonicalKey]) {
+    knowledge._temporal[canonicalKey] = [];
+  }
+
+  if (currentEnvelope) {
+    if (valuesEqual(currentValue, value)) {
+      // Reconfirmation — append timestamp; no new envelope.
+      if (!currentEnvelope.reconfirmations) {
+        currentEnvelope.reconfirmations = [];
+      }
+      currentEnvelope.reconfirmations.push(now);
+    } else {
+      // Supersession — seal predecessor, add new envelope.
+      currentEnvelope.valid_to = now;
+      currentEnvelope.invalidation_reason = opts?.invalidation_reason ?? "superseded";
+      const newEnvelope: TemporalEnvelope = {
+        valid_from: opts?.valid_from ?? now,
+        valid_to: null,
+        ingested_at: now,
+        ingested_by: opts?.ingested_by ?? "archivist",
+        supersedes: currentEnvelope.ingested_at,
+        confidence: opts?.confidence ?? 0.9,
+      };
+      knowledge._temporal[canonicalKey].push(newEnvelope);
+    }
+  } else if (currentValue !== undefined) {
+    // Migration path: section has value but no envelope. Lazy back-fill.
+    const migrated: TemporalEnvelope = {
+      valid_from: knowledge._meta.updated_at ?? now,
+      valid_to: value === currentValue ? null : now,
+      ingested_at: knowledge._meta.updated_at ?? now,
+      ingested_by: "migration",
+      confidence: 0.7,
+    };
+    knowledge._temporal[canonicalKey].push(migrated);
+    if (!valuesEqual(currentValue, value)) {
+      migrated.invalidation_reason = opts?.invalidation_reason ?? "superseded";
+      const newEnvelope: TemporalEnvelope = {
+        valid_from: opts?.valid_from ?? now,
+        valid_to: null,
+        ingested_at: now,
+        ingested_by: opts?.ingested_by ?? "archivist",
+        supersedes: migrated.ingested_at,
+        confidence: opts?.confidence ?? 0.9,
+      };
+      knowledge._temporal[canonicalKey].push(newEnvelope);
+    }
+  } else {
+    // ADD: fresh fact.
+    const newEnvelope: TemporalEnvelope = {
+      valid_from: opts?.valid_from ?? now,
+      valid_to: null,
+      ingested_at: now,
+      ingested_by: opts?.ingested_by ?? "archivist",
+      confidence: opts?.confidence ?? 0.9,
+    };
+    knowledge._temporal[canonicalKey].push(newEnvelope);
+  }
+
+  // Perform the flat-section upsert
   const sectionData = knowledge[section as keyof KnowledgeFile];
   if (typeof sectionData === "object" && sectionData !== null && !Array.isArray(sectionData)) {
     (sectionData as Record<string, unknown>)[key] = value;
   }
 
-  // Update metadata
-  knowledge._meta.updated_at = new Date().toISOString();
-  knowledge._meta.updated_by = "archivist";
+  knowledge._meta.updated_at = now;
+  knowledge._meta.updated_by = opts?.ingested_by === "user" ? "user" : "archivist";
 
-  // Write with validation + atomic rename (crash-safe)
+  // Temporal invariant check BEFORE write
+  try {
+    assertTemporalInvariant(knowledge);
+  } catch (err) {
+    restoreLatestSnapshot(workspacePath, KNOWLEDGE_FILENAME);
+    throw new Error(`upsertFact invariant violation; snapshot restored: ${String(err)}`);
+  }
+
+  // Stamp content hash so downstream readers can detect raw edits.
+  stampContentHash(knowledge as unknown as HashableFile);
+
   const json = JSON.stringify(knowledge, null, 2) + "\n";
 
-  // Verify the JSON we're about to write is valid by re-parsing
   try {
     JSON.parse(json);
   } catch {
-    // Restore from snapshot if we somehow produced invalid JSON
     restoreLatestSnapshot(workspacePath, KNOWLEDGE_FILENAME);
     throw new Error("upsertFact produced invalid JSON; snapshot restored");
   }
 
-  // Atomic write: write to .tmp then rename — a crash mid-write leaves
-  // the .tmp as garbage but the last good KNOWLEDGE.json intact.
   const tmpPath = filePath + ".tmp";
   fs.writeFileSync(tmpPath, json, "utf-8");
   fs.renameSync(tmpPath, filePath);
+}
+
+/**
+ * Invalidate the currently-valid envelope for a fact.
+ * Does NOT remove the value from the flat section — filtered out by getCurrentFacts.
+ */
+export function invalidateFact(
+  workspacePath: string,
+  section: string,
+  key: string,
+  reason: string,
+): void {
+  const knowledge = getFacts(workspacePath);
+  const filePath = knowledgePath(workspacePath);
+
+  if (!knowledge._temporal) {
+    knowledge._temporal = {};
+  }
+  const current = findCurrentEnvelope(knowledge._temporal, section, key);
+  if (!current) {
+    // Nothing to invalidate — either key doesn't exist or already invalidated.
+    return;
+  }
+
+  createSnapshot(workspacePath, KNOWLEDGE_FILENAME);
+
+  const now = new Date().toISOString();
+  current.valid_to = now;
+  current.invalidation_reason = reason;
+  knowledge._meta.updated_at = now;
+
+  try {
+    assertTemporalInvariant(knowledge);
+  } catch (err) {
+    restoreLatestSnapshot(workspacePath, KNOWLEDGE_FILENAME);
+    throw new Error(`invalidateFact invariant violation; snapshot restored: ${String(err)}`);
+  }
+
+  stampContentHash(knowledge as unknown as HashableFile);
+  const json = JSON.stringify(knowledge, null, 2) + "\n";
+  const tmpPath = filePath + ".tmp";
+  fs.writeFileSync(tmpPath, json, "utf-8");
+  fs.renameSync(tmpPath, filePath);
+}
+
+/**
+ * Delete a fact outright from the flat section.
+ * Used by the CRUD classifier's DELETE path when bitemporal is unavailable
+ * or when the caller explicitly wants destructive removal.
+ */
+export function deleteFact(workspacePath: string, section: string, key: string): void {
+  const knowledge = getFacts(workspacePath);
+  const filePath = knowledgePath(workspacePath);
+
+  const sectionData = (knowledge as unknown as Record<string, unknown>)[section];
+  if (typeof sectionData !== "object" || sectionData === null || Array.isArray(sectionData)) {
+    return;
+  }
+  const rec = sectionData as Record<string, unknown>;
+  if (!(key in rec)) return;
+
+  createSnapshot(workspacePath, KNOWLEDGE_FILENAME);
+  delete rec[key];
+
+  // Also invalidate any temporal envelope if present
+  if (knowledge._temporal) {
+    const current = findCurrentEnvelope(knowledge._temporal, section, key);
+    if (current) {
+      current.valid_to = new Date().toISOString();
+      current.invalidation_reason = "deleted";
+    }
+  }
+
+  knowledge._meta.updated_at = new Date().toISOString();
+
+  stampContentHash(knowledge as unknown as HashableFile);
+  const json = JSON.stringify(knowledge, null, 2) + "\n";
+  const tmpPath = filePath + ".tmp";
+  fs.writeFileSync(tmpPath, json, "utf-8");
+  fs.renameSync(tmpPath, filePath);
+}
+
+/**
+ * Return KnowledgeFile filtered to currently-valid facts (valid_to === null).
+ * Facts whose envelope is invalidated are stripped from the flat sections.
+ */
+export function getCurrentFacts(workspacePath: string): KnowledgeFile {
+  const knowledge = getFacts(workspacePath);
+  if (!knowledge._temporal) return knowledge;
+
+  const result: KnowledgeFile = JSON.parse(JSON.stringify(knowledge));
+  for (const [canonicalKey, envelopes] of Object.entries(knowledge._temporal)) {
+    const current = envelopes.find((e) => e.valid_to === null);
+    if (current) continue;
+    // No currently-valid envelope — strip the flat value.
+    const [section, key] = canonicalKey.split(".");
+    if (!section || !key) continue;
+    const sectionData = (result as unknown as Record<string, unknown>)[section];
+    if (typeof sectionData === "object" && sectionData !== null && !Array.isArray(sectionData)) {
+      delete (sectionData as Record<string, unknown>)[key];
+    }
+  }
+  return result;
+}
+
+/** Return full envelope history for a fact key, oldest first. */
+export function getFactHistory(
+  workspacePath: string,
+  section: string,
+  key: string,
+): TemporalEnvelope[] {
+  const knowledge = getFacts(workspacePath);
+  const envs = knowledge._temporal?.[envelopeKey(section, key)];
+  if (!envs) return [];
+  return [...envs].sort((a, b) => a.ingested_at.localeCompare(b.ingested_at));
+}
+
+/**
+ * Return facts that were currently-valid at the given ISO timestamp.
+ * Facts whose envelope's [valid_from, valid_to) contained the timestamp are included.
+ */
+export function getFactsAsOf(workspacePath: string, timestamp: string): KnowledgeFile {
+  const knowledge = getFacts(workspacePath);
+  if (!knowledge._temporal) return knowledge;
+
+  const asOfMs = new Date(timestamp).getTime();
+  const result: KnowledgeFile = JSON.parse(JSON.stringify(knowledge));
+
+  // For each temporal key, find the envelope valid at timestamp.
+  for (const [canonicalKey, envelopes] of Object.entries(knowledge._temporal)) {
+    const matching = envelopes.find((e) => {
+      const fromMs = new Date(e.valid_from).getTime();
+      const toMs = e.valid_to === null ? Infinity : new Date(e.valid_to).getTime();
+      return fromMs <= asOfMs && asOfMs < toMs;
+    });
+    const [section, key] = canonicalKey.split(".");
+    if (!section || !key) continue;
+    const sectionData = (result as unknown as Record<string, unknown>)[section];
+    if (typeof sectionData !== "object" || sectionData === null || Array.isArray(sectionData)) {
+      continue;
+    }
+    const rec = sectionData as Record<string, unknown>;
+    if (!matching) {
+      delete rec[key];
+    }
+    // If matching exists but value in current file is different from asOf-era value,
+    // we cannot reconstruct the old scalar/object without storing values in envelopes.
+    // v1 limitation: getFactsAsOf returns the CURRENT value for keys that were valid
+    // at the timestamp. Full value history requires storing value in envelope (v2).
+  }
+  return result;
 }
 
 /**
@@ -174,6 +468,7 @@ export function appendArchivistLog(workspacePath: string, action: string, reason
 
   knowledge._meta.updated_at = new Date().toISOString();
 
+  stampContentHash(knowledge as unknown as HashableFile);
   const json = JSON.stringify(knowledge, null, 2) + "\n";
 
   try {

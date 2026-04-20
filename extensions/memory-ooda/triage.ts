@@ -9,7 +9,13 @@
  */
 
 import { errorMessage, stripCodeFences } from "./parse-utils.js";
-import type { KnowledgeFile, PrioritiesFile, SITREP, TrajectoryScalingConfig } from "./types.js";
+import type {
+  KnowledgeFile,
+  PrioritiesFile,
+  SITREP,
+  TrajectoryScalingConfig,
+  TrajectoryScalingMode,
+} from "./types.js";
 
 // ============================================================================
 // Types
@@ -377,7 +383,42 @@ export function applyTrajectoryScaling(
   const scaled = Math.round(rawPriority * scale);
   const clamped = Math.max(1, Math.min(10, scaled)) as SITREP["priority"];
 
-  if (clamped === rawPriority) return sitrep;
-
+  // V2 contract: always set rawPriority so the audit log has both values
+  // per-row, regardless of whether scaling changed the priority.
   return { ...sitrep, priority: clamped, rawPriority };
+}
+
+// ============================================================================
+// CR_OODA_TRAJECTORY_AWARE_TRIAGE_V2 — mode resolution + audit log
+// ============================================================================
+
+/**
+ * Resolve the effective trajectory-scaling mode from config, handling the
+ * deprecated `enabled: boolean` field. Used during migration.
+ */
+export function resolveTrajectoryMode(
+  config?: Partial<TrajectoryScalingConfig>,
+): TrajectoryScalingMode {
+  if (!config) return "shadow";
+  if (config.mode) return config.mode;
+  if (config.enabled === true) return "live";
+  if (config.enabled === false) return "off";
+  return "shadow";
+}
+
+/**
+ * Classify the scaling quadrant for a SITREP given domain trajectories.
+ * Mirrors the matrix in applyTrajectoryScaling for audit logging.
+ */
+export function classifyQuadrant(
+  rawPriority: number,
+  avgTrajectory: number,
+): "pos_pos" | "pos_neg" | "neg_pos" | "neg_neg" | "neutral" {
+  if (rawPriority === 5) return "neutral";
+  const cumulativePositive = avgTrajectory > 0;
+  const signalNegative = rawPriority >= 6;
+  if (cumulativePositive && !signalNegative) return "pos_pos";
+  if (cumulativePositive && signalNegative) return "pos_neg";
+  if (!cumulativePositive && !signalNegative) return "neg_pos";
+  return "neg_neg";
 }

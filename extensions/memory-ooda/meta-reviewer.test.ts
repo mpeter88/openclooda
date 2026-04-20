@@ -700,6 +700,104 @@ describe("runMetaReviewer", () => {
     expect(result.fromFallback).toBe(false);
     expect(callModel).not.toHaveBeenCalled();
   });
+
+  // ============================================================================
+  // CR_OODA_PASS_K_ACCEPTANCE_GATE — gate wiring in runMetaReviewer
+  // ============================================================================
+
+  it("admits proposals when admission corpus falls open (bootstrap)", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const nodePath = await import("node:path");
+    const tmp = fs.mkdtempSync(nodePath.join(os.tmpdir(), "ooda-mr-gate-"));
+    try {
+      const propStore = createMockProposalStore();
+      const callModel: ModelCallFn = vi.fn(async () => VALID_PROPOSALS_RESPONSE);
+      const result = await runMetaReviewer(
+        { failures: [createTestFailure()], priorities: createTestPriorities() },
+        createMockPrioritiesStore(),
+        propStore,
+        callModel,
+        { gate: { workspacePath: tmp } },
+      );
+      expect(result.proposalsCreated).toHaveLength(1);
+      expect(result.proposalsCreated[0].admissionReport?.admit).toBe(true);
+      expect(result.proposalsCreated[0].admissionReport?.admitReason).toMatch(
+        /no_corpus_bootstrap/,
+      );
+      expect(result.proposalsRejected).toBeUndefined();
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects proposals when runnable regresses a populated corpus", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const nodePath = await import("node:path");
+    const { saveAdmissionCase } = await import("./admission-gate.js");
+    const tmp = fs.mkdtempSync(nodePath.join(os.tmpdir(), "ooda-mr-gate-reject-"));
+    try {
+      // Populate corpus (5 prior-success cases) to trip minCasesForGate.
+      for (let i = 0; i < 5; i++) {
+        saveAdmissionCase(tmp, {
+          id: `c${i}`,
+          label: `c${i}`,
+          fixture: {
+            observation: "",
+            knowledge: {} as any,
+            priorities: {} as any,
+          },
+          expected: {
+            actionId: `c${i}`,
+            description: "",
+            successSignal: "",
+            failureSignal: "",
+            domain: "operations",
+          },
+          priorOutcome: "success",
+          capturedAt: new Date().toISOString(),
+        });
+      }
+
+      const propStore = createMockProposalStore();
+      const rejectCalls: Array<{ id: string; reason: string }> = [];
+      propStore.rejectProposal = (id: string, reason: string) => {
+        rejectCalls.push({ id, reason });
+        const target = propStore.proposals.find((p) => p.id === id);
+        if (target) target.status = "rejected";
+      };
+
+      const callModel: ModelCallFn = vi.fn(async () => VALID_PROPOSALS_RESPONSE);
+
+      const result = await runMetaReviewer(
+        { failures: [createTestFailure()], priorities: createTestPriorities() },
+        createMockPrioritiesStore(),
+        propStore,
+        callModel,
+        {
+          gate: {
+            workspacePath: tmp,
+            runnable: async () => ({
+              source: "tool_result",
+              success: false,
+              toolName: "t",
+              summary: "",
+            }),
+          },
+        },
+      );
+
+      expect(result.proposalsCreated).toHaveLength(0);
+      expect(result.proposalsRejected).toHaveLength(1);
+      expect(result.proposalsRejected?.[0].rejectionReason).toMatch(/admission_gate/);
+      expect(result.proposalsRejected?.[0].admissionReport?.admit).toBe(false);
+      expect(rejectCalls).toHaveLength(1);
+      expect(propStore.proposals[0].status).toBe("rejected");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 // ============================================================================

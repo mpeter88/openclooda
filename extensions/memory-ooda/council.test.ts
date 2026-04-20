@@ -350,6 +350,55 @@ describe("runCouncil — system2 mode", () => {
     // weightedTotal = 0.85*0.4 + 0.6*0.35 + 0.7*0.25 = 0.34 + 0.21 + 0.175 = 0.725
     expect(result.winner.weightedTotal).toBeCloseTo(0.725, 2);
   });
+
+  // CR_OODA_PATTERN_SEPARATION_GATE ----------------------------------------
+
+  it("fires Discriminator when separationMatches supplied", async () => {
+    const calls: string[] = [];
+    const callModel: ModelCallFn = vi.fn(async (prompt: string) => {
+      if (prompt.startsWith("You are the Discriminator")) {
+        calls.push("discriminator");
+        return "The prior memory was about staging; this is production. Materially different.";
+      }
+      if (prompt.startsWith("You are the Analyst")) return "Analysis output";
+      if (prompt.startsWith("You are the Strategist")) return "Strategy output";
+      if (prompt.startsWith("You are the Skeptic")) return "Skeptic output";
+      return VALID_CHAIR_RESPONSE;
+    });
+
+    const input: StrategyInput = {
+      ...createTestInput(),
+      separationMatches: [
+        "prior staging deploy at 2026-03-15 succeeded",
+        "prior staging deploy at 2026-03-22 succeeded",
+      ],
+    };
+    const result = await runCouncil(input, "system2", callModel);
+
+    expect(calls).toContain("discriminator");
+    expect(result.council_trace.discriminator).toContain("production");
+    expect(result.members.some((m) => m.role === "discriminator")).toBe(true);
+  });
+
+  it("does not fire Discriminator when separationMatches empty/absent", async () => {
+    const calls: string[] = [];
+    const callModel: ModelCallFn = vi.fn(async (prompt: string) => {
+      if (prompt.startsWith("You are the Discriminator")) {
+        calls.push("discriminator");
+        return "should not fire";
+      }
+      if (prompt.startsWith("You are the Analyst")) return "Analysis output";
+      if (prompt.startsWith("You are the Strategist")) return "Strategy output";
+      if (prompt.startsWith("You are the Skeptic")) return "Skeptic output";
+      return VALID_CHAIR_RESPONSE;
+    });
+
+    const result = await runCouncil(createTestInput(), "system2", callModel);
+
+    expect(calls).toHaveLength(0);
+    expect(result.council_trace.discriminator).toBeUndefined();
+    expect(result.members.every((m) => m.role !== "discriminator")).toBe(true);
+  });
 });
 
 // ============================================================================
