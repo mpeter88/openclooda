@@ -195,6 +195,27 @@ export function parseProposal(raw: string): ProposalDraft {
     throw new Error("Proposal must include at least one hypothesis fixture");
   }
 
+  // Finding 4 — fixture tag enforcement at write time. Every H-fixture must
+  // carry the hypothesis's success_metric.fixture_tag in its tags array;
+  // otherwise the sandbox's H-pass-rate would be computed over fixtures the
+  // LLM never intended as hypothesis-specific. Reject the whole proposal
+  // when any fixture is missing the tag — same posture as scope violations.
+  const fixtureTag = hypothesis?.success_metric?.fixture_tag;
+  if (typeof fixtureTag === "string" && fixtureTag.length > 0) {
+    const missing: string[] = [];
+    for (const fx of hypothesis_fixtures.fixtures) {
+      const tags = (fx as { tags?: unknown }).tags;
+      if (!Array.isArray(tags) || !tags.includes(fixtureTag)) {
+        missing.push(String((fx as { id?: unknown }).id ?? "?"));
+      }
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `Hypothesis fixtures missing required tag "${fixtureTag}": ${missing.join(", ")}`,
+      );
+    }
+  }
+
   return { proposal_md, hypothesis, value, hypothesis_fixtures, allowed_paths, diff };
 }
 

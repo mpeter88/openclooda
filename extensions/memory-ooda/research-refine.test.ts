@@ -12,7 +12,15 @@ import {
 import { parseRefineDraft, runResearchRefine } from "./research-refine.js";
 import type { ModelCallFn } from "./triage.js";
 
-const SAMPLE_DIFF = `diff --git a/x.ts b/x.ts
+const SAMPLE_DIFF = `diff --git a/extensions/memory-ooda/council.ts b/extensions/memory-ooda/council.ts
+--- a/extensions/memory-ooda/council.ts
++++ b/extensions/memory-ooda/council.ts
+@@ -1 +1 @@
+-a
++b
+`;
+
+const OUT_OF_SCOPE_DIFF = `diff --git a/x.ts b/x.ts
 --- a/x.ts
 +++ b/x.ts
 @@ -1 +1 @@
@@ -225,5 +233,102 @@ describe("runResearchRefine", () => {
     const callModel: ModelCallFn = vi.fn(async () => "not json");
     const r = await runResearchRefine(tmp, callModel, { expId: "exp-refine-1" });
     expect(r.outcome).toBe("parse_error");
+  });
+
+  it("scope-widened refine diff → concluded-dump with learning note", async () => {
+    seedExperimentRefining(tmp);
+    const callModel: ModelCallFn = vi.fn(async () =>
+      JSON.stringify({
+        action: "refine_hypothesis_and_diff",
+        rationale: "drift",
+        new_claim: "narrower",
+        new_prediction: "narrower",
+        new_diff: OUT_OF_SCOPE_DIFF,
+      }),
+    );
+    const r = await runResearchRefine(tmp, callModel, { expId: "exp-refine-1" });
+    expect(r.outcome).toBe("scope_widened");
+    const updated = readExperimentRecord(tmp, "exp-refine-1");
+    expect(updated?.status).toBe("concluded-dump");
+    expect(updated?.conclusion?.verdict).toBe("dump");
+    expect(updated?.conclusion?.learning).toMatch(/refine widened scope/);
+  });
+
+  it("R-001 placeholder run does not count toward max_runs", async () => {
+    // 1 placeholder (verdict=error, no ended_at) + 2 real runs = 3 total but
+    // only 2 real attempts, max_runs=3 — refine should still proceed.
+    const now = new Date().toISOString();
+    const hypothesis_obj = {
+      id: "H-017",
+      claim: "x",
+      prediction: "y",
+      success_metric: { fixture_tag: "H-017-x", min_pass_rate: 0.6, min_delta_vs_parent: 0.05 },
+      failure_metric: { regression_forbidden_tags: ["critical"] },
+      scope_boundary: ["extensions/memory-ooda/council.ts"],
+    };
+    const runs = [
+      { run_id: "H-017-R-001", started_at: now, verdict: "error" as const, notes: "placeholder" },
+      {
+        run_id: "H-017-R-002",
+        started_at: now,
+        ended_at: now,
+        verdict: "signal" as const,
+        notes: "real",
+      },
+      {
+        run_id: "H-017-R-003",
+        started_at: now,
+        ended_at: now,
+        verdict: "signal" as const,
+        notes: "real",
+      },
+    ];
+    const record: ExperimentRecord = {
+      exp_id: "exp-placeholder",
+      created_at: now,
+      updated_at: now,
+      status: "refining",
+      source: { kind: "paper", ref: "x" },
+      parent_genid: "initial",
+      scope: {
+        allowed_paths: ["extensions/memory-ooda/council.ts"],
+        denylist_paths: [],
+        max_files: 3,
+      },
+      hypothesis_obj,
+      runs,
+      max_runs: 3,
+      scores: {},
+    };
+    fs.mkdirSync(experimentDir(tmp, record.exp_id), { recursive: true });
+    writeExperimentRecord(tmp, record);
+    const callModel: ModelCallFn = vi.fn(async () =>
+      JSON.stringify({
+        action: "refine_tests",
+        rationale: "tighter",
+        new_fixtures: {
+          fixtures: [
+            {
+              id: "fx",
+              label: "fx",
+              fixture: { observation: "", knowledge: {}, priorities: {} },
+              expected: {
+                actionId: "a",
+                description: "",
+                successSignal: "",
+                failureSignal: "",
+                domain: "ops",
+              },
+              priorOutcome: "success",
+              capturedAt: now,
+              tags: ["H-017-x"],
+            },
+          ],
+          rationale: "",
+        },
+      }),
+    );
+    const r = await runResearchRefine(tmp, callModel, { expId: "exp-placeholder" });
+    expect(r.outcome).toBe("refined");
   });
 });

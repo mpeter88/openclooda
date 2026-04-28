@@ -16,10 +16,11 @@
  */
 
 import { validParents } from "./agent-archive.js";
+import { appendDMNLog } from "./dmn.js";
 import { runResearchCompare, runResearchRollout } from "./research-compare.js";
 import { runResearchDiscover, type DiscoverOptions } from "./research-discover.js";
 import type { ResearchCandidate, ExperimentRecord } from "./research-loop.js";
-import { listExperiments, readResearchLog } from "./research-loop.js";
+import { listExperiments, readResearchLog, transitionStage } from "./research-loop.js";
 import { runResearchPropose, type ProposeOptions } from "./research-propose.js";
 import { runResearchRefine } from "./research-refine.js";
 import { runResearchSandbox, type IsolationDeps } from "./research-sandbox.js";
@@ -161,9 +162,30 @@ export async function runResearchTickOnce(
         advanced_exp_id: proposed.exp_id,
       };
     }
-    await runResearchSandbox(proposed.exp_id, config.isolation, {
-      workspacePath,
-    });
+    // Apply-failure routing (CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING #1):
+    // a corrupt LLM patch used to throw out of runResearchSandbox and leave
+    // the record stuck at `proposed` forever, deadlocking every later tick.
+    // Catch here so the next refine tick can rewrite the diff.
+    try {
+      await runResearchSandbox(proposed.exp_id, config.isolation, {
+        workspacePath,
+      });
+    } catch (err) {
+      const reason = String(err).slice(0, 200);
+      appendDMNLog(workspacePath, {
+        timestamp: new Date().toISOString(),
+        bucket: "dormant",
+        kind: "research_tick",
+        outcome: "error",
+        details: `sandbox apply failed → refining ${proposed.exp_id}: ${reason}`,
+      });
+      transitionStage(workspacePath, proposed.exp_id, "refining", `apply failed: ${reason}`);
+      return {
+        action: "sandbox",
+        details: `sandbox apply failed → refining: ${reason}`,
+        advanced_exp_id: proposed.exp_id,
+      };
+    }
     return {
       action: "sandbox",
       details: `sandboxed ${proposed.exp_id}`,

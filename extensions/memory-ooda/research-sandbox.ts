@@ -34,8 +34,18 @@ import type { ActualOutcome, AdmissionCase } from "./types.js";
  * the sandbox alongside the regression corpus; their pass rate is tracked
  * separately on the current Run so the verdict path can enforce the
  * hypothesis's success_metric.min_pass_rate.
+ *
+ * Finding 4 — when `fixtureTag` is supplied, only fixtures whose `tags` array
+ * includes the tag are returned. Belt + suspenders: parseProposal already
+ * rejects untagged fixtures at write time; this filter ensures any caller that
+ * bypassed propose validation (or fed in a pre-existing fixture file) still
+ * can't pollute the H-pass-rate.
  */
-export function readHypothesisFixtures(workspacePath: string, expId: string): AdmissionCase[] {
+export function readHypothesisFixtures(
+  workspacePath: string,
+  expId: string,
+  fixtureTag?: string,
+): AdmissionCase[] {
   const file = path.join(experimentDir(workspacePath, expId), "hypothesis-fixtures.jsonl");
   if (!fs.existsSync(file)) return [];
   const out: AdmissionCase[] = [];
@@ -47,6 +57,9 @@ export function readHypothesisFixtures(workspacePath: string, expId: string): Ad
     } catch {
       /* tolerate corrupt lines */
     }
+  }
+  if (typeof fixtureTag === "string" && fixtureTag.length > 0) {
+    return out.filter((c) => Array.isArray(c.tags) && c.tags.includes(fixtureTag));
   }
   return out;
 }
@@ -163,11 +176,24 @@ export async function runResearchSandbox(
   const threshold = options.expandThreshold ?? 0.4;
   const timeout = options.caseTimeoutMs ?? 15_000;
   const regressionCases = options.cases ?? listAdmissionCases(options.workspacePath);
-  const hypothesisFixtures = readHypothesisFixtures(options.workspacePath, expId);
 
   // Load the diff we're going to apply.
   const dir = experimentDir(options.workspacePath, expId);
   const diffPath = path.join(dir, "diff.patch");
+
+  // Read the record up-front so we know the hypothesis fixture_tag (if any)
+  // and can filter H-fixtures structurally before evaluation. Finding 4.
+  let priorRecord: ExperimentRecord | undefined;
+  const earlyStatusFile = path.join(dir, "status.json");
+  if (fs.existsSync(earlyStatusFile)) {
+    try {
+      priorRecord = JSON.parse(fs.readFileSync(earlyStatusFile, "utf-8")) as ExperimentRecord;
+    } catch {
+      /* malformed status — leave undefined; fixtures load unfiltered */
+    }
+  }
+  const fixtureTag = priorRecord?.hypothesis_obj?.success_metric?.fixture_tag;
+  const hypothesisFixtures = readHypothesisFixtures(options.workspacePath, expId, fixtureTag);
   if (!fs.existsSync(diffPath)) {
     throw new Error(`sandbox: diff.patch missing for ${expId}`);
   }

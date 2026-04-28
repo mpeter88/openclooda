@@ -196,6 +196,12 @@ export interface RolloutDecision {
  * Evaluate the experiment's delta. If it meets the rollout threshold and has
  * no regressions, emit a PolicyProposal (category: "research_rollout") and
  * append to the rollout queue. Otherwise transition to `rejected` with notes.
+ *
+ * Finding 7 — when `record.hypothesis_obj` is present, trust the upstream
+ * verdict from compare. Compare already routed signal/fail elsewhere
+ * (refining/concluded-dump), so rollout only ever sees `pass`. The legacy
+ * threshold gate is kept for pre-hypothesis-discipline records that have no
+ * verdict to trust.
  */
 export async function runResearchRollout(options: RolloutOptions): Promise<RolloutDecision> {
   const threshold = options.rolloutThreshold ?? 0.05;
@@ -210,26 +216,40 @@ export async function runResearchRollout(options: RolloutOptions): Promise<Rollo
     transitionStage(options.workspacePath, options.expId, "rejected", "no compare result");
     return { admitted: false, reason: "no compare result" };
   }
-  if (delta.had_regression) {
-    transitionStage(
-      options.workspacePath,
-      options.expId,
-      "rejected",
-      "regressed on prior-success admission cases",
-    );
-    return { admitted: false, reason: "regression on prior-success case(s)" };
-  }
-  if (delta.mean < threshold) {
-    transitionStage(
-      options.workspacePath,
-      options.expId,
-      "rejected",
-      `mean delta ${delta.mean.toFixed(3)} below threshold ${threshold}`,
-    );
-    return {
-      admitted: false,
-      reason: `mean delta ${delta.mean.toFixed(3)} < ${threshold}`,
-    };
+
+  if (record.hypothesis_obj) {
+    // Verdict-aware path. compare derived "pass" from both
+    // min_delta_vs_parent and min_pass_rate; no second threshold gate.
+    const lastRun = record.runs?.[record.runs.length - 1];
+    if (lastRun?.verdict !== "pass") {
+      return {
+        admitted: false,
+        reason: `verdict=${lastRun?.verdict ?? "n/a"} (rollout requires pass)`,
+      };
+    }
+  } else {
+    // Legacy path — pre-hypothesis-discipline records only have the threshold.
+    if (delta.had_regression) {
+      transitionStage(
+        options.workspacePath,
+        options.expId,
+        "rejected",
+        "regressed on prior-success admission cases",
+      );
+      return { admitted: false, reason: "regression on prior-success case(s)" };
+    }
+    if (delta.mean < threshold) {
+      transitionStage(
+        options.workspacePath,
+        options.expId,
+        "rejected",
+        `mean delta ${delta.mean.toFixed(3)} below threshold ${threshold}`,
+      );
+      return {
+        admitted: false,
+        reason: `mean delta ${delta.mean.toFixed(3)} < ${threshold}`,
+      };
+    }
   }
 
   // Diff content — passed as reasoning to the proposal for traceability.

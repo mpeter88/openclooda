@@ -444,6 +444,13 @@ export interface AdmissionCase {
   /** Prior outcome observed on this case — used to detect regressions. */
   priorOutcome?: "success" | "failure" | "partial";
   capturedAt: string;
+  /**
+   * CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING #4: optional fixture tags. Used by
+   * the research sandbox to filter hypothesis-specific fixtures (must include
+   * `success_metric.fixture_tag`) so the H-pass-rate is computed only over
+   * fixtures that actually target the hypothesis.
+   */
+  tags?: string[];
 }
 
 export interface AdmissionReport {

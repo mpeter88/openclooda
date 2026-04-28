@@ -220,6 +220,47 @@ describe("runResearchTickOnce — dispatch precedence", () => {
     expect(pickParentGenid(tmp)).toBe("initial");
   });
 
+  it("sandbox apply failure routes proposed → refining (no longer stuck)", async () => {
+    saveAdmissionCase(tmp, mkCase("c0"));
+    const record: ExperimentRecord = {
+      exp_id: "exp-fail",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      status: "proposed",
+      source: { kind: "paper", ref: "arxiv:x" },
+      parent_genid: "initial",
+      scope: {
+        allowed_paths: ["extensions/memory-ooda/council.ts"],
+        denylist_paths: [],
+        max_files: 3,
+      },
+      scores: {},
+    };
+    writeExperimentRecord(tmp, record);
+    fs.writeFileSync(path.join(experimentDir(tmp, "exp-fail"), "diff.patch"), VALID_DIFF, "utf-8");
+    const failingIsolation: IsolationDeps = {
+      applyDiff: async () => {
+        throw new Error("git apply failed (exit=128): error: corrupt patch at line 155");
+      },
+      runCase: async () => ({
+        source: "tool_result",
+        success: true,
+        toolName: "t",
+        summary: "",
+      }),
+    };
+    const r = await runResearchTickOnce(tmp, vi.fn(), {
+      ...baseConfig,
+      enableSandbox: true,
+      isolation: failingIsolation,
+    });
+    expect(r.action).toBe("sandbox");
+    expect(r.details).toMatch(/apply failed/);
+    expect(r.advanced_exp_id).toBe("exp-fail");
+    const updated = listExperiments(tmp).find((e) => e.exp_id === "exp-fail");
+    expect(updated?.status).toBe("refining");
+  });
+
   it("sandboxed experiment → action=compare or rollout", async () => {
     const record: ExperimentRecord = {
       exp_id: "exp-sbxed",

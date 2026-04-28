@@ -155,6 +155,7 @@ const SAMPLE_FIXTURES = {
       },
       priorOutcome: "success",
       capturedAt: new Date().toISOString(),
+      tags: ["H-curiosity-amb"],
     },
   ],
   rationale: "falsifies claim if model still misses ambiguous inputs",
@@ -348,5 +349,27 @@ describe("runResearchPropose", () => {
     expect(r.experiment.source.citation).toBe(CANDIDATE.title);
     expect(r.experiment.parent_genid).toBe("abc-123");
     expect(r.experiment.hypothesis_obj?.claim).toContain("curiosity");
+  });
+
+  it("rejects when fixture missing required success_metric.fixture_tag", async () => {
+    const fixturesWithoutTag = {
+      ...SAMPLE_FIXTURES,
+      fixtures: SAMPLE_FIXTURES.fixtures.map((f) => {
+        const { tags: _omit, ...rest } = f;
+        return { ...rest, tags: [] };
+      }),
+    };
+    const r = await runResearchPropose(
+      tmp,
+      modelReturning({ hypothesis_fixtures: fixturesWithoutTag }),
+      {
+        candidate: CANDIDATE,
+        architectureSummary: "",
+        parentGenid: "initial",
+        maxRetries: 0,
+      },
+    );
+    expect(r.experiment.status).toBe("rejected");
+    expect(r.experiment.notes).toMatch(/required tag/);
   });
 });

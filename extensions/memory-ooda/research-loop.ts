@@ -52,7 +52,7 @@ export type ExperimentStage =
  */
 const TRANSITIONS: Record<ExperimentStage, ExperimentStage[]> = {
   discovered: ["proposed", "rejected"],
-  proposed: ["awaiting-epic-approval", "sandboxed", "rejected"],
+  proposed: ["awaiting-epic-approval", "sandboxed", "refining", "rejected"],
   "awaiting-epic-approval": ["sandboxed", "concluded-dump", "rejected"],
   sandboxed: ["compared", "rejected"],
   compared: ["rollout-proposed", "refining", "concluded-dump", "rejected"],

@@ -35,6 +35,7 @@ import {
   writeExperimentRecord,
   type ExperimentRecord,
 } from "./research-loop.js";
+import { validateScope } from "./research-propose.js";
 import type { ModelCallFn } from "./triage.js";
 
 export interface RefineDraft {
@@ -138,7 +139,7 @@ export interface RefineOptions {
 }
 
 export interface RefineResult {
-  outcome: "refined" | "max_runs_reached" | "parse_error" | "not_applicable";
+  outcome: "refined" | "max_runs_reached" | "parse_error" | "scope_widened" | "not_applicable";
   nextRunId?: string;
   action?: RefineDraft["action"];
   reason?: string;
@@ -162,7 +163,12 @@ export async function runResearchRefine(
   const runs = record.runs ?? [];
   const maxRuns = options.maxRuns ?? record.max_runs ?? 3;
 
-  if (runs.length >= maxRuns) {
+  // Finding 9 — propose seeds R-001 with verdict="error" + no ended_at as a
+  // placeholder. Sandbox always sets ended_at on real runs (even when verdict
+  // stays "error"). So `verdict==="error" && !ended_at` is the unique
+  // placeholder shape; everything else counts as a real attempt.
+  const realRuns = runs.filter((r) => r.verdict !== "error" || r.ended_at);
+  if (realRuns.length >= maxRuns) {
     const lastRun = runs[runs.length - 1];
     concludeExperiment(workspacePath, options.expId, {
       verdict: "dump",
@@ -170,7 +176,7 @@ export async function runResearchRefine(
       authored_by: "system",
     });
     transitionStage(workspacePath, options.expId, "concluded-dump", "max runs reached");
-    return { outcome: "max_runs_reached", reason: `${runs.length}/${maxRuns}` };
+    return { outcome: "max_runs_reached", reason: `${realRuns.length}/${maxRuns}` };
   }
 
   let draft: RefineDraft | null = null;
@@ -183,6 +189,29 @@ export async function runResearchRefine(
   }
   if (!draft) {
     return { outcome: "parse_error", reason: parseError };
+  }
+
+  // Finding 2 — re-validate scope on refine_hypothesis_and_diff. Iterative
+  // refinement must NOT silently widen the file set past the original
+  // allowed_paths. On violation: conclude as dump with an explicit learning
+  // note so the audit trail records why the experiment died.
+  if (draft.action === "refine_hypothesis_and_diff" && draft.new_diff) {
+    const scopeCheck = validateScope(draft.new_diff, record.scope);
+    if (!scopeCheck.valid) {
+      const reason = scopeCheck.reason ?? "scope violation";
+      concludeExperiment(workspacePath, options.expId, {
+        verdict: "dump",
+        learning: `refine widened scope: ${reason}`,
+        authored_by: "system",
+      });
+      transitionStage(
+        workspacePath,
+        options.expId,
+        "concluded-dump",
+        `refine widened scope: ${reason}`,
+      );
+      return { outcome: "scope_widened", reason };
+    }
   }
 
   const nextRunNumber = runs.length + 1;
