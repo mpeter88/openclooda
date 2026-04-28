@@ -370,6 +370,6 @@ describe("runResearchPropose", () => {
       },
     );
     expect(r.experiment.status).toBe("rejected");
-    expect(r.experiment.notes).toMatch(/required tag/);
+    expect(r.experiment.notes).toMatch(/Hypothesis fixtures invalid|tags must include/);
   });
 });

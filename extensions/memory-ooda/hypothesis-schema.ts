@@ -16,6 +16,10 @@ import path from "node:path";
 import type { AdmissionCase } from "./types.js";
 
 export const HYPOTHESIS_COUNTER_FILENAME = ".archive/hypothesis-counter.txt";
+export const HYPOTHESIS_COUNTER_LOCK_FILENAME = ".archive/hypothesis-counter.lock";
+
+const LOCK_TIMEOUT_MS = 5_000;
+const LOCK_POLL_INTERVAL_MS = 50;
 
 // ============================================================================
 // Types
@@ -106,18 +110,76 @@ export function readHypothesisCounter(workspacePath: string): number {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
+function lockPath(workspacePath: string): string {
+  return path.join(workspacePath, HYPOTHESIS_COUNTER_LOCK_FILENAME);
+}
+
+/**
+ * Acquire an exclusive file-lock on the counter via `wx` open. Spins until
+ * acquired or LOCK_TIMEOUT_MS passes. Throws on timeout — caller should treat
+ * timeout as "skip this allocation; next tick will retry". Stale locks (held
+ * by a dead pid) eventually time out; we don't try to GC them here because
+ * the read+write+rename window is sub-millisecond.
+ */
+function acquireCounterLock(workspacePath: string): number {
+  const p = lockPath(workspacePath);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let lastErr: unknown;
+  while (Date.now() < deadline) {
+    try {
+      // wx = O_CREAT | O_EXCL — fails if file exists. atomic across processes.
+      return fs.openSync(p, "wx");
+    } catch (err) {
+      lastErr = err;
+      // EEXIST → another process holds the lock; spin briefly.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw err;
+      // Tight sync sleep is fine here — counter ops are sub-ms; spin briefly.
+      const until = Date.now() + LOCK_POLL_INTERVAL_MS;
+      while (Date.now() < until) {
+        /* spin */
+      }
+    }
+  }
+  throw new Error(`hypothesis counter lock timeout after ${LOCK_TIMEOUT_MS}ms: ${String(lastErr)}`);
+}
+
+function releaseCounterLock(workspacePath: string, fd: number): void {
+  try {
+    fs.closeSync(fd);
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.unlinkSync(lockPath(workspacePath));
+  } catch {
+    /* lock already cleaned up */
+  }
+}
+
 /**
  * Allocate the next hypothesis id and persist the counter. Write-then-rename
  * so a crash during write can't leave a torn file that would re-use an id.
+ *
+ * Finding 3 — guarded by an exclusive file-lock so concurrent processes
+ * (gateway tick + CLI command) cannot both read N and both write N+1, which
+ * would mint duplicate H-ids. Throws on lock-timeout so propose returns
+ * unallocated and the next tick can retry.
  */
 export function allocateHypothesisId(workspacePath: string): string {
   const p = counterPath(workspacePath);
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  const next = readHypothesisCounter(workspacePath) + 1;
-  const tmp = `${p}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, String(next), "utf-8");
-  fs.renameSync(tmp, p);
-  return `H-${String(next).padStart(3, "0")}`;
+  const fd = acquireCounterLock(workspacePath);
+  try {
+    const next = readHypothesisCounter(workspacePath) + 1;
+    const tmp = `${p}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, String(next), "utf-8");
+    fs.renameSync(tmp, p);
+    return `H-${String(next).padStart(3, "0")}`;
+  } finally {
+    releaseCounterLock(workspacePath, fd);
+  }
 }
 
 /** Zero-padded run id within a hypothesis. */
@@ -153,6 +215,64 @@ export function validateHypothesis(h: Hypothesis): HypothesisValidationResult {
   }
   if (!Array.isArray(h.scope_boundary) || h.scope_boundary.length === 0) {
     errors.push("scope_boundary must be a non-empty array");
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Finding 5 — per-fixture shape validation. Run at the propose-stage boundary
+ * so malformed fixtures fail fast (with a clear reason) rather than crashing
+ * the sandbox stage when it tries to evaluate them.
+ *
+ * Required per fixture: id (non-empty), label, fixture (object), expected
+ * (object with actionId/description/successSignal/failureSignal/domain),
+ * priorOutcome ("success"|"failure"), capturedAt (ISO date), tags (array
+ * containing the supplied fixture_tag).
+ */
+export function validateHypothesisFixtures(
+  fixtures: unknown,
+  fixture_tag: string,
+): HypothesisValidationResult {
+  const errors: string[] = [];
+  if (!Array.isArray(fixtures) || fixtures.length === 0) {
+    errors.push("fixtures must be a non-empty array");
+    return { valid: false, errors };
+  }
+  for (let i = 0; i < fixtures.length; i++) {
+    const fx = fixtures[i] as Record<string, unknown> | null | undefined;
+    const tag = `fixtures[${i}]`;
+    if (!fx || typeof fx !== "object" || Array.isArray(fx)) {
+      errors.push(`${tag}: must be an object`);
+      continue;
+    }
+    if (typeof fx.id !== "string" || fx.id.length === 0) {
+      errors.push(`${tag}.id required (non-empty string)`);
+    }
+    if (typeof fx.label !== "string") {
+      errors.push(`${tag}.label required (string)`);
+    }
+    if (!fx.fixture || typeof fx.fixture !== "object" || Array.isArray(fx.fixture)) {
+      errors.push(`${tag}.fixture required (object)`);
+    }
+    const expected = fx.expected as Record<string, unknown> | undefined;
+    if (!expected || typeof expected !== "object" || Array.isArray(expected)) {
+      errors.push(`${tag}.expected required (object)`);
+    } else {
+      for (const k of ["actionId", "description", "successSignal", "failureSignal", "domain"]) {
+        if (typeof expected[k] !== "string") {
+          errors.push(`${tag}.expected.${k} required (string)`);
+        }
+      }
+    }
+    if (fx.priorOutcome !== "success" && fx.priorOutcome !== "failure") {
+      errors.push(`${tag}.priorOutcome must be "success" or "failure"`);
+    }
+    if (typeof fx.capturedAt !== "string" || Number.isNaN(new Date(fx.capturedAt).getTime())) {
+      errors.push(`${tag}.capturedAt required (ISO timestamp)`);
+    }
+    if (!Array.isArray(fx.tags) || !fx.tags.includes(fixture_tag)) {
+      errors.push(`${tag}.tags must include "${fixture_tag}"`);
+    }
   }
   return { valid: errors.length === 0, errors };
 }

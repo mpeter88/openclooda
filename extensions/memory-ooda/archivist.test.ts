@@ -8,7 +8,6 @@ import {
   generateWeightProposals,
   inferDomain,
   parsePatterns,
-  parsePatternErrors,
   readState,
   runArchivist,
   shouldProposeWeightAdjustment,
@@ -343,7 +342,7 @@ describe("buildArchivistPrompt", () => {
 
 describe("parsePatterns", () => {
   it("parses valid pattern array", () => {
-    const patterns = parsePatterns(VALID_MODEL_RESPONSE);
+    const { patterns } = parsePatterns(VALID_MODEL_RESPONSE);
     expect(patterns).toHaveLength(2);
     expect(patterns[0].section).toBe("stack");
     expect(patterns[0].key).toBe("language");
@@ -352,13 +351,13 @@ describe("parsePatterns", () => {
   });
 
   it("parses empty array", () => {
-    const patterns = parsePatterns("[]");
+    const { patterns } = parsePatterns("[]");
     expect(patterns).toHaveLength(0);
   });
 
   it("strips markdown code fences", () => {
     const wrapped = "```json\n" + VALID_MODEL_RESPONSE + "\n```";
-    const patterns = parsePatterns(wrapped);
+    const { patterns } = parsePatterns(wrapped);
     expect(patterns).toHaveLength(2);
   });
 
@@ -376,38 +375,39 @@ describe("parsePatterns", () => {
     expect(() => parsePatterns(JSON.stringify(many))).toThrow("Too many patterns: 16");
   });
 
-  // Per-item validation now soft-drops bad rows instead of throwing the
-  // whole batch. A single null-value pattern used to freeze the loop —
-  // the LLM can produce one bad row inside an otherwise-valid batch and
-  // we want to keep the rest. parsePatternErrors carries the drop reason.
+  // Per-item validation soft-drops bad rows instead of throwing the
+  // whole batch. The returned `errors` array carries each drop reason.
 
   it("drops pattern with invalid section but keeps valid siblings", () => {
     const mixed = [
       { section: "invalid", key: "bad", value: "v", reason: "r" },
       { section: "stack", key: "good", value: "v", reason: "r" },
     ];
-    const result = parsePatterns(JSON.stringify(mixed));
-    expect(result).toHaveLength(1);
-    expect(result[0].key).toBe("good");
-    expect(parsePatternErrors.some((e) => e.includes("section must be one of"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(mixed));
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].key).toBe("good");
+    expect(errors.some((e) => e.includes("section must be one of"))).toBe(true);
   });
 
   it("drops pattern with empty key", () => {
     const bad = [{ section: "stack", key: "", value: "v", reason: "r" }];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(parsePatternErrors.some((e) => e.includes("missing or empty key"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("missing or empty key"))).toBe(true);
   });
 
   it("drops pattern with null value (the bug that froze the loop for 5 days)", () => {
     const bad = [{ section: "stack", key: "k", value: null, reason: "r" }];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(parsePatternErrors.some((e) => e.includes("null value"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("null value"))).toBe(true);
   });
 
   it("drops pattern with empty reason", () => {
     const bad = [{ section: "stack", key: "k", value: "v", reason: "" }];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(parsePatternErrors.some((e) => e.includes("missing or empty reason"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("missing or empty reason"))).toBe(true);
   });
 
   it("rejects invalid JSON (whole-batch failure still throws)", () => {
@@ -416,30 +416,34 @@ describe("parsePatterns", () => {
 
   it("drops non-string value for stack section (M9)", () => {
     const bad = [{ section: "stack", key: "lang", value: { nested: true }, reason: "test" }];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(parsePatternErrors.some((e) => e.includes("string"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("string"))).toBe(true);
   });
 
   it("drops non-string value for domain_context section (M9)", () => {
     const bad = [{ section: "domain_context", key: "focus", value: 42, reason: "test" }];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(parsePatternErrors.some((e) => e.includes("string"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("string"))).toBe(true);
   });
 
   it("drops non-object value for people section (M9)", () => {
     const bad = [{ section: "people", key: "alice", value: "just a string", reason: "test" }];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(parsePatternErrors.some((e) => e.includes("object"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("object"))).toBe(true);
   });
 
   it("drops array value for projects section (M9)", () => {
     const bad = [{ section: "projects", key: "proj", value: [1, 2], reason: "test" }];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(parsePatternErrors.some((e) => e.includes("object"))).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("object"))).toBe(true);
   });
 
   it("accepts object values for projects section", () => {
-    const patterns = parsePatterns(
+    const { patterns } = parsePatterns(
       JSON.stringify([
         {
           section: "projects",
@@ -908,10 +912,9 @@ describe("lessons_learned extraction", () => {
         reason: "test",
       },
     ];
-    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
-    expect(
-      parsePatternErrors.some((e) => e.includes("string") && e.includes("lessons_learned")),
-    ).toBe(true);
+    const { patterns, errors } = parsePatterns(JSON.stringify(bad));
+    expect(patterns).toEqual([]);
+    expect(errors.some((e) => e.includes("string") && e.includes("lessons_learned"))).toBe(true);
   });
 });
 

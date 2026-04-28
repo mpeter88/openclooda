@@ -170,11 +170,19 @@ export interface ArchivistState {
   last_run_at: string;
   /** Number of archivist completions since the meta-reviewer last ran. */
   archivist_runs_since_meta_review: number;
+  /**
+   * Finding 8 — drop rate for the last N archivist runs. drops/(parsed+drops).
+   * Sustained high drop rate is a model-quality signal worth surfacing.
+   */
+  recent_drop_rates?: number[];
   /** @deprecated use turns_since_last_archivist — kept for migration compat */
   last_archivist_turn?: number;
   /** @deprecated renamed to last_processed_turn — kept for migration compat */
   last_run_turn?: number;
 }
+
+/** Window over which we keep drop-rate samples. */
+const RECENT_DROP_RATES_WINDOW = 10;
 
 /** Configuration for a single archivist run. */
 export interface ArchivistConfig {
@@ -462,15 +470,19 @@ const VALID_SECTIONS = new Set([
   "preferences_notes",
 ]);
 
-/**
- * Drop reasons recorded by the most recent parsePatterns invocation. Cleared
- * at the start of each call. Caller reads this to log soft-drop reasons
- * for observability — see CR_OODA_ARCHIVIST_CRUD_CLASSIFIER.md notes on
- * tolerant per-item validation.
- */
-export const parsePatternErrors: string[] = [];
+export interface ParsedPatterns {
+  patterns: PatternExtraction[];
+  errors: string[];
+}
 
-export function parsePatterns(raw: string): PatternExtraction[] {
+/**
+ * Finding 8 — parsePatterns returns `{ patterns, errors }` instead of using a
+ * module-scoped `parsePatternErrors` array. Per-call return prevents the
+ * cross-test contamination that the module-scoped buffer made possible and
+ * lets callers compute drop-rate severity (WARN/ERROR) from the same data
+ * structure they consume the patterns from.
+ */
+export function parsePatterns(raw: string): ParsedPatterns {
   const cleaned = stripCodeFences(raw);
   const parsed = JSON.parse(cleaned);
 
@@ -484,7 +496,7 @@ export function parsePatterns(raw: string): PatternExtraction[] {
 
   // Empty array is valid — no patterns found
   if (parsed.length === 0) {
-    return [];
+    return { patterns: [], errors: [] };
   }
 
   // Soft-drop per-item validation. The LLM occasionally emits malformed or
@@ -493,13 +505,12 @@ export function parsePatterns(raw: string): PatternExtraction[] {
   // nothing to say). Throwing on a single bad row used to poison the whole
   // run, which then kept retrying the same poisoned batch every tick. We
   // now drop bad rows + record their reasons so the caller can surface
-  // signal without freezing the loop. parsePatternErrors carries those
-  // drop reasons so the caller can log them.
-  parsePatternErrors.length = 0;
+  // signal without freezing the loop.
+  const errors: string[] = [];
   const validActions = new Set(["ADD", "UPDATE", "DELETE", "NOOP", "BELIEVE"]);
-  return parsed.flatMap((item: unknown, idx: number): PatternExtraction[] => {
+  const patterns = parsed.flatMap((item: unknown, idx: number): PatternExtraction[] => {
     const drop = (reason: string): PatternExtraction[] => {
-      parsePatternErrors.push(`Pattern[${idx}] dropped: ${reason}`);
+      errors.push(`Pattern[${idx}] dropped: ${reason}`);
       return [];
     };
 
@@ -564,6 +575,8 @@ export function parsePatterns(raw: string): PatternExtraction[] {
       },
     ];
   });
+
+  return { patterns, errors };
 }
 
 // ============================================================================
@@ -1006,6 +1019,7 @@ export async function runArchivist(
 
   // Step 2: Run summarization pass with retries
   let patterns: PatternExtraction[] = [];
+  let parseErrors: string[] = [];
   let fromFallback = false;
   let lastError: unknown;
 
@@ -1026,15 +1040,27 @@ export async function runArchivist(
   for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
     try {
       const raw = await callModel(prompt);
-      patterns = parsePatterns(raw);
+      const result = parsePatterns(raw);
+      patterns = result.patterns;
+      parseErrors = result.errors;
       lastError = undefined;
-      // Log any per-item soft-drops from the parser so observability isn't
-      // silent. parsePatterns now drops bad rows instead of throwing the
-      // whole batch (which used to freeze the loop on a single null value).
-      if (parsePatternErrors.length > 0) {
+      // Finding 8 — escalate severity by drop rate. ERROR when nothing parsed
+      // but drops happened (LLM emitted only garbage); WARN when more than
+      // half the rows were dropped; otherwise informational parse_partial.
+      if (parseErrors.length > 0) {
+        const total = patterns.length + parseErrors.length;
+        const dropRate = total > 0 ? parseErrors.length / total : 0;
+        let action: string;
+        if (patterns.length === 0) {
+          action = "parse_error";
+        } else if (dropRate > 0.5) {
+          action = "parse_warn";
+        } else {
+          action = "parse_partial";
+        }
         semanticStore.appendArchivistLog(
-          "parse_partial",
-          `parsed=${patterns.length}, dropped=${parsePatternErrors.length}: ${parsePatternErrors.slice(0, 5).join("; ")}`,
+          action,
+          `parsed=${patterns.length}, dropped=${parseErrors.length}, drop_rate=${dropRate.toFixed(2)}: ${parseErrors.slice(0, 5).join("; ")}`,
         );
       }
       break;
@@ -1246,12 +1272,19 @@ export async function runArchivist(
 
   // Step 7: Reset turns_since_last_archivist to 0. last_processed_turn is
   // maintained by index.ts on every agent_end — don't touch it here.
+  // Finding 8 — track recent drop rates so operator can spot model decay.
   const prevState = readState(workspacePath);
+  const total = patterns.length + parseErrors.length;
+  const thisDropRate = total > 0 ? parseErrors.length / total : 0;
+  const recent_drop_rates = [...(prevState.recent_drop_rates ?? []), thisDropRate].slice(
+    -RECENT_DROP_RATES_WINDOW,
+  );
   writeState(workspacePath, {
     last_processed_turn: prevState.last_processed_turn,
     turns_since_last_archivist: 0,
     last_run_at: new Date().toISOString(),
     archivist_runs_since_meta_review: prevState.archivist_runs_since_meta_review + 1,
+    recent_drop_rates,
   });
 
   // Step 8: Proposal extraction (second pass — best effort, non-blocking)
