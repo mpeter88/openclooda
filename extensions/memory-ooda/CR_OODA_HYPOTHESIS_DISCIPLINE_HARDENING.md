@@ -1,6 +1,6 @@
 # CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING — Robustness fixes for the structured hypothesis pipeline
 
-Status: draft
+Status: implemented
 Target batch: K
 Estimated effort: ~1 day
 Depends on: CR_OODA_HYPOTHESIS_DISCIPLINE (the substrate this hardens),
@@ -29,7 +29,7 @@ real worktrees.
 
 ## Motivation
 
-CR_OODA_HYPOTHESIS_DISCIPLINE delivered the right _shape_ — falsifiable
+CR*OODA_HYPOTHESIS_DISCIPLINE delivered the right \_shape* — falsifiable
 hypothesis, value linkage, refine loop, conclusion close-out, roadmap gate.
 What it did not deliver is the _robustness_ needed for the loop to run
 unattended on a real LLM emitting imperfect JSON / diffs / fixtures.
