@@ -1,6 +1,6 @@
 # CR_OODA_CAUSAL_RETRIEVAL — Retrieve by antecedence, not cosine alone
 
-Status: shipping
+Status: implemented
 Target batch: G (follows emotional-tagging + DMN + pattern-separation)
 Estimated effort: 1 day
 Depends on: episodic events with `actionId` + `outcome` / `outcomeSignal` (already present)

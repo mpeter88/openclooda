@@ -1,6 +1,6 @@
 # CR_OODA_AGENT_ARCHIVE — Generation lineage for the plugin itself
 
-Status: shipping
+Status: implemented
 Target batch: H (foundation for research loop)
 Estimated effort: 1 day
 Depends on: none (uses existing content-hash + admission gate)

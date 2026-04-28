@@ -1,6 +1,6 @@
 # CR_OODA_DMN_INTEGRATION_LOOP — Default Mode Network analog with activity-tapered cadence
 
-Status: draft
+Status: implemented
 Target batch: F (post-integration)
 Estimated effort: 3 days
 Depends on: none structurally; lighter if CR_OODA_EMOTIONAL_TAGGING has shipped (DMN can then re-score priority-weighted memories)

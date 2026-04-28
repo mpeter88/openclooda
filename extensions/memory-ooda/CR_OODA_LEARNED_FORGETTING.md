@@ -1,6 +1,6 @@
 # CR_OODA_LEARNED_FORGETTING — Prune by usefulness, not age alone
 
-Status: shipping
+Status: implemented
 Target batch: G (alongside causal-retrieval)
 Estimated effort: 1 day
 Depends on: EpisodicEvent fields (importance, outcome, lastRetrievedAt if added later)

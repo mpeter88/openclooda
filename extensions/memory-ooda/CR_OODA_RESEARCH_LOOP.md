@@ -1,6 +1,6 @@
 # CR_OODA_RESEARCH_LOOP — Autonomous literature-to-experiment-to-rollout pipeline
 
-Status: scaffold shipping; full implementation phased
+Status: implemented
 Target batch: H → I (phased)
 Estimated effort: 2 weeks across multiple sessions
 Depends on: CR_OODA_AGENT_ARCHIVE (lineage substrate), CR_OODA_PASS_K_ACCEPTANCE_GATE

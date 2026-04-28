@@ -1,6 +1,6 @@
 # CR_OODA_EMOTIONAL_TAGGING — Priority-weighted episodic memory
 
-Status: draft
+Status: implemented
 Target batch: F (post-integration)
 Estimated effort: 1 day
 Depends on: none (ships standalone)
