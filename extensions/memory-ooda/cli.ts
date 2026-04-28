@@ -1252,6 +1252,31 @@ export function registerResearchCommands(workspace: CLICommand, workspacePath: s
       console.log(JSON.stringify(rec, null, 2));
     });
 
+  // CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING #10: show-run for full audit trail
+  research
+    .command("show-run")
+    .argument("<exp-id>", "Experiment id")
+    .argument("<run-id>", "Run id (e.g. H-017-R-002)")
+    .description("Show full detail for a single hypothesis run (audit trail)")
+    .action((expId: string, runId: string) => {
+      const rec = readExperimentRecord(workspacePath, expId);
+      if (!rec) {
+        console.error(`No experiment with id "${expId}".`);
+        process.exitCode = 1;
+        return;
+      }
+      const run = rec.runs?.find((r) => r.run_id === runId);
+      if (!run) {
+        console.error(`Run "${runId}" not found in experiment "${expId}".`);
+        console.error(
+          `Available runs: ${(rec.runs ?? []).map((r) => r.run_id).join(", ") || "none"}`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      console.log(JSON.stringify(run, null, 2));
+    });
+
   research
     .command("log")
     .description("Dump the research discovery log (candidates scored by relevance)")

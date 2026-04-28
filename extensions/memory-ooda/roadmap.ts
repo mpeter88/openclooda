@@ -95,6 +95,17 @@ export function findEpic(workspacePath: string, epicId: string): RoadmapEpic | n
  * section if missing. Operator-triggered only (via `roadmap accept`).
  */
 export function appendEpic(workspacePath: string, epic: RoadmapEpic): void {
+  // CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING #11: injection guards
+  if (!/^[a-z0-9-]+$/.test(epic.id)) {
+    throw new Error(`Epic id must match [a-z0-9-]+, got: "${epic.id}"`);
+  }
+  if (epic.title.length >= 200 || epic.title.includes("\n")) {
+    throw new Error(`Epic title must be < 200 chars and single-line`);
+  }
+  // CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING #14: collision guard
+  if (findEpic(workspacePath, epic.id)) {
+    throw new Error(`Epic "${epic.id}" already exists in ROADMAP.md`);
+  }
   const p = roadmapPath(workspacePath);
   let text = fs.existsSync(p) ? fs.readFileSync(p, "utf-8") : "";
   if (!text.trim()) {
@@ -141,6 +152,10 @@ export function appendProposedEpic(
   row: Omit<ProposedEpicRow, "proposed_at" | "status"> &
     Partial<Pick<ProposedEpicRow, "proposed_at" | "status">>,
 ): ProposedEpicRow {
+  // CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING #11: injection guard on proposed title
+  if (row.title && (row.title.length >= 200 || row.title.includes("\n"))) {
+    throw new Error(`Proposed epic title must be < 200 chars and single-line`);
+  }
   const full: ProposedEpicRow = {
     ...row,
     proposed_at: row.proposed_at ?? new Date().toISOString(),
