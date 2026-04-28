@@ -1,6 +1,6 @@
 # CR_OODA_HYPOTHESIS_DISCIPLINE — Structured hypothesis, value-linkage, targeted tests, refine-loop
 
-Status: implemented
+Status: implemented + hardened (see CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING)
 Target batch: J
 Estimated effort: ~1 day
 Depends on: CR_OODA_RESEARCH_LOOP (pipeline substrate), CR_OODA_AGENT_ARCHIVE

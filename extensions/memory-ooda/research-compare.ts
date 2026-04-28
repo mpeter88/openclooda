@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { concludeExperiment } from "./conclusion.js";
+import { concludeAndTransition } from "./conclusion.js";
 import type { RunVerdict } from "./hypothesis-schema.js";
 import { addProposal } from "./proposals.js";
 import {
@@ -164,12 +164,16 @@ export async function runResearchCompare(
   if (verdict === "signal") {
     transitionStage(options.workspacePath, options.expId, "refining");
   } else if (verdict === "fail") {
-    concludeExperiment(options.workspacePath, options.expId, {
-      verdict: "dump",
-      learning: `compare verdict=fail; mean_delta=${compare.mean_delta.toFixed(3)}; regressions=${compare.regression_ids.length}; hypothesis_pass_rate=${lastRun?.hypothesis_pass_rate ?? "n/a"}`,
-      authored_by: "system",
-    });
-    transitionStage(options.workspacePath, options.expId, "concluded-dump", "compare verdict=fail");
+    concludeAndTransition(
+      options.workspacePath,
+      options.expId,
+      {
+        verdict: "dump",
+        learning: `compare verdict=fail; mean_delta=${compare.mean_delta.toFixed(3)}; regressions=${compare.regression_ids.length}; hypothesis_pass_rate=${lastRun?.hypothesis_pass_rate ?? "n/a"}`,
+        authored_by: "system",
+      },
+      "concluded-dump",
+    );
   }
 
   return { record: updated, compare, verdict };

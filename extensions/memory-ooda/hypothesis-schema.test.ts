@@ -7,6 +7,7 @@ import {
   makeRunId,
   readHypothesisCounter,
   validateHypothesis,
+  validateHypothesisFixtures,
   validateValueImpact,
   type Hypothesis,
   type ValueImpact,
@@ -150,5 +151,102 @@ describe("validateValueImpact", () => {
   it("rejects out-of-range est_impact", () => {
     expect(validateValueImpact({ ...baseExisting, est_impact: -0.1 }).valid).toBe(false);
     expect(validateValueImpact({ ...baseExisting, est_impact: 1.5 }).valid).toBe(false);
+  });
+});
+
+describe("validateHypothesisFixtures", () => {
+  const TAG = "H-test-tag";
+  const goodFixture = {
+    id: "fx-1",
+    label: "label",
+    fixture: { observation: "x", knowledge: {}, priorities: {} },
+    expected: {
+      actionId: "a",
+      description: "d",
+      successSignal: "s",
+      failureSignal: "f",
+      domain: "ops",
+    },
+    priorOutcome: "success" as const,
+    capturedAt: new Date().toISOString(),
+    tags: [TAG],
+  };
+
+  it("accepts a well-formed fixture array", () => {
+    const r = validateHypothesisFixtures([goodFixture], TAG);
+    expect(r.valid).toBe(true);
+    expect(r.errors).toEqual([]);
+  });
+
+  it("rejects an empty array", () => {
+    const r = validateHypothesisFixtures([], TAG);
+    expect(r.valid).toBe(false);
+    expect(r.errors[0]).toMatch(/non-empty/);
+  });
+
+  it("rejects when tags missing the required tag", () => {
+    const r = validateHypothesisFixtures([{ ...goodFixture, tags: [] }], TAG);
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes("must include"))).toBe(true);
+  });
+
+  it("rejects malformed expected block", () => {
+    const r = validateHypothesisFixtures(
+      [
+        {
+          ...goodFixture,
+          expected: { actionId: "a" } as unknown as (typeof goodFixture)["expected"],
+        },
+      ],
+      TAG,
+    );
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes("expected.description"))).toBe(true);
+  });
+
+  it("rejects malformed capturedAt", () => {
+    const r = validateHypothesisFixtures([{ ...goodFixture, capturedAt: "garbage" }], TAG);
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes("capturedAt"))).toBe(true);
+  });
+});
+
+describe("allocateHypothesisId concurrency", () => {
+  it("releases the lock after each allocation so the next call succeeds", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ooda-hid-lock-"));
+    try {
+      // Sequential calls — each must release the lock so the next can take it.
+      const ids = [allocateHypothesisId(tmp), allocateHypothesisId(tmp), allocateHypothesisId(tmp)];
+      expect(ids).toEqual(["H-001", "H-002", "H-003"]);
+      // Lock file should be cleaned up after release.
+      expect(fs.existsSync(path.join(tmp, ".archive", "hypothesis-counter.lock"))).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("times out when an external process holds the lock", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ooda-hid-lock-busy-"));
+    try {
+      const lockFile = path.join(tmp, ".archive", "hypothesis-counter.lock");
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      // Simulate an outside process holding the lock by creating the file
+      // and leaving it. acquireCounterLock should spin until the 5s deadline
+      // and then throw. We use a vi mock of Date.now to avoid the real wait.
+      const realNow = Date.now;
+      let cur = 0;
+      Date.now = () => {
+        cur += 1000;
+        return cur;
+      };
+      fs.writeFileSync(lockFile, "");
+      try {
+        expect(() => allocateHypothesisId(tmp)).toThrow(/lock timeout/);
+      } finally {
+        Date.now = realNow;
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

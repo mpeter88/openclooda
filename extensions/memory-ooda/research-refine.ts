@@ -25,13 +25,12 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { concludeExperiment } from "./conclusion.js";
+import { concludeAndTransition } from "./conclusion.js";
 import { makeRunId, type HypothesisFixtures, type Run } from "./hypothesis-schema.js";
 import { stripCodeFences } from "./parse-utils.js";
 import {
   experimentDir,
   readExperimentRecord,
-  transitionStage,
   writeExperimentRecord,
   type ExperimentRecord,
 } from "./research-loop.js";
@@ -170,12 +169,16 @@ export async function runResearchRefine(
   const realRuns = runs.filter((r) => r.verdict !== "error" || r.ended_at);
   if (realRuns.length >= maxRuns) {
     const lastRun = runs[runs.length - 1];
-    concludeExperiment(workspacePath, options.expId, {
-      verdict: "dump",
-      learning: `max_runs=${maxRuns} reached without pass; last verdict=${lastRun.verdict}, notes=${lastRun.notes}`,
-      authored_by: "system",
-    });
-    transitionStage(workspacePath, options.expId, "concluded-dump", "max runs reached");
+    concludeAndTransition(
+      workspacePath,
+      options.expId,
+      {
+        verdict: "dump",
+        learning: `max_runs=${maxRuns} reached without pass; last verdict=${lastRun.verdict}, notes=${lastRun.notes}`,
+        authored_by: "system",
+      },
+      "concluded-dump",
+    );
     return { outcome: "max_runs_reached", reason: `${realRuns.length}/${maxRuns}` };
   }
 
@@ -199,16 +202,15 @@ export async function runResearchRefine(
     const scopeCheck = validateScope(draft.new_diff, record.scope);
     if (!scopeCheck.valid) {
       const reason = scopeCheck.reason ?? "scope violation";
-      concludeExperiment(workspacePath, options.expId, {
-        verdict: "dump",
-        learning: `refine widened scope: ${reason}`,
-        authored_by: "system",
-      });
-      transitionStage(
+      concludeAndTransition(
         workspacePath,
         options.expId,
+        {
+          verdict: "dump",
+          learning: `refine widened scope: ${reason}`,
+          authored_by: "system",
+        },
         "concluded-dump",
-        `refine widened scope: ${reason}`,
       );
       return { outcome: "scope_widened", reason };
     }

@@ -15,7 +15,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Conclusion } from "./hypothesis-schema.js";
-import { readExperimentRecord, writeExperimentRecord, researchLogPath } from "./research-loop.js";
+import {
+  canTransition,
+  readExperimentRecord,
+  researchLogPath,
+  writeExperimentRecord,
+  type ExperimentRecord,
+  type ExperimentStage,
+} from "./research-loop.js";
 
 export interface CloseOutRow {
   closeout: true;
@@ -65,6 +72,53 @@ export function concludeExperiment(
     authored_by: full.authored_by,
   };
 
+  const logFile = researchLogPath(workspacePath);
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.appendFileSync(logFile, `${JSON.stringify(row)}\n`, "utf-8");
+
+  return { record: updated, closeOut: row };
+}
+
+/**
+ * Atomic conclude + transition (CR_OODA_HYPOTHESIS_DISCIPLINE_HARDENING #15
+ * cleanup). Writes the conclusion AND the terminal stage in a single
+ * writeExperimentRecord call, then appends the close-out row. Replaces the
+ * two-call call sites in research-compare / research-refine that previously
+ * left a tiny window where the conclusion was stamped but the status hadn't
+ * yet transitioned.
+ */
+export function concludeAndTransition(
+  workspacePath: string,
+  expId: string,
+  conclusion: Omit<Conclusion, "concluded_at"> & Partial<Pick<Conclusion, "concluded_at">>,
+  terminalStage: ExperimentStage,
+): { record: ExperimentRecord | null; closeOut: CloseOutRow | null } {
+  const record = readExperimentRecord(workspacePath, expId);
+  if (!record) return { record: null, closeOut: null };
+
+  const full: Conclusion = {
+    ...conclusion,
+    concluded_at: conclusion.concluded_at ?? new Date().toISOString(),
+  };
+  const nextStatus = canTransition(record.status, terminalStage) ? terminalStage : record.status;
+  const updated: ExperimentRecord = {
+    ...record,
+    status: nextStatus,
+    conclusion: full,
+    updated_at: new Date().toISOString(),
+  };
+  writeExperimentRecord(workspacePath, updated);
+
+  const row: CloseOutRow = {
+    closeout: true,
+    exp_id: expId,
+    hypothesis_id: record.hypothesis_obj?.id ?? "unknown",
+    source_candidate_id: record.source.ref,
+    verdict: full.verdict,
+    learning: full.learning,
+    concluded_at: full.concluded_at,
+    authored_by: full.authored_by,
+  };
   const logFile = researchLogPath(workspacePath);
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   fs.appendFileSync(logFile, `${JSON.stringify(row)}\n`, "utf-8");

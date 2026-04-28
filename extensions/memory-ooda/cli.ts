@@ -43,6 +43,7 @@ import {
 } from "./proposals.js";
 import { runResearchBackfill } from "./research-backfill.js";
 import {
+  experimentDir,
   listExperiments,
   readExperimentRecord,
   readResearchLog,
@@ -1274,7 +1275,19 @@ export function registerResearchCommands(workspace: CLICommand, workspacePath: s
         process.exitCode = 1;
         return;
       }
-      console.log(JSON.stringify(run, null, 2));
+      // Surface the refine.json side-car when present; the on-disk file holds
+      // the full LLM rationale that the run object truncates to 200 chars.
+      const runDir = path.join(experimentDir(workspacePath, expId), "runs", runId);
+      const out: Record<string, unknown> = { run };
+      const refinePath = path.join(runDir, "refine.json");
+      if (fs.existsSync(refinePath)) {
+        try {
+          out.refine = JSON.parse(fs.readFileSync(refinePath, "utf-8"));
+        } catch {
+          /* corrupt file — leave omitted */
+        }
+      }
+      console.log(JSON.stringify(out, null, 2));
     });
 
   research
