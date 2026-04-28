@@ -8,6 +8,7 @@ import {
   generateWeightProposals,
   inferDomain,
   parsePatterns,
+  parsePatternErrors,
   readState,
   runArchivist,
   shouldProposeWeightAdjustment,
@@ -375,48 +376,66 @@ describe("parsePatterns", () => {
     expect(() => parsePatterns(JSON.stringify(many))).toThrow("Too many patterns: 16");
   });
 
-  it("rejects invalid section", () => {
-    const bad = [{ section: "invalid", key: "k", value: "v", reason: "r" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("section must be one of");
+  // Per-item validation now soft-drops bad rows instead of throwing the
+  // whole batch. A single null-value pattern used to freeze the loop —
+  // the LLM can produce one bad row inside an otherwise-valid batch and
+  // we want to keep the rest. parsePatternErrors carries the drop reason.
+
+  it("drops pattern with invalid section but keeps valid siblings", () => {
+    const mixed = [
+      { section: "invalid", key: "bad", value: "v", reason: "r" },
+      { section: "stack", key: "good", value: "v", reason: "r" },
+    ];
+    const result = parsePatterns(JSON.stringify(mixed));
+    expect(result).toHaveLength(1);
+    expect(result[0].key).toBe("good");
+    expect(parsePatternErrors.some((e) => e.includes("section must be one of"))).toBe(true);
   });
 
-  it("rejects missing key", () => {
+  it("drops pattern with empty key", () => {
     const bad = [{ section: "stack", key: "", value: "v", reason: "r" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("non-empty key");
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(parsePatternErrors.some((e) => e.includes("missing or empty key"))).toBe(true);
   });
 
-  it("rejects null value", () => {
+  it("drops pattern with null value (the bug that froze the loop for 5 days)", () => {
     const bad = [{ section: "stack", key: "k", value: null, reason: "r" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("non-null value");
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(parsePatternErrors.some((e) => e.includes("null value"))).toBe(true);
   });
 
-  it("rejects missing reason", () => {
+  it("drops pattern with empty reason", () => {
     const bad = [{ section: "stack", key: "k", value: "v", reason: "" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("non-empty reason");
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(parsePatternErrors.some((e) => e.includes("missing or empty reason"))).toBe(true);
   });
 
-  it("rejects invalid JSON", () => {
+  it("rejects invalid JSON (whole-batch failure still throws)", () => {
     expect(() => parsePatterns("not json")).toThrow();
   });
 
-  it("rejects non-string value for stack section (M9)", () => {
+  it("drops non-string value for stack section (M9)", () => {
     const bad = [{ section: "stack", key: "lang", value: { nested: true }, reason: "test" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be a string for section");
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(parsePatternErrors.some((e) => e.includes("string"))).toBe(true);
   });
 
-  it("rejects non-string value for domain_context section (M9)", () => {
+  it("drops non-string value for domain_context section (M9)", () => {
     const bad = [{ section: "domain_context", key: "focus", value: 42, reason: "test" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be a string for section");
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(parsePatternErrors.some((e) => e.includes("string"))).toBe(true);
   });
 
-  it("rejects non-object value for people section (M9)", () => {
+  it("drops non-object value for people section (M9)", () => {
     const bad = [{ section: "people", key: "alice", value: "just a string", reason: "test" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be an object for section");
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(parsePatternErrors.some((e) => e.includes("object"))).toBe(true);
   });
 
-  it("rejects array value for projects section (M9)", () => {
+  it("drops array value for projects section (M9)", () => {
     const bad = [{ section: "projects", key: "proj", value: [1, 2], reason: "test" }];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow("must be an object for section");
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(parsePatternErrors.some((e) => e.includes("object"))).toBe(true);
   });
 
   it("accepts object values for projects section", () => {
@@ -880,7 +899,7 @@ describe("lessons_learned extraction", () => {
     });
   });
 
-  it("validates lessons_learned values must be strings", () => {
+  it("drops lessons_learned patterns whose value is not a string", () => {
     const bad = [
       {
         section: "lessons_learned",
@@ -889,9 +908,10 @@ describe("lessons_learned extraction", () => {
         reason: "test",
       },
     ];
-    expect(() => parsePatterns(JSON.stringify(bad))).toThrow(
-      'must be a string for section "lessons_learned"',
-    );
+    expect(parsePatterns(JSON.stringify(bad))).toEqual([]);
+    expect(
+      parsePatternErrors.some((e) => e.includes("string") && e.includes("lessons_learned")),
+    ).toBe(true);
   });
 });
 

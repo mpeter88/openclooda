@@ -106,7 +106,8 @@ export type DMNWorkKind =
   | "retrospective_chair"
   | "rehearsal"
   | "pattern_distill"
-  | "campbell_watchdog";
+  | "campbell_watchdog"
+  | "research_tick";
 
 export interface DMNWorkUnitFlags {
   belief_rescore: boolean;
@@ -114,6 +115,7 @@ export interface DMNWorkUnitFlags {
   rehearsal: boolean;
   pattern_distill: boolean;
   campbell_watchdog: boolean;
+  research_tick: boolean;
 }
 
 export const DEFAULT_WORK_UNIT_FLAGS: DMNWorkUnitFlags = {
@@ -126,6 +128,9 @@ export const DEFAULT_WORK_UNIT_FLAGS: DMNWorkUnitFlags = {
   retrospective_chair: false,
   rehearsal: false,
   pattern_distill: false,
+  // CR_OODA_RESEARCH_LOOP: autonomous literature-to-experiment pipeline.
+  // Default off — operators opt in after confirming budget + isolation boundary.
+  research_tick: false,
 };
 
 /** Which kinds of work are valid for a bucket. Asleep excludes everything. */
@@ -136,7 +141,9 @@ export function eligibleWorkKinds(bucket: DMNBucket): DMNWorkKind[] {
       return ["belief_rescore", "retrospective_chair", "rehearsal", "campbell_watchdog"];
     case "idle":
     case "dormant":
-      return ["belief_rescore", "pattern_distill", "campbell_watchdog"];
+      // research_tick runs only when the user is away — never competes for
+      // budget with rehearsal/retrospective_chair which serve the active user.
+      return ["belief_rescore", "pattern_distill", "campbell_watchdog", "research_tick"];
     case "asleep":
       return [];
   }
@@ -308,7 +315,12 @@ export function recordLLMCall(state: DMNState, now: number = Date.now()): DMNSta
 }
 
 export function isLLMBackedKind(kind: DMNWorkKind): boolean {
-  return kind === "retrospective_chair" || kind === "rehearsal" || kind === "pattern_distill";
+  return (
+    kind === "retrospective_chair" ||
+    kind === "rehearsal" ||
+    kind === "pattern_distill" ||
+    kind === "research_tick"
+  );
 }
 
 // ============================================================================

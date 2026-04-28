@@ -450,6 +450,9 @@ importers:
       openai:
         specifier: ^6.29.0
         version: 6.32.0(ws@8.19.0)(zod@4.3.6)
+      sqlite-vec:
+        specifier: 0.1.7-alpha.2
+        version: 0.1.7-alpha.2
 
   extensions/memory-ooda:
     dependencies:

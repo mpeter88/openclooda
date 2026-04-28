@@ -369,6 +369,12 @@ are the same lesson and must use one canonical key).
 You receive a batch of recent episodic events from an AI assistant session.
 Your job: extract durable knowledge worth remembering across future sessions.
 
+CRITICAL OUTPUT RULES:
+- Every pattern must have a non-null \`value\`. If you have nothing to say
+  for a key, OMIT THE ENTIRE PATTERN — do not emit \`"value": null\`.
+- Every pattern must have a non-empty \`reason\`. Same rule: omit instead of null.
+- Empty array \`[]\` is a valid response if no events warrant durable knowledge.
+
 ## Episodic Events
 ${eventsBlock}
 ${existingKeysBlock}
@@ -456,6 +462,14 @@ const VALID_SECTIONS = new Set([
   "preferences_notes",
 ]);
 
+/**
+ * Drop reasons recorded by the most recent parsePatterns invocation. Cleared
+ * at the start of each call. Caller reads this to log soft-drop reasons
+ * for observability — see CR_OODA_ARCHIVIST_CRUD_CLASSIFIER.md notes on
+ * tolerant per-item validation.
+ */
+export const parsePatternErrors: string[] = [];
+
 export function parsePatterns(raw: string): PatternExtraction[] {
   const cleaned = stripCodeFences(raw);
   const parsed = JSON.parse(cleaned);
@@ -473,21 +487,38 @@ export function parsePatterns(raw: string): PatternExtraction[] {
     return [];
   }
 
-  return parsed.map((item: unknown, idx: number) => {
+  // Soft-drop per-item validation. The LLM occasionally emits malformed or
+  // null-valued patterns inside an otherwise-valid batch (e.g.
+  // `{"section":"lessons_learned","key":"x","value":null}` when it had
+  // nothing to say). Throwing on a single bad row used to poison the whole
+  // run, which then kept retrying the same poisoned batch every tick. We
+  // now drop bad rows + record their reasons so the caller can surface
+  // signal without freezing the loop. parsePatternErrors carries those
+  // drop reasons so the caller can log them.
+  parsePatternErrors.length = 0;
+  const validActions = new Set(["ADD", "UPDATE", "DELETE", "NOOP", "BELIEVE"]);
+  return parsed.flatMap((item: unknown, idx: number): PatternExtraction[] => {
+    const drop = (reason: string): PatternExtraction[] => {
+      parsePatternErrors.push(`Pattern[${idx}] dropped: ${reason}`);
+      return [];
+    };
+
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      throw new Error(`Pattern[${idx}] must be an object`);
+      return drop("not an object");
     }
 
     const obj = item as Record<string, unknown>;
 
     if (typeof obj.section !== "string" || !VALID_SECTIONS.has(obj.section)) {
-      throw new Error(`Pattern[${idx}].section must be one of: ${[...VALID_SECTIONS].join(", ")}`);
+      return drop(
+        `section must be one of ${[...VALID_SECTIONS].join(", ")} — got ${String(obj.section)}`,
+      );
     }
     if (typeof obj.key !== "string" || obj.key.length === 0) {
-      throw new Error(`Pattern[${idx}] must have a non-empty key`);
+      return drop("missing or empty key");
     }
     if (obj.value === undefined || obj.value === null) {
-      throw new Error(`Pattern[${idx}] must have a non-null value`);
+      return drop(`null value for key "${obj.key}" (section ${obj.section})`);
     }
     // Per-section type validation
     if (
@@ -497,40 +528,41 @@ export function parsePatterns(raw: string): PatternExtraction[] {
         obj.section === "preferences_notes") &&
       typeof obj.value !== "string"
     ) {
-      throw new Error(`Pattern[${idx}].value must be a string for section "${obj.section}"`);
+      return drop(`value must be a string for section "${obj.section}"`);
     }
     if (
       (obj.section === "projects" || obj.section === "people") &&
       (typeof obj.value !== "object" || Array.isArray(obj.value))
     ) {
-      throw new Error(`Pattern[${idx}].value must be an object for section "${obj.section}"`);
+      return drop(`value must be an object for section "${obj.section}"`);
     }
     if (typeof obj.reason !== "string" || obj.reason.length === 0) {
-      throw new Error(`Pattern[${idx}] must have a non-empty reason`);
+      return drop("missing or empty reason");
     }
 
     // Validate optional action field
-    const validActions = new Set(["ADD", "UPDATE", "DELETE", "NOOP", "BELIEVE"]);
     let action: import("./types.js").PatternAction | undefined;
     if (obj.action !== undefined) {
       if (typeof obj.action !== "string" || !validActions.has(obj.action)) {
-        throw new Error(
-          `Pattern[${idx}].action must be one of: ADD, UPDATE, DELETE, NOOP, BELIEVE`,
+        return drop(
+          `action must be one of ADD, UPDATE, DELETE, NOOP, BELIEVE — got ${String(obj.action)}`,
         );
       }
       action = obj.action as import("./types.js").PatternAction;
     }
 
-    return {
-      action,
-      section: obj.section as PatternExtraction["section"],
-      key: obj.key,
-      value: obj.value,
-      previousValue: obj.previousValue,
-      invalidation_reason:
-        typeof obj.invalidation_reason === "string" ? obj.invalidation_reason : undefined,
-      reason: obj.reason,
-    };
+    return [
+      {
+        action,
+        section: obj.section as PatternExtraction["section"],
+        key: obj.key,
+        value: obj.value,
+        previousValue: obj.previousValue,
+        invalidation_reason:
+          typeof obj.invalidation_reason === "string" ? obj.invalidation_reason : undefined,
+        reason: obj.reason,
+      },
+    ];
   });
 }
 
@@ -996,6 +1028,15 @@ export async function runArchivist(
       const raw = await callModel(prompt);
       patterns = parsePatterns(raw);
       lastError = undefined;
+      // Log any per-item soft-drops from the parser so observability isn't
+      // silent. parsePatterns now drops bad rows instead of throwing the
+      // whole batch (which used to freeze the loop on a single null value).
+      if (parsePatternErrors.length > 0) {
+        semanticStore.appendArchivistLog(
+          "parse_partial",
+          `parsed=${patterns.length}, dropped=${parsePatternErrors.length}: ${parsePatternErrors.slice(0, 5).join("; ")}`,
+        );
+      }
       break;
     } catch (err) {
       lastError = err;

@@ -15,10 +15,19 @@
 import fs from "node:fs";
 import path from "node:path";
 import { listAdmissionCases, saveAdmissionCase } from "./admission-gate.js";
+import {
+  childrenOf,
+  lineageTo,
+  markValidParent,
+  readArchive,
+  findGeneration,
+  meanScore,
+} from "./agent-archive.js";
 import type { EpisodicEvent } from "./archivist.js";
 import { formBelief, getActiveBeliefs, getBeliefs, retireBelief, canPromote } from "./beliefs.js";
 import { findAntecedents, formatAntecedents } from "./causal-retrieval.js";
 import { gateHistoryPath, readGateHistory, type GateHistoryRow } from "./change-gate.js";
+import { concludeExperiment, readCloseOuts } from "./conclusion.js";
 import {
   computeDistortion,
   distortionHistoryPath,
@@ -31,6 +40,23 @@ import {
   getProposals,
   updateProposalStatus,
 } from "./proposals.js";
+import { runResearchBackfill } from "./research-backfill.js";
+import {
+  listExperiments,
+  readExperimentRecord,
+  readResearchLog,
+  readRolloutQueue,
+  transitionStage,
+} from "./research-loop.js";
+import {
+  appendEpic,
+  bootstrapRoadmap,
+  latestEpicStates,
+  listEpics,
+  pendingEpics,
+  resolveProposedEpic,
+  type Horizon,
+} from "./roadmap.js";
 import { getFacts, getFactsAsOf } from "./semantic-memory.js";
 import { listSnapshots, restoreLatestSnapshot } from "./snapshot.js";
 import {
@@ -38,6 +64,7 @@ import {
   evaluateTrajectoryScaling,
   readTrajectoryAudit,
 } from "./trajectory-audit.js";
+import type { ModelCallFn } from "./triage.js";
 import type {
   DistortionReading,
   DistortionSample,
@@ -947,6 +974,575 @@ export function registerSoulCommands(workspace: CLICommand, workspacePath: strin
 }
 
 // ============================================================================
+// Agent archive CLI (CR_OODA_AGENT_ARCHIVE)
+// ============================================================================
+
+export function registerArchiveCommands(workspace: CLICommand, workspacePath: string): void {
+  const archive = workspace
+    .command("archive")
+    .description("Inspect the per-generation plugin lineage");
+
+  archive
+    .command("list")
+    .description("List archive rows, newest first")
+    .option("--limit <n>", "Cap rows (default: 20)")
+    .option("--invalid-only", "Show only valid_parent=false rows")
+    .option("--json", "Output raw JSON")
+    .action((opts: { limit?: string; invalidOnly?: boolean; json?: boolean }) => {
+      const limit = opts.limit ? Math.max(1, Number.parseInt(opts.limit, 10) || 20) : 20;
+      let rows = readArchive(workspacePath).slice().reverse();
+      if (opts.invalidOnly) rows = rows.filter((r) => !r.valid_parent);
+      rows = rows.slice(0, limit);
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("Archive is empty.");
+        return;
+      }
+      for (const r of rows) {
+        const valid = r.valid_parent ? "✓" : "✗";
+        const mean = meanScore(r);
+        const score = mean !== null ? `mean=${mean.toFixed(2)}` : "no-score";
+        const depth = `d=${r.lineage_depth}`;
+        const parent = r.parent_genid.slice(0, 8);
+        console.log(
+          `${valid} ${r.genid} ← ${parent} ${depth} ${score.padEnd(12)} [${r.admission.kind}] ${r.summary ?? ""}`,
+        );
+      }
+    });
+
+  archive
+    .command("show")
+    .argument("<genid>", "Generation id")
+    .description("Show a single archive row in full")
+    .action((genid: string) => {
+      const row = findGeneration(workspacePath, genid);
+      if (!row) {
+        console.error(`No generation with id "${genid}".`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(JSON.stringify(row, null, 2));
+    });
+
+  archive
+    .command("lineage")
+    .argument("<genid>", "Generation id (walks back to 'initial')")
+    .description("Print the ancestry path from the given genid back to the initial node")
+    .action((genid: string) => {
+      const chain = lineageTo(workspacePath, genid);
+      if (chain.length === 0) {
+        console.error(`No lineage found for "${genid}".`);
+        process.exitCode = 1;
+        return;
+      }
+      for (const r of chain) {
+        const valid = r.valid_parent ? "✓" : "✗";
+        console.log(
+          `${valid} ${r.genid} (${r.created_at}) [${r.admission.kind}] ${r.summary ?? ""}`,
+        );
+      }
+    });
+
+  archive
+    .command("children")
+    .argument("<genid>", "Parent generation id")
+    .description("List direct children of the given generation")
+    .action((genid: string) => {
+      const kids = childrenOf(workspacePath, genid);
+      if (kids.length === 0) {
+        console.log("(no children)");
+        return;
+      }
+      for (const k of kids) {
+        const valid = k.valid_parent ? "✓" : "✗";
+        console.log(`${valid} ${k.genid} [${k.admission.kind}] ${k.summary ?? ""}`);
+      }
+    });
+
+  archive
+    .command("mark-invalid")
+    .argument("<genid>", "Generation id")
+    .argument("<reason>", "Short reason for invalidation")
+    .description("Flag a generation as an ineligible parent (soft signal)")
+    .action((genid: string, reason: string) => {
+      const ok = markValidParent(workspacePath, genid, false, reason);
+      if (!ok) {
+        console.error(`No generation with id "${genid}".`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`Marked ${genid} as valid_parent=false (${reason}).`);
+    });
+}
+
+// ============================================================================
+// Research loop CLI (CR_OODA_RESEARCH_LOOP)
+// ============================================================================
+
+export function registerResearchCommands(workspace: CLICommand, workspacePath: string): void {
+  const research = workspace
+    .command("research")
+    .description("Autonomous literature-to-experiment pipeline (CR_OODA_RESEARCH_LOOP)");
+
+  research
+    .command("list")
+    .description("List experiments, newest first")
+    .option("--status <s>", "Filter by status (discovered|proposed|...)")
+    .option("--limit <n>", "Cap rows (default: 20)")
+    .option("--json", "Output raw JSON")
+    .action((opts: { status?: string; limit?: string; json?: boolean }) => {
+      const limit = opts.limit ? Math.max(1, Number.parseInt(opts.limit, 10) || 20) : 20;
+      let rows = listExperiments(workspacePath).slice().reverse();
+      if (opts.status) rows = rows.filter((r) => r.status === opts.status);
+      rows = rows.slice(0, limit);
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("No experiments yet.");
+        return;
+      }
+      for (const r of rows) {
+        const delta = r.scores.delta?.mean;
+        const deltaStr = typeof delta === "number" ? `Δ=${delta.toFixed(3)}` : "Δ=n/a";
+        console.log(
+          `${r.status.padEnd(16)} ${r.exp_id.padEnd(32)} parent=${r.parent_genid.slice(0, 8)} ${deltaStr} ${r.source.citation ?? r.source.ref}`,
+        );
+      }
+    });
+
+  research
+    .command("show")
+    .argument("<exp-id>", "Experiment id")
+    .description("Show a single experiment record in full")
+    .action((expId: string) => {
+      const rec = readExperimentRecord(workspacePath, expId);
+      if (!rec) {
+        console.error(`No experiment with id "${expId}".`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(JSON.stringify(rec, null, 2));
+    });
+
+  research
+    .command("log")
+    .description("Dump the research discovery log (candidates scored by relevance)")
+    .option("--json", "Output raw JSON")
+    .option("--min-relevance <n>", "Filter by minimum relevance_score")
+    .action((opts: { json?: boolean; minRelevance?: string }) => {
+      const floor = opts.minRelevance ? Number.parseFloat(opts.minRelevance) || 0 : 0;
+      const rows = readResearchLog(workspacePath).filter((c) => c.relevance_score >= floor);
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("Research log empty.");
+        return;
+      }
+      for (const c of rows) {
+        console.log(`${c.relevance_score.toFixed(2)} ${c.id.padEnd(32)} ${c.title ?? ""}`);
+      }
+    });
+
+  research
+    .command("reject")
+    .argument("<exp-id>", "Experiment id")
+    .argument("<reason>", "Why the experiment is being rejected")
+    .description("Manually reject an experiment (hard terminate)")
+    .action((expId: string, reason: string) => {
+      const updated = transitionStage(workspacePath, expId, "rejected", reason);
+      if (!updated) {
+        console.error(`Cannot reject ${expId} — illegal transition or not found.`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`Rejected ${expId}: ${reason}`);
+    });
+
+  research
+    .command("backfill")
+    .description(
+      "One-shot historical arxiv sweep (cat × kw × date range). Uses ANTHROPIC_API_KEY from env. Dedup-safe; re-runs skip already-seen ids.",
+    )
+    .option("--since <iso>", "Earliest submittedDate (YYYY-MM-DD). Default 2024-01-01")
+    .option("--until <iso>", "Latest submittedDate (YYYY-MM-DD). Default today")
+    .option("--max-per-query <n>", "arxiv API cap per (cat,kw). Default 50")
+    .option("--max-total <n>", "Hard cap on LLM-scored items (controls bill). Default 100")
+    .option(
+      "--floor <n>",
+      "Relevance score cutoff. Default PRIORITIES.research_candidate_floor or 0.45",
+    )
+    .option("--dry-run", "Fetch + keyword-filter only, skip LLM scoring")
+    .action(
+      async (opts: {
+        since?: string;
+        until?: string;
+        maxPerQuery?: string;
+        maxTotal?: string;
+        floor?: string;
+        dryRun?: boolean;
+      }) => {
+        let priorities: ReturnType<typeof getPriorities> | undefined;
+        try {
+          priorities = getPriorities(workspacePath);
+        } catch {
+          priorities = undefined;
+        }
+        const thresholds = (priorities?.thresholds ?? {}) as Record<string, unknown>;
+        const categories = (
+          (thresholds.research_feed_urls as string[] | undefined) ?? [
+            "http://export.arxiv.org/rss/cs.AI",
+          ]
+        )
+          .map((u) => {
+            const m = /\/rss\/([^/?#]+)/.exec(u);
+            return m?.[1];
+          })
+          .filter((c): c is string => typeof c === "string");
+        const keywords = (thresholds.research_keywords as string[] | undefined) ?? [];
+        if (categories.length === 0 || keywords.length === 0) {
+          console.error(
+            "backfill: PRIORITIES.json must set thresholds.research_feed_urls and thresholds.research_keywords",
+          );
+          process.exitCode = 1;
+          return;
+        }
+        const floor = opts.floor
+          ? Number.parseFloat(opts.floor)
+          : ((thresholds.research_candidate_floor as number | undefined) ?? 0.45);
+
+        const callModel: ModelCallFn = opts.dryRun
+          ? async () => JSON.stringify({ score: 0, rationale: "dry-run" })
+          : async (prompt: string) => {
+              const apiKey = process.env.ANTHROPIC_API_KEY;
+              if (!apiKey) {
+                throw new Error("backfill: ANTHROPIC_API_KEY env var required (or pass --dry-run)");
+              }
+              const res = await fetch("https://api.anthropic.com/v1/messages", {
+                method: "POST",
+                headers: {
+                  "content-type": "application/json",
+                  "x-api-key": apiKey,
+                  "anthropic-version": "2023-06-01",
+                },
+                body: JSON.stringify({
+                  model: "claude-sonnet-4-6",
+                  max_tokens: 4096,
+                  system:
+                    "You are an OODA reasoning agent. Respond with raw JSON only. No explanation, no code fences.",
+                  messages: [{ role: "user", content: prompt }],
+                }),
+              });
+              if (!res.ok) {
+                const body = await res.text().catch(() => "");
+                throw new Error(`Anthropic API ${res.status}: ${body.slice(0, 200)}`);
+              }
+              const data = (await res.json()) as {
+                content: Array<{ type: string; text?: string }>;
+              };
+              return data.content?.find((b) => b.type === "text")?.text ?? "";
+            };
+
+        const architectureSummary =
+          "openclooda is a cognitive OODA agent with dual-process council, triage, archivist, beliefs, DMN, admission gate, pattern separation, emotional tagging, causal retrieval, learned forgetting, evolutionary agent archive, and git-worktree sandboxed self-modification. " +
+          "Capability gaps we want research on: curiosity-driven exploration, metacognition / calibrated uncertainty, richer reasoning shapes (tree/graph-of-thought, debate, verification), theory of mind, generative world models, tool discovery & skill-library acquisition, hierarchical planning, graph-RAG / hierarchical memory, continual and lifelong learning, benchmarks beyond pass^k, self-critique / constitutional AI / RLAIF, predictive coding / free-energy / global workspace, POMDP / bandits / sequential decision / optimal stopping. " +
+          "Score high (>=0.6) for concrete, testable mechanisms filling a gap; medium (0.4-0.6) for adjacent ideas; low (<0.4) for pure theory, domain-specific, or incremental engineering.";
+
+        console.log(
+          `backfill: ${categories.length} cats × ${keywords.length} kws = ${categories.length * keywords.length} queries; floor=${floor}${opts.dryRun ? " (dry-run)" : ""}`,
+        );
+
+        const r = await runResearchBackfill(
+          workspacePath,
+          { callModel },
+          {
+            categories,
+            keywords,
+            architectureSummary,
+            since: opts.since,
+            until: opts.until,
+            maxPerQuery: opts.maxPerQuery ? Number.parseInt(opts.maxPerQuery, 10) : undefined,
+            maxCandidatesTotal: opts.maxTotal ? Number.parseInt(opts.maxTotal, 10) : undefined,
+            candidateFloor: floor,
+            onProgress: (p) => {
+              process.stderr.write(`  [${p.done}/${p.total}]\r`);
+            },
+          },
+        );
+        process.stderr.write("\n");
+        console.log(
+          `backfill complete: queries=${r.queries_issued} scanned=${r.scanned} scored=${r.scored} accepted=${r.accepted} skipped_existing=${r.skipped_existing} failed=${r.queries_failed}`,
+        );
+      },
+    );
+
+  research
+    .command("rollout-queue")
+    .description("Show experiments awaiting human approval after the research gate admitted them")
+    .option("--json", "Output raw JSON")
+    .action((opts: { json?: boolean }) => {
+      const rows = readRolloutQueue(workspacePath);
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("Rollout queue is empty.");
+        return;
+      }
+      for (const r of rows) {
+        console.log(
+          `${r.queued_at}  ${r.exp_id.padEnd(32)} proposal=${r.proposal_id}  ${r.summary}`,
+        );
+      }
+    });
+
+  // ==========================================================================
+  // CR_OODA_HYPOTHESIS_DISCIPLINE — hypothesis + roadmap subcommands
+  // ==========================================================================
+
+  const hypothesis = research
+    .command("hypothesis")
+    .description("Hypothesis-level inspection (CR_OODA_HYPOTHESIS_DISCIPLINE)");
+
+  hypothesis
+    .command("list")
+    .description("List experiments keyed by hypothesis id")
+    .option("--json", "Output raw JSON")
+    .action((opts: { json?: boolean }) => {
+      const rows = listExperiments(workspacePath)
+        .filter((e) => e.hypothesis_obj)
+        .map((e) => ({
+          hypothesis_id: e.hypothesis_obj!.id,
+          exp_id: e.exp_id,
+          status: e.status,
+          claim: e.hypothesis_obj!.claim,
+          runs: e.runs?.length ?? 0,
+          verdict: e.conclusion?.verdict ?? e.runs?.[e.runs.length - 1]?.verdict ?? "pending",
+          epic:
+            e.value?.roadmap_link.mode === "existing"
+              ? e.value.roadmap_link.epic
+              : e.value?.roadmap_link.mode === "propose"
+                ? `(proposed) ${e.value.roadmap_link.epic_id}`
+                : "(none)",
+        }));
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("No hypothesis-tracked experiments yet.");
+        return;
+      }
+      for (const r of rows) {
+        console.log(
+          `${r.hypothesis_id}  ${r.status.padEnd(22)} runs=${r.runs} verdict=${r.verdict.padEnd(8)} epic=${r.epic}`,
+        );
+        console.log(`  claim: ${r.claim}`);
+      }
+    });
+
+  hypothesis
+    .command("show")
+    .argument("<hypothesis-id>", "H-NNN identifier")
+    .description("Show the full experiment record for a hypothesis id")
+    .action((hId: string) => {
+      const match = listExperiments(workspacePath).find((e) => e.hypothesis_obj?.id === hId);
+      if (!match) {
+        console.error(`No experiment with hypothesis id "${hId}".`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(JSON.stringify(match, null, 2));
+    });
+
+  hypothesis
+    .command("conclude")
+    .argument("<exp-id>", "Experiment id")
+    .argument("<verdict>", "stage | dump | inconclusive")
+    .argument("<learning>", "One-line learning note")
+    .description("Manually conclude an experiment (authored_by=human)")
+    .action((expId: string, verdict: string, learning: string) => {
+      if (!["stage", "dump", "inconclusive"].includes(verdict)) {
+        console.error(`Invalid verdict: ${verdict}`);
+        process.exitCode = 1;
+        return;
+      }
+      const r = concludeExperiment(workspacePath, expId, {
+        verdict: verdict as "stage" | "dump" | "inconclusive",
+        learning,
+        authored_by: "human",
+      });
+      if (!r.record) {
+        console.error(`No record found for ${expId}`);
+        process.exitCode = 1;
+        return;
+      }
+      transitionStage(workspacePath, expId, "concluded-dump", learning);
+      console.log(`Concluded ${expId} as ${verdict}: ${learning}`);
+    });
+
+  hypothesis
+    .command("close-outs")
+    .description("Show close-out entries from the research log (terminal experiment outcomes)")
+    .option("--json", "Output raw JSON")
+    .action((opts: { json?: boolean }) => {
+      const rows = readCloseOuts(workspacePath);
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("No close-out rows yet.");
+        return;
+      }
+      for (const r of rows) {
+        console.log(
+          `${r.concluded_at}  ${r.hypothesis_id.padEnd(8)} ${r.verdict.padEnd(12)} ${r.exp_id}`,
+        );
+        console.log(`  learning: ${r.learning}`);
+      }
+    });
+
+  // --- Roadmap subcommands -------------------------------------------------
+
+  const roadmap = research
+    .command("roadmap")
+    .description("ROADMAP.md inspection + draft-epic review");
+
+  roadmap
+    .command("list")
+    .description("List epics currently in ROADMAP.md")
+    .option("--json", "Output raw JSON")
+    .action((opts: { json?: boolean }) => {
+      const epics = listEpics(workspacePath);
+      if (opts.json) {
+        console.log(JSON.stringify(epics, null, 2));
+        return;
+      }
+      if (epics.length === 0) {
+        console.log("ROADMAP.md is empty or missing. Run `workspace research roadmap bootstrap`.");
+        return;
+      }
+      for (const e of epics) {
+        console.log(`${e.horizon.padEnd(8)} ${e.id.padEnd(28)} ${e.title}`);
+      }
+    });
+
+  roadmap
+    .command("bootstrap")
+    .description(
+      "Write a starter ROADMAP.md populated from the default gap list (no-op if already present)",
+    )
+    .action(() => {
+      const wrote = bootstrapRoadmap(workspacePath);
+      console.log(wrote ? "ROADMAP.md written" : "ROADMAP.md already exists — leaving untouched");
+    });
+
+  roadmap
+    .command("pending")
+    .description("Show draft epics proposed by the research loop awaiting operator review")
+    .option("--json", "Output raw JSON")
+    .action((opts: { json?: boolean }) => {
+      const rows = pendingEpics(workspacePath);
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("No pending epic proposals.");
+        return;
+      }
+      for (const r of rows) {
+        console.log(
+          `${r.epic_id.padEnd(28)} horizon=${r.horizon.padEnd(8)} by=${r.proposed_by_hypothesis_id}`,
+        );
+        console.log(`  title: ${r.title}`);
+        console.log(`  rationale: ${r.rationale}`);
+      }
+    });
+
+  roadmap
+    .command("accept")
+    .argument("<epic-id>", "Draft epic id")
+    .argument("[reason]", "Optional reason", "accepted")
+    .description("Accept a draft epic — appends to ROADMAP.md + unblocks its experiment")
+    .action((epicId: string, reason: string) => {
+      const resolved = resolveProposedEpic(workspacePath, epicId, "accepted", reason);
+      if (!resolved) {
+        console.error(`No pending epic with id "${epicId}"`);
+        process.exitCode = 1;
+        return;
+      }
+      appendEpic(workspacePath, {
+        id: resolved.epic_id,
+        title: resolved.title,
+        horizon: resolved.horizon as Horizon,
+      });
+      // Unblock the experiment.
+      const waiting = listExperiments(workspacePath).find(
+        (e) =>
+          e.status === "awaiting-epic-approval" &&
+          e.value?.roadmap_link.mode === "propose" &&
+          e.value.roadmap_link.epic_id === epicId,
+      );
+      if (waiting) {
+        transitionStage(workspacePath, waiting.exp_id, "sandboxed", `epic ${epicId} accepted`);
+      }
+      console.log(
+        `Accepted ${epicId}. ROADMAP.md updated.${waiting ? ` Experiment ${waiting.exp_id} unblocked.` : ""}`,
+      );
+    });
+
+  roadmap
+    .command("reject")
+    .argument("<epic-id>", "Draft epic id")
+    .argument("<reason>", "Reason for rejection")
+    .description("Reject a draft epic — concludes its experiment as dump")
+    .action((epicId: string, reason: string) => {
+      const resolved = resolveProposedEpic(workspacePath, epicId, "rejected", reason);
+      if (!resolved) {
+        console.error(`No pending epic with id "${epicId}"`);
+        process.exitCode = 1;
+        return;
+      }
+      const waiting = listExperiments(workspacePath).find(
+        (e) =>
+          e.status === "awaiting-epic-approval" &&
+          e.value?.roadmap_link.mode === "propose" &&
+          e.value.roadmap_link.epic_id === epicId,
+      );
+      if (waiting) {
+        concludeExperiment(workspacePath, waiting.exp_id, {
+          verdict: "dump",
+          learning: `epic rejected: ${reason}`,
+          authored_by: "human",
+        });
+        transitionStage(
+          workspacePath,
+          waiting.exp_id,
+          "concluded-dump",
+          `epic rejected: ${reason}`,
+        );
+      }
+      console.log(
+        `Rejected ${epicId}: ${reason}.${waiting ? ` Experiment ${waiting.exp_id} concluded as dump.` : ""}`,
+      );
+    });
+
+  // Reference variable so listEpicStates is retained even if we later collapse
+  // the pending-only path. Silences the unused-import warning for the
+  // currently-unused export without removing it from the module surface.
+  void latestEpicStates;
+}
+
+// ============================================================================
 // Registration Entry Point
 // ============================================================================
 
@@ -968,4 +1564,6 @@ export function registerWorkspaceCli(program: CLIProgram, workspacePath: string)
   registerKnowledgeCommands(workspace, workspacePath);
   registerBeliefsCommands(workspace, workspacePath);
   registerSoulCommands(workspace, workspacePath);
+  registerArchiveCommands(workspace, workspacePath);
+  registerResearchCommands(workspace, workspacePath);
 }

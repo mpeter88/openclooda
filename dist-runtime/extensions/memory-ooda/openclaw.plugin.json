@@ -20,6 +20,43 @@
         "type": "string",
         "enum": ["off", "inline", "verbose"],
         "description": "Show OODA summary in TUI/chat replies. off=silent, inline=one-line, verbose=inline+council trace"
+      },
+      "research": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "CR_OODA_RESEARCH_LOOP — autonomous literature-to-experiment pipeline",
+        "properties": {
+          "tickEnabled": {
+            "type": "boolean",
+            "description": "Enable the research_tick DMN work unit. Default: false"
+          },
+          "sandboxEnabled": {
+            "type": "boolean",
+            "description": "Allow Stage 3 sandbox via git-worktree isolation. Default: false"
+          },
+          "repoRoot": {
+            "type": "string",
+            "description": "Repo root for git worktree add. Defaults to process.cwd()"
+          },
+          "baseRef": {
+            "type": "string",
+            "description": "Git ref to base worktrees on. Default: HEAD"
+          },
+          "evalCommand": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Eval command run inside the worktree. Default: pnpm tsgo --noEmit",
+            "properties": {
+              "cmd": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["cmd", "args"]
+          },
+          "timeoutMs": {
+            "type": "number",
+            "description": "Per-subprocess timeout in ms. Default: 120000"
+          }
+        }
       }
     }
   }

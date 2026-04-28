@@ -69,6 +69,16 @@ TESTS=(
   "extensions/memory-ooda/learned-forgetting.test.ts"
   # Workspace CLI — admission/knowledge/beliefs/soul
   "extensions/memory-ooda/workspace-cli.test.ts"
+  # Agent archive (CR_OODA_AGENT_ARCHIVE — per-generation lineage)
+  "extensions/memory-ooda/agent-archive.test.ts"
+  # Research loop scaffold (CR_OODA_RESEARCH_LOOP phase A)
+  "extensions/memory-ooda/research-loop.test.ts"
+  # Research loop stages B-E
+  "extensions/memory-ooda/research-discover.test.ts"
+  "extensions/memory-ooda/research-propose.test.ts"
+  "extensions/memory-ooda/research-sandbox.test.ts"
+  "extensions/memory-ooda/research-compare.test.ts"
+  "extensions/memory-ooda/research-tick.test.ts"
 )
 
 echo "→ Running OODA batch smoke test (${#TESTS[@]} suites)"

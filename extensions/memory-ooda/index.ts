@@ -75,6 +75,8 @@ import { createDefaultRegistry } from "./metric-registry.js";
 import { getPriorities, updateDomainWeight } from "./priorities.js";
 import { countPending, getProposals, addProposal } from "./proposals.js";
 import { Reflect, renderReflectNotification } from "./reflect.js";
+import { createWorktreeIsolation } from "./research-sandbox-worktree.js";
+import { runResearchTickOnce } from "./research-tick.js";
 import {
   getFacts,
   formatFactsForContext,
@@ -122,6 +124,25 @@ export type OodaConfig = {
    * "verbose" — inline + council trace when system2 fired
    */
   debugMode?: "off" | "inline" | "verbose";
+  /**
+   * CR_OODA_RESEARCH_LOOP: autonomous literature-to-experiment pipeline.
+   * Default is fully off (tick flag off in DMN; sandbox off here). Operators
+   * opt in after reviewing isolation + budget. Enabling `tickEnabled` schedules
+   * the DMN work unit; enabling `sandboxEnabled` additionally allows Stage 3
+   * to execute via the git-worktree isolation backend.
+   */
+  research?: {
+    tickEnabled?: boolean;
+    sandboxEnabled?: boolean;
+    /** Repo root for git worktree add. Defaults to process.cwd(). */
+    repoRoot?: string;
+    /** Git ref to base worktrees on. Default "HEAD". */
+    baseRef?: string;
+    /** Eval command inside the worktree. Default `pnpm tsgo --noEmit`. */
+    evalCommand?: { cmd: string; args: string[] };
+    /** Per-subprocess timeout (ms). Default 120_000. */
+    timeoutMs?: number;
+  };
 };
 
 function resolveWorkspacePath(cfg: OodaConfig): string {
@@ -450,6 +471,27 @@ const oodaPlugin = {
 
     api.logger.info(`memory-ooda: registered (workspace: ${workspacePath})`);
 
+    // CR_OODA_HYPOTHESIS_DISCIPLINE — write a starter ROADMAP.md on first run.
+    // bootstrapRoadmap is a no-op when ROADMAP.md already exists; operator can
+    // edit freely afterward and the plugin will never overwrite.
+    if (cfg.research?.tickEnabled === true) {
+      import("./roadmap.js")
+        .then(({ bootstrapRoadmap }) => {
+          try {
+            if (bootstrapRoadmap(workspacePath)) {
+              api.logger.info(
+                "memory-ooda: ROADMAP.md bootstrapped (first research-loop activation)",
+              );
+            }
+          } catch {
+            /* best-effort; roadmap absence is non-fatal */
+          }
+        })
+        .catch(() => {
+          /* best-effort */
+        });
+    }
+
     // ========================================================================
     // Shared EpisodicStore — single connection per plugin registration.
     // buildEpisodicStore opens a DatabaseSync (sqlite) connection. Opening
@@ -472,6 +514,7 @@ const oodaPlugin = {
     let lastUserActivityAt = Date.now();
     const dmnConfig: DMNCadenceConfig = { ...DEFAULT_DMN_CONFIG };
     const dmnFlags: DMNWorkUnitFlags = { ...DEFAULT_WORK_UNIT_FLAGS };
+    if (cfg.research?.tickEnabled === true) dmnFlags.research_tick = true;
     let dmnScheduler: DMNScheduler | null = null;
 
     async function getEpisodicStore(): Promise<EpisodicStore | null> {
@@ -1773,6 +1816,50 @@ const oodaPlugin = {
           const r = await runPatternDistill(workspacePath, callModel, episodicStore);
           outcome = r.candidatesAdded > 0 ? "success" : "noop";
           details = `scanned=${r.eventsScanned} added=${r.candidatesAdded}`;
+        } else if (kind === "research_tick") {
+          // CR_OODA_RESEARCH_LOOP: advance the research pipeline by one step.
+          // Sandbox enablement + isolation backend come from plugin config
+          // (cfg.research); PRIORITIES.json still supplies feeds/keywords/
+          // thresholds so operators can retune without restarting.
+          try {
+            let tickPriorities: ReturnType<typeof getPriorities> | undefined;
+            try {
+              tickPriorities = getPriorities(workspacePath);
+            } catch {
+              tickPriorities = undefined;
+            }
+            const thresholdsAny = (tickPriorities?.thresholds ?? {}) as Record<string, unknown>;
+            const sandboxEnabled = cfg.research?.sandboxEnabled === true;
+            const isolation = sandboxEnabled
+              ? createWorktreeIsolation({
+                  workspacePath,
+                  repoRoot: cfg.research?.repoRoot,
+                  baseRef: cfg.research?.baseRef,
+                  evalCommand: cfg.research?.evalCommand,
+                  timeoutMs: cfg.research?.timeoutMs,
+                })
+              : undefined;
+            const r = await runResearchTickOnce(workspacePath, callModel, {
+              feeds: (thresholdsAny.research_feed_urls as string[] | undefined) ?? [
+                "http://export.arxiv.org/rss/cs.AI",
+              ],
+              keywords: (thresholdsAny.research_keywords as string[] | undefined) ?? [],
+              architectureSummary:
+                "openclooda is a cognitive OODA agent built around: dual-process council (system 1 / system 2), triage-driven routing, a semantic archivist that distills Tier-2 episodic memory into Tier-3 knowledge, beliefs + world-model scaffolding, a default-mode-network idle scheduler, an admission gate with pass^k, pattern separation (MinHash signatures), emotional tagging (SITREP priority as importance multiplier), causal antecedent retrieval, learned forgetting, an evolutionary agent archive, and sandboxed self-modification via git worktree. " +
+                "Known capability gaps we actively want research on: (1) curiosity-driven exploration and intrinsic motivation — choosing what to learn next; (2) metacognition and calibrated uncertainty — knowing when not to act and when to ask; (3) richer council reasoning shapes beyond flat voting (tree-of-thought, graph-of-thought, debate, self-refine, verification); (4) theory of mind and generative world models; (5) dynamic tool discovery and skill-library acquisition; (6) hierarchical planning and options frameworks; (7) better long-term retrieval (graph-RAG, hierarchical memory); (8) continual and lifelong learning under distribution drift; (9) novel agent benchmarks and evaluations beyond pass^k (e.g. SWE-bench-style); (10) self-critique, constitutional AI, RLAIF; (11) neuroscience-plausible mechanisms (predictive coding, free-energy principle, global workspace, neuromorphic); (12) decision-theoretic underpinnings (POMDP, bandits, sequential decision, optimal stopping, bayesian decision). " +
+                "Score a paper high (>=0.6) when it proposes a concrete, testable mechanism that plugs into one of the above gaps, or a clear empirical improvement over a listed capability. Score medium (0.4-0.6) when the idea is adjacent or inspirational but the mechanism isn't concrete enough to port. Score low (<0.4) for pure theory, domain-specific applications (robotics, vision) without a transferable idea, or incremental engineering tricks.",
+              candidateFloor: (thresholdsAny.research_candidate_floor as number | undefined) ?? 0.6,
+              rolloutThreshold:
+                (thresholdsAny.research_rollout_threshold as number | undefined) ?? 0.05,
+              enableSandbox: sandboxEnabled,
+              isolation,
+            });
+            outcome = r.action === "noop" ? "noop" : "success";
+            details = `research_tick: ${r.action} — ${r.details}`;
+          } catch (err) {
+            outcome = "error";
+            details = `research_tick failed: ${String(err).slice(0, 160)}`;
+          }
         } else {
           outcome = "noop";
           details = `${kind} dispatched but no runner`;

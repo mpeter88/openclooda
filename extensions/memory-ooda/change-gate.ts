@@ -230,4 +230,50 @@ function recordHistory(workspacePath: string, req: ChangeRequest, outcome: GateO
     changeId: req.id,
     summary: req.summary,
   });
+  // CR_OODA_AGENT_ARCHIVE: any admitted change (including override-granted ones)
+  // enters the generation ledger. Rejected changes do not — they never reached
+  // a state the plugin would have lived in.
+  if (!outcome.admit) return;
+  void (async () => {
+    try {
+      const { createHash } = await import("node:crypto");
+      const { appendGeneration } = await import("./agent-archive.js");
+      const pluginSourceHash = createHash("sha256")
+        .update(`${req.id}|${req.kind}|${req.summary}|${req.diff}`)
+        .digest("hex");
+      // Workspace file hashes — best-effort; readers already stamp content_hash
+      // on _meta. Pull by direct file read to avoid a circular import into
+      // semantic-memory/beliefs/priorities.
+      const readHash = async (rel: string): Promise<string | null> => {
+        try {
+          const fs = await import("node:fs");
+          const path = await import("node:path");
+          const file = path.join(workspacePath, rel);
+          if (!fs.existsSync(file)) return null;
+          const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as {
+            _meta?: { content_hash?: string };
+          };
+          return parsed._meta?.content_hash ?? null;
+        } catch {
+          return null;
+        }
+      };
+      appendGeneration(workspacePath, {
+        plugin_source_hash: pluginSourceHash,
+        workspace_hashes: {
+          knowledge: await readHash("KNOWLEDGE.json"),
+          beliefs: await readHash("BELIEFS.json"),
+          priorities: await readHash("PRIORITIES.json"),
+        },
+        admission: {
+          gate_id: req.id,
+          kind: req.kind,
+          reason: outcome.reason,
+        },
+        summary: req.summary,
+      });
+    } catch {
+      // Archive append must not break the gate flow.
+    }
+  })();
 }
