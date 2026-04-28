@@ -1071,7 +1071,7 @@ describe("generateWeightProposals", () => {
       amf_pipeline: makeDomainEntry(0.9),
       openclooda: makeDomainEntry(0.8),
     },
-  } as PrioritiesFile;
+  } as unknown as PrioritiesFile;
 
   it("generates proposals for domains with significant deviation", () => {
     const domainStats = [
