@@ -1358,7 +1358,7 @@ export async function runArchivist(
           const antecedents = formatAntecedents(
             findAntecedents(allRecent, {
               outcome: "failure",
-              limit: 5,
+              limit: 3,
             }),
           );
           appendCriticalFailure(workspacePath, {

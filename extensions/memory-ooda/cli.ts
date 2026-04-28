@@ -33,6 +33,7 @@ import {
   distortionHistoryPath,
   readDistortionHistory,
 } from "./distortion-index.js";
+import { DEFAULT_FORGETTING_POLICY, explainKeep, partitionForPrune } from "./learned-forgetting.js";
 import { getPriorities } from "./priorities.js";
 import {
   countPending,
@@ -710,6 +711,128 @@ export function registerErrorsCommands(workspace: CLICommand, workspacePath: str
         console.log(`Antecedents for "${signal}" (${rows.length})`);
         console.log("==========================================");
         for (const l of lines) console.log(l);
+      },
+    );
+}
+
+// ============================================================================
+// Memory CLI (CR_OODA_LEARNED_FORGETTING)
+// ============================================================================
+
+export function registerMemoryCommands(workspace: CLICommand, workspacePath: string): void {
+  const memory = workspace
+    .command("memory")
+    .description("Episodic memory inspection + retention policy dry-runs");
+
+  memory
+    .command("forget-policy")
+    .description(
+      "Dry-run the learned-forgetting partition over the episodic store; prints keep/drop counts (CR_OODA_LEARNED_FORGETTING).",
+    )
+    .option("--older-than-days <n>", "Override age cutoff (default: 90)")
+    .option("--keep-importance-floor <n>", "Override importance floor (default: 0.75)")
+    .option("--keep-retrieved-within-days <n>", "Override retrieval window (default: 30)")
+    .option("--keep-categories <csv>", "Comma-separated category allowlist (default: decision)")
+    .option("--limit <n>", "Cap how many events the dry-run reads (default: 10000)")
+    .option("--show-drops <n>", "Show first N dropped event ids + reasons (default: 0)")
+    .option("--json", "Output raw JSON")
+    .action(
+      async (opts: {
+        olderThanDays?: string;
+        keepImportanceFloor?: string;
+        keepRetrievedWithinDays?: string;
+        keepCategories?: string;
+        limit?: string;
+        showDrops?: string;
+        json?: boolean;
+      }) => {
+        const dbPath = path.join(process.env.HOME ?? "", ".openclaw", "memory", "lancedb");
+        const limit = opts.limit ? Math.max(1, Number.parseInt(opts.limit, 10) || 10000) : 10000;
+        const events = await readEpisodicForCli(dbPath, limit);
+
+        const day = 24 * 60 * 60 * 1000;
+        const policy = {
+          ...DEFAULT_FORGETTING_POLICY,
+          ...(opts.olderThanDays
+            ? { olderThanMs: Math.max(0, Number.parseFloat(opts.olderThanDays) || 90) * day }
+            : {}),
+          ...(opts.keepImportanceFloor
+            ? { keepImportanceFloor: Number.parseFloat(opts.keepImportanceFloor) }
+            : {}),
+          ...(opts.keepRetrievedWithinDays
+            ? {
+                keepRetrievedWithinMs:
+                  Math.max(0, Number.parseFloat(opts.keepRetrievedWithinDays) || 30) * day,
+              }
+            : {}),
+          ...(opts.keepCategories
+            ? {
+                keepCategories: opts.keepCategories
+                  .split(",")
+                  .map((s) => s.trim())
+                  .filter(Boolean),
+              }
+            : {}),
+        };
+
+        const now = Date.now();
+        const { keep, drop } = partitionForPrune(events, policy, now);
+
+        const showDrops = opts.showDrops
+          ? Math.max(0, Number.parseInt(opts.showDrops, 10) || 0)
+          : 0;
+        const dropPreview = drop.slice(0, showDrops).map((e) => ({
+          id: e.id,
+          category: e.category,
+          createdAt: e.createdAt,
+          importance: e.importance,
+          outcome: e.outcome,
+        }));
+
+        if (opts.json) {
+          console.log(
+            JSON.stringify(
+              {
+                policy,
+                events: events.length,
+                keep: keep.length,
+                drop: drop.length,
+                dropPreview,
+              },
+              null,
+              2,
+            ),
+          );
+          return;
+        }
+
+        const total = events.length;
+        const dropPct = total > 0 ? ((drop.length / total) * 100).toFixed(1) : "0.0";
+        console.log("Forgetting policy dry-run (no rows are deleted)");
+        console.log("================================================");
+        console.log(`Source DB:   ${dbPath}`);
+        console.log(`Events read: ${total}`);
+        console.log(`Policy:`);
+        console.log(`  olderThanDays           = ${(policy.olderThanMs / day).toFixed(1)}`);
+        console.log(`  keepImportanceFloor     = ${policy.keepImportanceFloor.toFixed(2)}`);
+        console.log(`  keepOutcomeLabeled      = ${policy.keepOutcomeLabeled}`);
+        console.log(
+          `  keepRetrievedWithinDays = ${(policy.keepRetrievedWithinMs / day).toFixed(1)}`,
+        );
+        console.log(`  keepCategories          = [${policy.keepCategories.join(", ")}]`);
+        console.log("");
+        console.log(`Keep: ${keep.length}`);
+        console.log(`Drop: ${drop.length}  (${dropPct}% of read)`);
+        if (dropPreview.length > 0) {
+          console.log("");
+          console.log(`First ${dropPreview.length} dropped:`);
+          for (const d of drop.slice(0, dropPreview.length)) {
+            const why = explainKeep(d, policy, now) ?? "no_protection";
+            console.log(
+              `  ${d.id.slice(0, 12)}  cat=${d.category.padEnd(12)} imp=${(d.importance ?? 0).toFixed(2)} ${why}`,
+            );
+          }
+        }
       },
     );
 }
@@ -1560,6 +1683,7 @@ export function registerWorkspaceCli(program: CLIProgram, workspacePath: string)
   registerDistortionCommands(workspace, workspacePath);
   registerTrajectoryCommands(workspace, workspacePath);
   registerErrorsCommands(workspace, workspacePath);
+  registerMemoryCommands(workspace, workspacePath);
   registerAdmissionCommands(workspace, workspacePath);
   registerKnowledgeCommands(workspace, workspacePath);
   registerBeliefsCommands(workspace, workspacePath);
