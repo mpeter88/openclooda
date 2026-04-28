@@ -1,6 +1,6 @@
 # CR_OODA_PATTERN_SEPARATION_GATE — Dentate-gyrus analog for recall
 
-Status: draft
+Status: implemented
 Target batch: G (after emotional-tagging + DMN)
 Estimated effort: 5 days
 Depends on:
