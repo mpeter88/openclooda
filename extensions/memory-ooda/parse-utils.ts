@@ -24,9 +24,16 @@ export function errorMessage(err: unknown): string {
  */
 export function stripCodeFences(text: string): string {
   const trimmed = text.trim();
-  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (match) {
-    return (match[1] ?? "").trim();
+  // Primary: anchored full-string fence (model output is only the fenced block)
+  const anchored = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (anchored) {
+    return (anchored[1] ?? "").trim();
+  }
+  // Fallback: extract the first fenced block even if there's surrounding text
+  // (model prefixed with explanation or appended a note after the closing fence)
+  const inner = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (inner) {
+    return (inner[1] ?? "").trim();
   }
   return trimmed;
 }
