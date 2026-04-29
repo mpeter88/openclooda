@@ -24,16 +24,18 @@ export function errorMessage(err: unknown): string {
  */
 export function stripCodeFences(text: string): string {
   const trimmed = text.trim();
-  // Primary: anchored full-string fence (model output is only the fenced block)
-  const anchored = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (anchored) {
-    return (anchored[1] ?? "").trim();
+  // Fast path: no fences at all
+  if (!trimmed.includes("```")) return trimmed;
+  // Extract the outermost JSON object — find first { and last }
+  // Handles any wrapping (```json, ```, explanation before/after, nested fences)
+  const first = trimmed.indexOf("{");
+  const last = trimmed.lastIndexOf("}");
+  if (first !== -1 && last > first) {
+    return trimmed.slice(first, last + 1);
   }
-  // Fallback: extract the first fenced block even if there's surrounding text
-  // (model prefixed with explanation or appended a note after the closing fence)
-  const inner = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  if (inner) {
-    return (inner[1] ?? "").trim();
-  }
-  return trimmed;
+  // No JSON object found — strip the fence markers and return whatever's inside
+  return trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
 }
