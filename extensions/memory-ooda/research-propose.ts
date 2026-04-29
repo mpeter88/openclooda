@@ -92,11 +92,13 @@ ${epicList}
 
 ${hint ? `## Operator hint\n${hint}\n` : ""}
 ## Rules
-- Touch at most ${MAX_FILES_DEFAULT} files.
+- Touch at most ${MAX_FILES_DEFAULT} TypeScript (.ts) files in extensions/memory-ooda/.
 - NEVER touch any file in the denylist: ${DEFAULT_DENYLIST.join(", ")}.
 - Diff must be a valid unified diff (\`diff --git\` headers, \`---\`/\`+++\`, hunks with \`@@\`).
 - Keep scope narrow: one experiment, one hypothesis, one falsifiable claim.
 - The hypothesis.scope_boundary MUST equal the allowed_paths array.
+- **allowed_paths MUST be non-empty** — list every .ts file your diff touches (e.g. ["extensions/memory-ooda/triage.ts"]). An empty allowed_paths will cause immediate rejection.
+- All files in allowed_paths must have a \`diff --git\` entry in the diff. Do not list files you do not diff.
 - Hypothesis fixtures must be narrow admission cases: each has a unique id,
   a fixture body, an expected outcome, and at least one tag.
   Every fixture MUST include the tag \`${"${hypothesis.success_metric.fixture_tag}"}\` so
@@ -180,7 +182,14 @@ export function parseProposal(raw: string): ProposalDraft {
   const hypothesis_fixtures = parsed.hypothesis_fixtures as HypothesisFixtures;
 
   if (!proposal_md || !diff || allowed_paths.length === 0) {
-    throw new Error("Proposal missing required fields (proposal_md/diff/allowed_paths)");
+    const missing = [
+      !proposal_md && "proposal_md",
+      !diff && "diff",
+      allowed_paths.length === 0 && "allowed_paths (must be non-empty list of .ts files)",
+    ]
+      .filter(Boolean)
+      .join(", ");
+    throw new Error(`Proposal missing required fields: ${missing}`);
   }
   if (!hypothesis || typeof hypothesis !== "object") {
     throw new Error("Proposal missing hypothesis object");
