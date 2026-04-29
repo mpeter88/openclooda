@@ -327,7 +327,7 @@ describe("runResearchPropose", () => {
     expect(r.experiment.notes).toMatch(/denylisted/);
   });
 
-  it("rejects when the model emits malformed JSON", async () => {
+  it("routes to 'discovered' (retryable) when the model emits malformed JSON", async () => {
     const callModel: ModelCallFn = vi.fn(async () => "not json");
     const r = await runResearchPropose(tmp, callModel, {
       candidate: CANDIDATE,
@@ -335,8 +335,9 @@ describe("runResearchPropose", () => {
       parentGenid: "initial",
       maxRetries: 0,
     });
-    expect(r.experiment.status).toBe("rejected");
-    expect(r.experiment.notes).toMatch(/proposal parse failed/);
+    // Transient parse failure: loop will re-attempt on next tick
+    expect(r.experiment.status).toBe("discovered");
+    expect(r.experiment.notes).toMatch(/proposal parse failed.*will retry/);
   });
 
   it("carries paper citation + hypothesis object into the record", async () => {

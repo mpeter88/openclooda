@@ -159,6 +159,18 @@ Respond with raw JSON only (no markdown fences):
 // Parsing + validation
 // ============================================================================
 
+/**
+ * Thrown by parseProposal when the output is structurally invalid in a way
+ * that retrying with the same prompt won't fix (e.g. fixture shape violation,
+ * missing hypothesis). Callers should route to "rejected" not "discovered".
+ */
+export class StructuralProposalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StructuralProposalError";
+  }
+}
+
 export interface ProposalDraft {
   proposal_md: string;
   hypothesis: Omit<Hypothesis, "id" | "scope_boundary">;
@@ -202,7 +214,7 @@ export function parseProposal(raw: string): ProposalDraft {
     !Array.isArray(hypothesis_fixtures.fixtures) ||
     hypothesis_fixtures.fixtures.length === 0
   ) {
-    throw new Error("Proposal must include at least one hypothesis fixture");
+    throw new StructuralProposalError("Proposal must include at least one hypothesis fixture");
   }
 
   // Findings 4 + 5 — per-fixture shape validation at write time. Confirms the
@@ -213,7 +225,7 @@ export function parseProposal(raw: string): ProposalDraft {
   if (typeof fixtureTag === "string" && fixtureTag.length > 0) {
     const result = validateHypothesisFixtures(hypothesis_fixtures.fixtures, fixtureTag);
     if (!result.valid) {
-      throw new Error(`Hypothesis fixtures invalid: ${result.errors.join("; ")}`);
+      throw new StructuralProposalError(`Hypothesis fixtures invalid: ${result.errors.join("; ")}`);
     }
   }
 
@@ -363,6 +375,7 @@ export async function runResearchPropose(
 
   let draft: ProposalDraft | null = null;
   let lastError = "";
+  let structuralFailure = false;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const raw = await callModel(prompt);
@@ -370,6 +383,12 @@ export async function runResearchPropose(
       break;
     } catch (err) {
       lastError = String(err).slice(0, 200);
+      if (err instanceof StructuralProposalError) {
+        // Structural errors (fixture shape, hypothesis schema) won't improve
+        // on retry with the same prompt — reject immediately.
+        structuralFailure = true;
+        break;
+      }
     }
   }
 
@@ -377,11 +396,13 @@ export async function runResearchPropose(
   const denylist = [...DEFAULT_DENYLIST, ...(options.extraDenylist ?? [])];
 
   if (!draft) {
+    // Transient parse failure = retryable. Structural failure = hard reject.
+    const retryable = !structuralFailure;
     const record: ExperimentRecord = {
       exp_id: expId,
       created_at: now,
       updated_at: now,
-      status: "rejected",
+      status: retryable ? "discovered" : "rejected",
       source: {
         kind: "paper",
         ref: options.candidate.id,
@@ -390,7 +411,9 @@ export async function runResearchPropose(
       parent_genid: options.parentGenid,
       scope: { allowed_paths: [], denylist_paths: denylist, max_files: MAX_FILES_DEFAULT },
       scores: {},
-      notes: `proposal parse failed: ${lastError}`,
+      notes: retryable
+        ? `proposal parse failed (will retry): ${lastError}`
+        : `proposal structurally invalid: ${lastError}`,
     };
     writeExperimentRecord(workspacePath, record);
     return {
