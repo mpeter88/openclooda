@@ -564,7 +564,10 @@ const oodaPlugin = {
       const apiKey = await resolveApiKey();
 
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 60_000);
+      // Research propose + refine generate large outputs (full diff + fixtures + JSON).
+      // 60s was too short — bumped to 180s. max_tokens bumped to 8192 to avoid
+      // truncated JSON causing SyntaxError parse failures.
+      const timeout = setTimeout(() => controller.abort(), 180_000);
 
       try {
         const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -577,7 +580,7 @@ const oodaPlugin = {
           },
           body: JSON.stringify({
             model: "claude-sonnet-4-6",
-            max_tokens: 4096,
+            max_tokens: 8192,
             system:
               "You are an OODA reasoning agent. Respond with raw JSON only. No explanation, no code fences.",
             messages: [{ role: "user", content: prompt }],
